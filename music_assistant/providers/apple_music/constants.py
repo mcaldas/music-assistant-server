@@ -37,6 +37,9 @@ CONF_MUSIC_APP_TOKEN = "music_app_token"
 CONF_MUSIC_USER_TOKEN = "music_user_token"
 CONF_MUSIC_USER_MANUAL_TOKEN = "music_user_manual_token"
 CONF_MUSIC_USER_TOKEN_TIMESTAMP = "music_user_token_timestamp"
+CONF_USE_OWN_APP_TOKEN = "use_own_app_token"
+# setup form field only: an own developer token is stored as CONF_MUSIC_APP_TOKEN
+CONF_OWN_APP_TOKEN = "own_app_token"
 CACHE_CATEGORY_DECRYPT_KEY = 1
 MAX_ARTWORK_DIMENSION = 1000
 BLOBSTORE_DOMAIN = "blobstore.apple.com"

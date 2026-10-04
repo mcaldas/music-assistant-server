@@ -3,6 +3,14 @@
     "music_app_token": {
       "label": "MusicKit App Token"
     },
+    "own_app_token": {
+      "label": "Your own developer token",
+      "description": "A MusicKit developer token from your own Apple Developer account, used instead of the one bundled with Music Assistant. Every installation shares the bundled token, and with it Apple's rate limit; your own token avoids those slowdowns."
+    },
+    "use_own_app_token": {
+      "label": "Use your own developer token",
+      "description": "Leave the token field empty to keep the one you saved before; switch off to go back to the bundled token."
+    },
     "music_user_manual_token": {
       "label": "Manual Music User Token"
     }
@@ -14,7 +22,7 @@
     },
     "user": {
       "title": "Sign in to Apple Music",
-      "description": "Continue to sign in with your Apple ID in a browser window. Advanced users can instead paste a Music User Token, for example for child accounts where the browser sign-in is unavailable."
+      "description": "Continue to sign in with your Apple ID in a browser window. Advanced users can instead paste a Music User Token, for example for child accounts where the browser sign-in is unavailable, or use their own developer token."
     },
     "auth": {
       "title": "Authorize Music Assistant",

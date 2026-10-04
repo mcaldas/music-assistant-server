@@ -90,11 +90,14 @@ class AppleMusicProvider(RecommendationPayloadMixin, MusicProvider):
             self.get_setup_value(CONF_MUSIC_USER_MANUAL_TOKEN)
             or self.get_setup_value(CONF_MUSIC_USER_TOKEN),
         )
-        # a stored/manual app token only exists because the setup flow found the
-        # bundled one empty or invalid, so it takes precedence over the bundled token
-        self._music_app_token = (
-            cast("str | None", self.get_setup_value(CONF_MUSIC_APP_TOKEN)) or MUSIC_APP_TOKEN
-        )
+        # a stored app token is the user's own (an advanced setup option) or a manual one the
+        # setup flow asked for because the bundled one was empty or invalid: it takes precedence
+        own_app_token = cast("str | None", self.get_setup_value(CONF_MUSIC_APP_TOKEN))
+        self._music_app_token = own_app_token or MUSIC_APP_TOKEN
+        if own_app_token:
+            self.logger.info(
+                "Using a stored Apple Music developer token instead of the bundled one"
+            )
         self._storefront = await self.api_client.get_user_storefront()
         await self.streaming_manager.initialize()
 
