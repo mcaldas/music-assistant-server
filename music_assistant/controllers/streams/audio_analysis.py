@@ -36,7 +36,12 @@ from music_assistant.helpers.api import api_command
 from music_assistant.helpers.datetime import local_clock_time_to_utc, utc_timestamp
 from music_assistant.helpers.json import json_dumps, json_loads
 from music_assistant.helpers.util import inference_thread_budget, is_arm
-from music_assistant.models.audio_analysis import AudioAnalysisData, AudioAnalysisError
+from music_assistant.models.audio_analysis import (
+    AudioAnalysisData,
+    AudioAnalysisError,
+    BarGrid,
+    BarGridBar,
+)
 from music_assistant.models.audio_analysis_provider import (
     AudioAnalysisProvider,
     InstrumentedSemaphore,
@@ -195,6 +200,66 @@ def _first_non_finite_field(analysis: AudioAnalysisData) -> str | None:
         ):
             return fld.name
     return None
+
+
+def _bar_grid(analysis: AudioAnalysisData, include_beats: bool) -> BarGrid | None:
+    """
+    Build the API bar grid from a stored Smart Fades analysis.
+
+    Returns None when the analysis has no downbeat grid.
+
+    :param analysis: Stored analysis row (any version).
+    :param include_beats: Also return every beat time.
+    """
+    # numpy and smart_fades are imported here: off the startup path, and smart_fades imports us
+    import numpy as np  # noqa: PLC0415
+
+    from music_assistant.controllers.streams.smart_fades.bands import (  # noqa: PLC0415
+        build_band_profile,
+    )
+    from music_assistant.controllers.streams.smart_fades.vocal import (  # noqa: PLC0415
+        parse_vocal_probabilities,
+    )
+
+    downbeats = analysis.downbeats or []
+    if not analysis.duration or len(downbeats) < 2:
+        return None
+    starts = np.asarray(downbeats, dtype=np.float64)
+    # the same bar edges and bin indexing as build_band_profile
+    edges = np.concatenate([starts, [starts[-1] + np.median(np.diff(starts))]])
+    idx = np.clip((edges / (analysis.duration / 1800)).astype(int), 0, 1800)
+    widths = np.maximum(idx[1:] - idx[:-1], 1)
+    profile = build_band_profile(analysis)
+    vocal = None
+    if timeline := parse_vocal_probabilities(analysis):
+        cum = np.concatenate([[0.0], np.cumsum(timeline.probabilities)])
+        vocal = (cum[idx[1:]] - cum[idx[:-1]]) / widths
+    bars = [
+        BarGridBar(
+            start=round(float(edges[i]), 3),
+            end=round(float(edges[i + 1]), 3),
+            vocal=round(float(vocal[i]), 4) if vocal is not None else None,
+            # build_band_profile gives bar power (mean square): report RMS like the waveform
+            **(
+                {
+                    name: round(float(np.sqrt(power[i])), 4)
+                    for name, power in profile.bar_power.items()
+                }
+                if profile
+                else {}
+            ),
+        )
+        for i in range(len(starts))
+    ]
+    return BarGrid(
+        duration=analysis.duration,
+        bpm=analysis.bpm,
+        key=analysis.key,
+        mode=analysis.mode,
+        beats_per_bar=analysis.beats_per_bar,
+        bars=bars,
+        beats=[round(beat, 3) for beat in analysis.beats or []] if include_beats else None,
+    )
 
 
 def _nice_analysis_worker() -> None:
@@ -631,6 +696,30 @@ class AudioAnalysisController:
         if analysis is None or analysis.rms_energy is None:
             return None
         return [float(value) for value in analysis.rms_energy]
+
+    @api_command("audio_analysis/bar_grid")
+    async def get_bar_grid(
+        self,
+        item_id: str,
+        provider_instance_id_or_domain: str,
+        include_beats: bool = False,
+    ) -> BarGrid | None:
+        """
+        Return a track's bars with per-bar band energy and vocal level, or None when not analysed.
+
+        Bars follow the Smart Fades downbeat grid, the one its crossfade planner uses. Band
+        levels are each bar's RMS on the same 0.0-1.0 scale as the waveform; vocal is the bar's
+        mean vocal probability. Values the stored analysis lacks are None. Never starts an
+        analysis.
+
+        :param item_id: Provider-native item ID.
+        :param provider_instance_id_or_domain: Music provider instance ID or domain.
+        :param include_beats: Also return every beat time in seconds.
+        """
+        analysis = await self.get_audio_analysis(
+            item_id, provider_instance_id_or_domain, priority=(SMART_FADES_ANALYSIS_DOMAIN,)
+        )
+        return _bar_grid(analysis, include_beats) if analysis else None
 
     async def set_track_loudness(
         self,

@@ -10,7 +10,7 @@ from collections.abc import AsyncGenerator, Mapping
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing
 from datetime import UTC, datetime
-from typing import Any, cast
+from typing import Any, cast, get_type_hints
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import numpy as np
@@ -39,7 +39,7 @@ from music_assistant.controllers.streams.audio_analysis import (
 from music_assistant.controllers.streams.audio_buffer import AudioBufferEOF
 from music_assistant.helpers.database import DatabaseConnection
 from music_assistant.helpers.json import json_dumps, json_loads
-from music_assistant.models.audio_analysis import AudioAnalysisData, AudioAnalysisError
+from music_assistant.models.audio_analysis import AudioAnalysisData, AudioAnalysisError, BarGrid
 from music_assistant.models.audio_analysis_provider import (
     AudioAnalysisProvider,
     InstrumentedSemaphore,
@@ -1803,3 +1803,86 @@ async def test_get_wave_form_none_without_rms() -> None:
     """wave_form returns None when no AA provider stored RMS energy."""
     c = _analysis_controller_with_rows([_aa_row(SMART_FADES_ANALYSIS_DOMAIN, 1, bpm=120.0)])
     assert await c.get_wave_form("track-1", "test-provider") is None
+
+
+def _grid_row(domain: str = SMART_FADES_ANALYSIS_DOMAIN, **fields: Any) -> dict[str, Any]:
+    """Build a 240 s, 120 BPM, 4/4 analysis row: 480 beats, 120 bars of 2 s."""
+    beats = [round(i * 0.5, 3) for i in range(480)]
+    row: dict[str, Any] = {
+        "duration": 240.0,
+        "bpm": 120.0,
+        "key": "A",
+        "mode": "minor",
+        "beats_per_bar": 4,
+        "beats": beats,
+        "downbeats": beats[::4],
+    }
+    return _aa_row(domain, 1, **(row | fields))
+
+
+@pytest.mark.asyncio
+async def test_get_bar_grid_returns_one_row_per_bar() -> None:
+    """bar_grid returns each bar with its band RMS and mean vocal probability."""
+    extra = {
+        "band_rms": {band: [0.5] * 1800 for band in ("low", "low_mid", "mid", "high")},
+        "vocal_activity": [0.0] * 900 + [1.0] * 900,
+    }
+    c = _analysis_controller_with_rows([_grid_row(extra_data=extra)])
+    grid = await c.get_bar_grid("track-1", "test-provider")
+    assert grid is not None
+    assert len(grid.bars) == 120
+    assert (grid.bars[0].start, grid.bars[0].end) == (0.0, 2.0)
+    # bar power is the mean square of the envelope: reported back as RMS, like the waveform
+    assert grid.bars[10].low == pytest.approx(0.5)
+    assert grid.bars[10].high == pytest.approx(0.5)
+    assert grid.bars[59].vocal == pytest.approx(0.0)
+    assert grid.bars[60].vocal == pytest.approx(1.0)
+    assert (grid.bpm, grid.key, grid.mode, grid.beats_per_bar) == (120.0, "A", "minor", 4)
+    assert grid.beats is None
+    assert grid.to_dict()["bars"][0]["start"] == 0.0
+
+
+@pytest.mark.asyncio
+async def test_get_bar_grid_includes_beats_on_request() -> None:
+    """bar_grid returns every beat only when asked to."""
+    c = _analysis_controller_with_rows([_grid_row()])
+    grid = await c.get_bar_grid("track-1", "test-provider", include_beats=True)
+    assert grid is not None
+    assert grid.beats is not None
+    assert len(grid.beats) == 480
+
+
+@pytest.mark.asyncio
+async def test_get_bar_grid_none_without_analysis_or_grid() -> None:
+    """bar_grid returns None for a track never analysed, or one without a downbeat grid."""
+    assert await _analysis_controller_with_rows([]).get_bar_grid("track-1", "test-provider") is None
+    c = _analysis_controller_with_rows([_aa_row(SMART_FADES_ANALYSIS_DOMAIN, 1, bpm=120.0)])
+    assert await c.get_bar_grid("track-1", "test-provider") is None
+
+
+@pytest.mark.asyncio
+async def test_get_bar_grid_old_row_has_bars_without_levels() -> None:
+    """An older analysis without band envelopes or vocal timeline still gives its bars."""
+    c = _analysis_controller_with_rows([_grid_row()])
+    grid = await c.get_bar_grid("track-1", "test-provider")
+    assert grid is not None
+    assert len(grid.bars) == 120
+    bar = grid.bars[0]
+    assert (bar.low, bar.low_mid, bar.mid, bar.high, bar.vocal) == (None, None, None, None, None)
+
+
+@pytest.mark.asyncio
+async def test_get_bar_grid_reads_smart_fades_only() -> None:
+    """bar_grid serves the Smart Fades grid, the planner's own, never another AA provider's."""
+    c = _analysis_controller_with_rows(
+        [_grid_row(), _aa_row(SONIC_ANALYSIS_DOMAIN, 2, bpm=99.0, key="C", mode="major")]
+    )
+    grid = await c.get_bar_grid("track-1", "test-provider")
+    assert grid is not None
+    assert (grid.bpm, grid.key) == (120.0, "A")
+
+
+def test_get_bar_grid_type_hints_resolve() -> None:
+    """The return type resolves at runtime, as the API command registration needs."""
+    hints = get_type_hints(AudioAnalysisController.get_bar_grid)
+    assert hints["return"] == BarGrid | None

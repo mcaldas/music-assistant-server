@@ -123,3 +123,37 @@ class AudioAnalysisData(DataClassDictMixin):
                 continue
             setattr(self, fld.name, new_val)
         return self
+
+
+@dataclass(kw_only=True)
+class BarGridBar(DataClassDictMixin):
+    """One bar of a track's bar grid: times in seconds, levels on a 0.0-1.0 scale."""
+
+    # Downbeat that starts the bar, on the analysis timeline.
+    start: float
+    # The next downbeat; the last bar ends one median bar length after its start.
+    end: float
+    # Bar RMS per band (20-120 Hz, 120-400 Hz, 400-4000 Hz, above 4000 Hz), same scale as
+    # the waveform; None when the stored analysis has no band envelopes.
+    low: float | None = None
+    low_mid: float | None = None
+    mid: float | None = None
+    high: float | None = None
+    # Mean vocal probability over the bar; None when the analysis has no vocal timeline.
+    vocal: float | None = None
+
+
+@dataclass(kw_only=True)
+class BarGrid(DataClassDictMixin):
+    """A track's bars with per-bar band energy and vocal level, as returned by the API."""
+
+    # Seconds, on the analysis timeline.
+    duration: float
+    bpm: float | None = None
+    # Pitch class (e.g. "Bb", "C#") and "major" or "minor".
+    key: str | None = None
+    mode: str | None = None
+    beats_per_bar: int | None = None
+    bars: list[BarGridBar]
+    # Every beat in seconds, only when asked for.
+    beats: list[float] | None = None
