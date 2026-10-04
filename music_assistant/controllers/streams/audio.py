@@ -113,7 +113,11 @@ from music_assistant.controllers.streams.constants import (
 )
 from music_assistant.controllers.streams.ogg_handler import get_chained_ogg_stream
 from music_assistant.controllers.streams.smart_fades import SmartFadesMixer
-from music_assistant.controllers.streams.smart_fades.fades import SmartFade, StandardCrossFade
+from music_assistant.controllers.streams.smart_fades.fades import (
+    SmartCrossFade,
+    SmartFade,
+    StandardCrossFade,
+)
 from music_assistant.controllers.streams.smart_fades.helpers import SMART_CROSSFADE_DURATION
 from music_assistant.helpers import ssl as ssl_util
 from music_assistant.helpers.aiohttp_client import encoded_request_url
@@ -136,6 +140,7 @@ from music_assistant.helpers.audio import (
     resolve_output_player_ids,
 )
 from music_assistant.helpers.compare import compare_item_ids
+from music_assistant.helpers.datetime import utc_timestamp
 from music_assistant.helpers.dsp import ComplexFilter, filter_to_ffmpeg_params
 from music_assistant.helpers.ffmpeg import (
     FFMpeg,
@@ -1540,6 +1545,8 @@ class StreamsAudio:
         """
         streamdetails = queue_item.streamdetails
         assert streamdetails
+        # a boundary reported while this item played before says nothing about this play
+        self._drop_transition_report(queue_item)
 
         # streamdetails are cached and reused for retries; reset this before any
         # media-type-specific dispatch so AudioSource failures do not stick.
@@ -1991,6 +1998,8 @@ class StreamsAudio:
             queue.index_in_buffer = self.mass.player_queues.index_by_id(
                 queue.queue_id, next_queue_item.queue_item_id
             )
+            # clients learn at once that the next item is locked and can no longer change
+            self.mass.player_queues.signal_update(queue.queue_id)
         except QueueEmpty:
             # end of queue reached, no next item
             next_queue_item = None
@@ -2051,6 +2060,13 @@ class StreamsAudio:
                     )
                     crossfade_allowed = transition_mode != CrossfadeMode.DISABLED
             if not crossfade_allowed:
+                if next_queue_item is not None:
+                    self._report_transition(
+                        queue.queue_id,
+                        queue_item,
+                        next_queue_item.queue_item_id,
+                        CrossfadeMode.DISABLED,
+                    )
                 # no crossfade enabled/allowed, just yield the buffer last part
                 bytes_written += len(tail_window)
                 for pcm_slice in iter_pcm_slices(bytes(tail_window), pcm_format, 1000):
@@ -2085,6 +2101,14 @@ class StreamsAudio:
                         else transition_mode
                     )
                     crossfade_timing = smart_fade.timing_info
+                    self._report_transition(
+                        queue.queue_id,
+                        queue_item,
+                        next_queue_item.queue_item_id,
+                        applied_mode,
+                        smart_fade,
+                        len(fade_out_data) / pcm_format.pcm_sample_size,
+                    )
                     next_handover = CrossfadeHandover(
                         stream=None,
                         fade_in_media_duration=0.0,
@@ -2224,6 +2248,12 @@ class StreamsAudio:
                         "Crossfade failed for queue %s: %s",
                         queue.display_name,
                         err,
+                    )
+                    self._report_transition(
+                        queue.queue_id,
+                        queue_item,
+                        next_queue_item.queue_item_id,
+                        CrossfadeMode.DISABLED,
                     )
                     next_queue_item = None
                     for pcm_slice in iter_pcm_slices(fade_out_data, pcm_format, 1000):
@@ -2522,6 +2552,13 @@ class StreamsAudio:
                             playback_speed=track_playback_speed,
                         )
                     if transition_mode == CrossfadeMode.DISABLED:
+                        if last_queue_track is not None:
+                            self._report_transition(
+                                queue.queue_id,
+                                last_queue_track,
+                                queue_track.queue_item_id,
+                                CrossfadeMode.DISABLED,
+                            )
                         # nothing to fade into: flush the held-back tail of the previous track
                         for pcm_slice in iter_pcm_slices(last_fadeout_part, pcm_format, 1000):
                             yield pcm_slice
@@ -2577,6 +2614,15 @@ class StreamsAudio:
                             + (timing_info.fadein_trimmed_duration + timing_info.crossfade_duration)
                             * track_playback_speed
                         )
+                        if outgoing_queue_track is not None:
+                            self._report_transition(
+                                queue.queue_id,
+                                outgoing_queue_track,
+                                queue_track.queue_item_id,
+                                applied_mode,
+                                crossfade_smart_fade,
+                                len(last_fadeout_part) / pcm_sample_size,
+                            )
                 # no fade is credited to this track until one is really rendered below
                 self._report_crossfade_mode(
                     queue.queue_id,
@@ -2750,6 +2796,13 @@ class StreamsAudio:
                                     queue_track.name,
                                     mix_err,
                                 )
+                                if outgoing_queue_track is not None:
+                                    self._report_transition(
+                                        queue.queue_id,
+                                        outgoing_queue_track,
+                                        queue_track.queue_item_id,
+                                        CrossfadeMode.DISABLED,
+                                    )
                                 # the tail was un-counted for the live credit above;
                                 # it now plays as ordinary outgoing audio
                                 last_play_log_entry.seconds_streamed += (
@@ -2849,6 +2902,8 @@ class StreamsAudio:
                     if last_fadeout_part:
                         # crossfade into this item never happened — undo the eager seek_position
                         queue_track.streamdetails.seek_position = raw_seek_position
+                        if outgoing_queue_track is not None:
+                            self._drop_transition_report(outgoing_queue_track)
                     continue
 
                 #### HANDLE END OF TRACK
@@ -2863,8 +2918,17 @@ class StreamsAudio:
                     play_log_entry.seconds_streamed = 0
                     if last_fadeout_part:
                         queue_track.streamdetails.seek_position = raw_seek_position
+                        if outgoing_queue_track is not None:
+                            self._drop_transition_report(outgoing_queue_track)
                     continue
                 if last_fadeout_part:
+                    if outgoing_queue_track is not None:
+                        self._report_transition(
+                            queue.queue_id,
+                            outgoing_queue_track,
+                            queue_track.queue_item_id,
+                            CrossfadeMode.DISABLED,
+                        )
                     # edge case: we did not get enough data to make the crossfade
                     # attribute these bytes to the previous track (they are its tail)
                     for pcm_slice in iter_pcm_slices(last_fadeout_part, pcm_format, 1000):
@@ -4238,6 +4302,83 @@ class StreamsAudio:
             ),
             alters_audio=queue_item.streamdetails.fade_in,
         )
+
+    def _report_transition(
+        self,
+        queue_id: str,
+        outgoing: QueueItem,
+        next_item_id: str,
+        applied_mode: CrossfadeMode,
+        smart_fade: SmartFade | None = None,
+        tail_seconds: float = 0.0,
+    ) -> None:
+        """
+        Publish on the outgoing item how its boundary into the next item will play.
+
+        The ``transition_*`` extra attributes describe the planned transition: its mode,
+        the smart fade's tier and strategy, where the mix starts and ends in outgoing-song
+        seconds, the overlap, where the incoming item enters and the outgoing deck's final
+        tempo ratio. A later call replaces them; a new stream of the item drops them.
+
+        :param queue_id: Queue the item is streamed from.
+        :param outgoing: Queue item that is ending.
+        :param next_item_id: Queue item the boundary leads into.
+        :param applied_mode: Mode of the fade that will be applied, DISABLED for none.
+        :param smart_fade: The built fade, None when there is none.
+        :param tail_seconds: Seconds of the outgoing tail the fade was built on.
+        """
+        attrs = outgoing.extra_attributes
+        for key in [key for key in attrs if key.startswith("transition_")]:
+            del attrs[key]
+        attrs["transition_next_item_id"] = next_item_id
+        attrs["transition_locked_at"] = utc_timestamp()
+        attrs["transition_mode"] = applied_mode.value
+        if smart_fade is not None:
+            timing = smart_fade.timing_info
+            ratio = 1.0
+            mix_end: float | None = None
+            if isinstance(smart_fade, SmartCrossFade) and smart_fade.plan is not None:
+                plan = smart_fade.plan
+                if plan.tempo_plan.steps:
+                    ratio = plan.tempo_plan.steps[-1][1]
+                # the assembler's own mapping of the plan onto the outgoing song
+                mix_end = smart_fade.planner.buffer_offset + plan.fade_out_window
+                attrs["transition_tier"] = plan.tier.value
+                attrs["transition_strategy"] = plan.metrics.strategy.value
+            elif (
+                isinstance(smart_fade, StandardCrossFade)
+                and outgoing.streamdetails is not None
+                and outgoing.streamdetails.duration
+            ):
+                # a standard fade ends where the held tail ends
+                mix_end = (
+                    outgoing.streamdetails.duration
+                    - tail_seconds
+                    + timing.pre_crossfade_duration
+                    + timing.crossfade_duration
+                )
+            attrs["transition_overlap"] = round(timing.crossfade_duration, 3)
+            attrs["transition_incoming_entry"] = round(timing.fadein_trimmed_duration, 3)
+            attrs["transition_tempo_ratio"] = round(ratio, 4)
+            if mix_end is not None:
+                attrs["transition_mix_end"] = round(mix_end, 3)
+                attrs["transition_mix_start"] = round(
+                    mix_end - timing.crossfade_duration * ratio, 3
+                )
+        self.mass.player_queues.signal_update(queue_id)
+
+    def _drop_transition_report(self, queue_item: QueueItem) -> None:
+        """
+        Remove a transition report that no longer describes how the item will end.
+
+        :param queue_item: Queue item whose ``transition_*`` extra attributes are dropped.
+        """
+        attrs = queue_item.extra_attributes
+        stale = [key for key in attrs if key.startswith("transition_")]
+        for key in stale:
+            del attrs[key]
+        if stale:
+            self.mass.player_queues.signal_update(queue_item.queue_id)
 
     async def _await_pending_crossfade(
         self, queue: PlayerQueue, queue_item: QueueItem

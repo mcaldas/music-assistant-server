@@ -90,6 +90,8 @@ class SmartCrossFadePlanner(TransitionPlanner):
         ctx = build_transition_context(
             fade_out_analysis, fade_in_analysis, buffer_duration, self.logger
         )
+        # read by the caller to place the plan in the outgoing song
+        self.buffer_offset = ctx.buffer_offset
         factory = CandidateFactory(ctx, self.logger)
         specs = [spec for generator in default_generators() for spec in generator.generate(ctx)]
         candidates = [candidate for spec in specs if (candidate := factory.build(spec)) is not None]

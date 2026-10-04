@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from collections import deque
 from collections.abc import AsyncGenerator
 from types import SimpleNamespace
-from typing import TYPE_CHECKING, Any, cast
+from typing import Any, cast
 from unittest.mock import AsyncMock, MagicMock
 
+import pytest
 from music_assistant_models.enums import ContentType, CrossfadeMode, MediaType
 from music_assistant_models.errors import QueueEmpty
 from music_assistant_models.media_items import AudioFormat
@@ -16,10 +18,11 @@ from music_assistant_models.media_items import AudioFormat
 from music_assistant.controllers.streams import audio as audio_module
 from music_assistant.controllers.streams.audio import StreamsAudio
 from music_assistant.controllers.streams.audio_buffer import AudioBuffer
-from music_assistant.controllers.streams.smart_fades.fades import StandardCrossFade
-
-if TYPE_CHECKING:
-    import pytest
+from music_assistant.controllers.streams.smart_fades.fades import (
+    SmartCrossFade,
+    StandardCrossFade,
+)
+from music_assistant.models.audio_analysis import AudioAnalysisData
 
 TEST_PCM_FORMAT = AudioFormat(
     content_type=ContentType.PCM_S16LE,
@@ -220,6 +223,41 @@ def _install_counting_mix(monkeypatch: pytest.MonkeyPatch, audio: StreamsAudio) 
     return calls
 
 
+def _grid_analysis(bpm: float, duration: float = 240.0) -> AudioAnalysisData:
+    """Build an analysis row with a steady 4/4 grid and an audible, flat energy curve."""
+    beats = [index * 60.0 / bpm for index in range(int(duration * bpm / 60.0) + 1)]
+    return AudioAnalysisData(
+        duration=duration,
+        bpm=bpm,
+        beats=beats,
+        downbeats=beats[::4],
+        rms_energy=[0.5] * 1800,
+        key="A",
+        mode="minor",
+    )
+
+
+def _smart_fade() -> SmartCrossFade:
+    """Build a real smart fade between two tracks close enough in tempo to be ramped."""
+    fade = SmartCrossFade(
+        logger=logging.getLogger(__name__),
+        fade_out_analysis=_grid_analysis(120.0),
+        fade_in_analysis=_grid_analysis(123.0),
+    )
+    window_size = TEST_PCM_FORMAT.pcm_sample_size * 45
+    fade.build(window_size, window_size, TEST_PCM_FORMAT)
+    return fade
+
+
+def _transition_keys(queue_item: SimpleNamespace) -> dict[str, Any]:
+    """Return the transition report published on a queue item."""
+    return {
+        key: value
+        for key, value in queue_item.extra_attributes.items()
+        if key.startswith("transition_")
+    }
+
+
 async def test_flow_prefetches_the_incoming_fade_in_during_the_holdback(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -343,6 +381,8 @@ async def test_flow_reports_no_crossfade_when_the_transition_is_denied(
         ("item-1", CrossfadeMode.DISABLED),
         ("item-2", CrossfadeMode.DISABLED),
     ]
+    # the tail was never held back, so no boundary was planned to publish
+    assert not _transition_keys(first_item)
 
 
 async def test_flow_reports_a_smart_fade_that_degraded_to_standard(
@@ -663,3 +703,225 @@ async def test_disable_crossfade_mid_session_applies_at_next_transition(
         ("item-2", CrossfadeMode.DISABLED),
     ]
     assert emitted == TEST_PCM_FORMAT.pcm_sample_size * 60
+    report = _transition_keys(first_item)
+    assert report["transition_mode"] == "disabled"
+    assert report["transition_next_item_id"] == "item-2"
+
+
+def test_report_transition_publishes_the_smart_plan(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A smart fade's report places the mix on the outgoing song's own grid."""
+    outgoing = _queue_item("item-1", "First", duration=240)
+    audio, _queue, mass = _flow_audio(monkeypatch, next_item=None, load_next=[QueueEmpty])
+    fade = _smart_fade()
+    plan = fade.plan
+    assert plan is not None
+    ratio = plan.tempo_plan.steps[-1][1]
+    # a ramped plan, so a mix start that ignores the tempo ratio lands off the grid
+    assert ratio != pytest.approx(1.0)
+
+    audio._report_transition(
+        "queue-1",
+        cast("Any", outgoing),
+        "item-2",
+        CrossfadeMode.SMART_CROSSFADE,
+        fade,
+        45.0,
+    )
+
+    report = _transition_keys(outgoing)
+    bar_seconds = 4 * 60.0 / 120.0
+    assert report["transition_next_item_id"] == "item-2"
+    assert report["transition_mode"] == "smart_crossfade"
+    assert report["transition_tier"] == plan.tier.value
+    assert report["transition_strategy"] == plan.metrics.strategy.value
+    # the blend runs out with the song and starts on one of its downbeats
+    assert report["transition_mix_end"] == pytest.approx(240.0, abs=1e-3)
+    assert report["transition_mix_start"] < report["transition_mix_end"]
+    assert report["transition_mix_start"] / bar_seconds == pytest.approx(
+        round(report["transition_mix_start"] / bar_seconds), abs=0.01
+    )
+    assert report["transition_tempo_ratio"] == pytest.approx(ratio, abs=1e-4)
+    mass.player_queues.signal_update.assert_called_once_with("queue-1")
+
+
+def test_report_transition_places_a_standard_fade_at_the_held_tail(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A standard fade over the whole held tail ends with the song and has no smart keys."""
+    outgoing = _queue_item("item-1", "First", duration=300)
+    audio, _queue, _mass = _flow_audio(monkeypatch, next_item=None, load_next=[QueueEmpty])
+    fade = StandardCrossFade(logger=MagicMock(), crossfade_duration=STANDARD_CROSSFADE_DURATION)
+    overlap_size = TEST_PCM_FORMAT.pcm_sample_size * STANDARD_CROSSFADE_DURATION
+    fade.build(overlap_size, overlap_size, TEST_PCM_FORMAT)
+
+    audio._report_transition(
+        "queue-1",
+        cast("Any", outgoing),
+        "item-2",
+        CrossfadeMode.STANDARD_CROSSFADE,
+        fade,
+        float(STANDARD_CROSSFADE_DURATION),
+    )
+
+    report = _transition_keys(outgoing)
+    assert report["transition_mode"] == "standard_crossfade"
+    assert report["transition_mix_end"] == pytest.approx(300.0)
+    assert report["transition_mix_start"] == pytest.approx(300.0 - STANDARD_CROSSFADE_DURATION)
+    assert report["transition_tempo_ratio"] == 1.0
+    assert not {"transition_tier", "transition_strategy"} & report.keys()
+
+
+def test_report_transition_rewrite_drops_the_old_plan(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A later DISABLED report replaces every key of the smart plan before it."""
+    outgoing = _queue_item("item-1", "First")
+    outgoing.extra_attributes["playback_speed"] = 1.0
+    audio, _queue, mass = _flow_audio(monkeypatch, next_item=None, load_next=[QueueEmpty])
+    audio._report_transition(
+        "queue-1", cast("Any", outgoing), "item-2", CrossfadeMode.SMART_CROSSFADE, _smart_fade()
+    )
+
+    audio._report_transition("queue-1", cast("Any", outgoing), "item-3", CrossfadeMode.DISABLED)
+
+    report = _transition_keys(outgoing)
+    assert report.keys() == {
+        "transition_next_item_id",
+        "transition_locked_at",
+        "transition_mode",
+    }
+    assert report["transition_next_item_id"] == "item-3"
+    assert report["transition_mode"] == "disabled"
+    # attributes that are not part of the report are left alone
+    assert outgoing.extra_attributes["playback_speed"] == 1.0
+    assert mass.player_queues.signal_update.call_count == 2
+
+
+async def test_flow_publishes_the_transition_before_the_mix_plays(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The boundary's report, with the degraded mode, is on the outgoing item before any mix."""
+    first_item = _queue_item("item-1", "First")
+    second_item = _queue_item("item-2", "Second")
+    degraded = StandardCrossFade(logger=MagicMock(), crossfade_duration=STANDARD_CROSSFADE_DURATION)
+    overlap_size = TEST_PCM_FORMAT.pcm_sample_size * STANDARD_CROSSFADE_DURATION
+    degraded.build(overlap_size, overlap_size, TEST_PCM_FORMAT)
+    audio, queue, _mass = _flow_audio(
+        monkeypatch,
+        next_item=second_item,
+        load_next=[second_item, QueueEmpty],
+        crossfade_mode=CrossfadeMode.SMART_CROSSFADE,
+        build_result=degraded,
+    )
+    _install_item_streams(monkeypatch, audio, {"item-1": 60, "item-2": 60})
+    snapshots: list[dict[str, Any]] = []
+    mix = audio.smart_fades_mixer.mix
+
+    def _snapshotting_mix(*args: Any, **kwargs: Any) -> AsyncGenerator[bytes]:
+        snapshots.append(_transition_keys(first_item))
+        return mix(*args, **kwargs)
+
+    monkeypatch.setattr(audio.smart_fades_mixer, "mix", _snapshotting_mix)
+
+    stream = audio.get_queue_flow_stream(
+        cast("Any", queue), cast("Any", first_item), TEST_PCM_FORMAT, session_id="session-1"
+    )
+    await _drain(stream)
+
+    assert len(snapshots) == 1
+    assert snapshots[0]["transition_mode"] == "standard_crossfade"
+    assert snapshots[0]["transition_next_item_id"] == "item-2"
+
+
+async def test_flow_reports_a_failed_mix_as_disabled(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A mix that fails before any audio rewrites the boundary's report to disabled."""
+    first_item = _queue_item("item-1", "First")
+    second_item = _queue_item("item-2", "Second")
+    audio, queue, _mass = _flow_audio(
+        monkeypatch, next_item=second_item, load_next=[second_item, QueueEmpty]
+    )
+    _install_item_streams(monkeypatch, audio, {"item-1": 40, "item-2": 20})
+
+    async def _failing_mix(*_args: object, **_kwargs: object) -> AsyncGenerator[bytes]:
+        msg = "mixer failed"
+        raise RuntimeError(msg)
+        yield b""  # type: ignore[unreachable]
+
+    monkeypatch.setattr(audio.smart_fades_mixer, "mix", _failing_mix)
+
+    stream = audio.get_queue_flow_stream(
+        cast("Any", queue), cast("Any", first_item), TEST_PCM_FORMAT, session_id="session-1"
+    )
+    await _drain(stream)
+
+    report = _transition_keys(first_item)
+    assert report["transition_mode"] == "disabled"
+    assert report["transition_next_item_id"] == "item-2"
+    assert "transition_overlap" not in report
+
+
+async def test_flow_publishes_a_smart_plan(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A smart fade built at the boundary reaches the outgoing item's report."""
+    first_item = _queue_item("item-1", "First", duration=240)
+    second_item = _queue_item("item-2", "Second", duration=240)
+    audio, queue, _mass = _flow_audio(
+        monkeypatch,
+        next_item=second_item,
+        load_next=[second_item, QueueEmpty],
+        crossfade_mode=CrossfadeMode.SMART_CROSSFADE,
+        build_result=_smart_fade(),
+    )
+    _install_item_streams(monkeypatch, audio, {"item-1": 240, "item-2": 60})
+
+    await _drain(
+        audio.get_queue_flow_stream(
+            cast("Any", queue), cast("Any", first_item), TEST_PCM_FORMAT, session_id="session-1"
+        )
+    )
+
+    report = _transition_keys(first_item)
+    assert report["transition_mode"] == "smart_crossfade"
+    assert report["transition_next_item_id"] == "item-2"
+    assert report["transition_tier"] == "full_blend"
+    assert report["transition_mix_end"] == pytest.approx(240.0, abs=1e-3)
+
+
+async def test_flow_drops_the_plan_into_a_track_that_produced_nothing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A fade planned into a silent next track is dropped once the track is skipped."""
+    first_item = _queue_item("item-1", "First")
+    second_item = _queue_item("item-2", "Second")
+    audio, queue, mass = _flow_audio(
+        monkeypatch, next_item=second_item, load_next=[second_item, QueueEmpty]
+    )
+    _install_item_streams(monkeypatch, audio, {"item-1": 40, "item-2": 0})
+
+    await _drain(
+        audio.get_queue_flow_stream(
+            cast("Any", queue), cast("Any", first_item), TEST_PCM_FORMAT, session_id="session-1"
+        )
+    )
+
+    assert not _transition_keys(first_item)
+    mass.player_queues.signal_update.assert_called_with("queue-1")
+
+
+async def test_a_new_stream_of_an_item_drops_its_old_report(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Playing an item again drops the boundary reported while it played before."""
+    item = _queue_item("item-1", "First")
+    item.media_type = MediaType.AUDIO_SOURCE
+    item.extra_attributes["playback_speed"] = 1.0
+    audio, _queue, mass = _flow_audio(monkeypatch, next_item=None, load_next=[QueueEmpty])
+    audio._report_transition("queue-1", cast("Any", item), "item-2", CrossfadeMode.DISABLED)
+
+    async def _no_audio(**_kwargs: object) -> AsyncGenerator[bytes]:
+        return
+        yield b""  # type: ignore[unreachable]
+
+    monkeypatch.setattr(audio, "get_audio_source_stream", _no_audio)
+    await _drain(audio.get_queue_item_stream(cast("Any", item), TEST_PCM_FORMAT))
+
+    assert not _transition_keys(item)
+    assert item.extra_attributes["playback_speed"] == 1.0
+    assert mass.player_queues.signal_update.call_count == 2

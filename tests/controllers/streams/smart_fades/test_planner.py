@@ -134,6 +134,16 @@ class TestSmartCrossFadePlanner:
         # the swap sits inside the overlap
         assert 0.0 < eq.swap_at < plan.crossfade_duration
 
+    def test_records_where_the_buffer_starts_in_the_song(self) -> None:
+        """A plan leaves the buffer's start in the outgoing song on the planner."""
+        out = _analysis(120.0)
+        assert out.duration is not None
+        planner = SmartCrossFadePlanner(LOGGER)
+
+        planner.plan(out, _analysis(122.0), 45.0)
+
+        assert planner.buffer_offset == pytest.approx(out.duration - 45.0)
+
     def test_is_deterministic(self) -> None:
         """Planning the same inputs twice yields identical plans (pure function)."""
         out, inc = _analysis(120.0), _analysis(123.0)

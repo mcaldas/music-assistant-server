@@ -8,7 +8,7 @@ import time
 from collections.abc import AsyncGenerator
 from types import SimpleNamespace
 from typing import Any, cast
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, call
 
 import pytest
 from music_assistant_models.enums import ContentType, CrossfadeMode, MediaType, StreamType
@@ -225,6 +225,11 @@ async def test_unprepared_next_track_flushes_outgoing_tail_without_opening_sourc
     build.assert_not_awaited()
     # the missing incoming audio is (re)requested relative to the outgoing item
     mass.player_queues.prepare_next_audio_buffer.assert_called_once_with("queue-1", "current")
+    # the next item was locked and signalled, then the boundary reported as no fade
+    assert queue.index_in_buffer == 1
+    assert mass.player_queues.signal_update.call_args_list == [call("queue-1"), call("queue-1")]
+    assert current_item.extra_attributes["transition_mode"] == "disabled"
+    assert current_item.extra_attributes["transition_next_item_id"] == "next"
 
 
 @pytest.mark.parametrize("playback_speed", [0.5, 2.0])
@@ -348,3 +353,96 @@ async def test_crossfade_reads_its_window_past_the_resident_buffer(
     # the next track resumes at the media time the blend already played
     assert crossfade_data.fade_in_media_duration == pytest.approx(expected_window * playback_speed)
     assert crossfade_data.fade_in_media_duration <= next_details.duration / 2
+    # the boundary was published with the mode that was built
+    assert current_item.extra_attributes["transition_mode"] == "standard_crossfade"
+    assert current_item.extra_attributes["transition_next_item_id"] == "next"
+    assert current_item.extra_attributes["transition_overlap"] == crossfade_duration
+
+
+async def test_a_failed_mix_is_reported_as_no_fade() -> None:
+    """A single-item mix that fails before any audio plays the tail as is and reports it."""
+    pcm_format = AudioFormat(
+        content_type=ContentType.PCM_S16LE,
+        sample_rate=8000,
+        bit_depth=16,
+        channels=2,
+    )
+    current_item = SimpleNamespace(
+        queue_id="queue-1",
+        queue_item_id="current",
+        name="Current",
+        streamdetails=SimpleNamespace(
+            duration=16,
+            seek_position=0,
+            seconds_streamed=0,
+            uri="test://current",
+            buffer=_delivered_buffer(),
+            is_realtime=False,
+        ),
+        extra_attributes={},
+    )
+    next_item = SimpleNamespace(
+        queue_id="queue-1",
+        queue_item_id="next",
+        name="Next",
+        streamdetails=SimpleNamespace(
+            audio_format=pcm_format,
+            buffer=_buffer(16, ready=True),
+            duration=16,
+            seek_position=0,
+            uri="test://next",
+            volume_normalization_mode=None,
+            is_realtime=False,
+        ),
+        extra_attributes={},
+        available=True,
+    )
+    mass = MagicMock()
+    mass.player_queues.get.return_value = SimpleNamespace(
+        queue_id="queue-1", display_name="Queue", index_in_buffer=0
+    )
+    mass.player_queues.load_next_queue_item = AsyncMock(return_value=next_item)
+    mass.player_queues.index_by_id.return_value = 1
+    audio = StreamsAudio(cast("Any", mass))
+    audio.setup()
+    audio.select_pcm_format = AsyncMock(return_value=pcm_format)  # type: ignore[method-assign]
+    audio.crossfade_allowed = MagicMock(return_value=True)  # type: ignore[method-assign]
+    audio.smart_fades_mixer.build = AsyncMock(  # type: ignore[method-assign]
+        return_value=SimpleNamespace(
+            timing_info=SimpleNamespace(
+                pre_crossfade_duration=0,
+                post_crossfade_duration=0,
+                crossfade_duration=8,
+                fadein_trimmed_duration=0,
+            )
+        )
+    )
+
+    async def _failing_mix(*_args: object, **_kwargs: object) -> AsyncGenerator[bytes]:
+        msg = "mixer failed"
+        raise RuntimeError(msg)
+        yield b""  # type: ignore[unreachable]
+
+    async def _item_stream(
+        queue_item: object, *_args: object, **_kwargs: object
+    ) -> AsyncGenerator[bytes]:
+        for _ in range(16 if queue_item is current_item else 0):
+            yield _audio(pcm_format, 1)
+
+    audio.smart_fades_mixer.mix = _failing_mix  # type: ignore[method-assign]
+    audio.get_queue_item_stream = _item_stream  # type: ignore[method-assign]
+    stream = audio.get_queue_item_stream_with_smartfade(
+        cast("Any", SimpleNamespace(player_id="player-1", name="Player")),
+        cast("Any", current_item),
+        pcm_format,
+        crossfade_mode=CrossfadeMode.STANDARD_CROSSFADE,
+        standard_crossfade_duration=8,
+    )
+
+    emitted = sum([len(chunk) async for chunk in stream])
+
+    # the whole outgoing track still plays, and nobody is told a fade is coming
+    assert emitted == pcm_format.pcm_sample_size * 16
+    assert current_item.extra_attributes["transition_mode"] == "disabled"
+    assert current_item.extra_attributes["transition_next_item_id"] == "next"
+    assert "transition_overlap" not in current_item.extra_attributes
