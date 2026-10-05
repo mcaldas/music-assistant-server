@@ -725,7 +725,7 @@ def test_report_transition_publishes_the_smart_plan(monkeypatch: pytest.MonkeyPa
         "item-2",
         CrossfadeMode.SMART_CROSSFADE,
         fade,
-        45.0,
+        195.0,
     )
 
     report = _transition_keys(outgoing)
@@ -748,6 +748,7 @@ def test_report_transition_places_a_standard_fade_at_the_held_tail(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A standard fade over the whole held tail ends with the song and has no smart keys."""
+    # the item's whole-second duration is not where the song really ends
     outgoing = _queue_item("item-1", "First", duration=300)
     audio, _queue, _mass = _flow_audio(monkeypatch, next_item=None, load_next=[QueueEmpty])
     fade = StandardCrossFade(logger=MagicMock(), crossfade_duration=STANDARD_CROSSFADE_DURATION)
@@ -760,13 +761,13 @@ def test_report_transition_places_a_standard_fade_at_the_held_tail(
         "item-2",
         CrossfadeMode.STANDARD_CROSSFADE,
         fade,
-        float(STANDARD_CROSSFADE_DURATION),
+        299.6 - STANDARD_CROSSFADE_DURATION,
     )
 
     report = _transition_keys(outgoing)
     assert report["transition_mode"] == "standard_crossfade"
-    assert report["transition_mix_end"] == pytest.approx(300.0)
-    assert report["transition_mix_start"] == pytest.approx(300.0 - STANDARD_CROSSFADE_DURATION)
+    assert report["transition_mix_end"] == pytest.approx(299.6)
+    assert report["transition_mix_start"] == pytest.approx(299.6 - STANDARD_CROSSFADE_DURATION)
     assert report["transition_tempo_ratio"] == 1.0
     assert not {"transition_tier", "transition_strategy"} & report.keys()
 
@@ -869,7 +870,8 @@ async def test_flow_publishes_a_smart_plan(monkeypatch: pytest.MonkeyPatch) -> N
         crossfade_mode=CrossfadeMode.SMART_CROSSFADE,
         build_result=_smart_fade(),
     )
-    _install_item_streams(monkeypatch, audio, {"item-1": 240, "item-2": 60})
+    # the audio the source delivers is 4 s shorter than the analysed track
+    _install_item_streams(monkeypatch, audio, {"item-1": 236, "item-2": 60})
 
     await _drain(
         audio.get_queue_flow_stream(
@@ -881,7 +883,8 @@ async def test_flow_publishes_a_smart_plan(monkeypatch: pytest.MonkeyPatch) -> N
     assert report["transition_mode"] == "smart_crossfade"
     assert report["transition_next_item_id"] == "item-2"
     assert report["transition_tier"] == "full_blend"
-    assert report["transition_mix_end"] == pytest.approx(240.0, abs=1e-3)
+    # placed on the audio that played, not on the analysis' length
+    assert report["transition_mix_end"] == pytest.approx(236.0, abs=1e-3)
 
 
 async def test_flow_drops_the_plan_into_a_track_that_produced_nothing(
@@ -925,3 +928,32 @@ async def test_a_new_stream_of_an_item_drops_its_old_report(
     assert not _transition_keys(item)
     assert item.extra_attributes["playback_speed"] == 1.0
     assert mass.player_queues.signal_update.call_count == 2
+
+
+async def test_flow_places_a_mixed_in_track_on_its_own_audio(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A track that came in through a mix counts the audio the mixer read of it too."""
+    first_item = _queue_item("item-1", "First", duration=240)
+    second_item = _queue_item("item-2", "Second", duration=240)
+    third_item = _queue_item("item-3", "Third", duration=240)
+    audio, queue, _mass = _flow_audio(
+        monkeypatch,
+        next_item=second_item,
+        load_next=[second_item, third_item, QueueEmpty],
+        crossfade_mode=CrossfadeMode.SMART_CROSSFADE,
+        build_result=_smart_fade(),
+    )
+    _install_item_streams(monkeypatch, audio, {"item-1": 240, "item-2": 236, "item-3": 60})
+
+    await _drain(
+        audio.get_queue_flow_stream(
+            cast("Any", queue), cast("Any", first_item), TEST_PCM_FORMAT, session_id="session-1"
+        )
+    )
+
+    assert _transition_keys(first_item)["transition_mix_end"] == pytest.approx(240.0, abs=1e-3)
+    report = _transition_keys(second_item)
+    assert report["transition_next_item_id"] == "item-3"
+    # the stand-in fade was planned on a 45 s tail; this tail is a few ms shorter
+    assert report["transition_mix_end"] == pytest.approx(236.0, abs=0.01)

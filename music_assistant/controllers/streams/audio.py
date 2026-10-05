@@ -1950,6 +1950,8 @@ class StreamsAudio:
             discard_position = float(streamdetails.seek_position)
 
         total_chunks_received = 0
+        # the source's bytes, which place the held tail in song seconds
+        received_bytes = 0
         playback_speed = cast("float", queue_item.extra_attributes.get("playback_speed", 1.0))
         async for chunk in self.get_queue_item_stream(
             queue_item,
@@ -1961,6 +1963,7 @@ class StreamsAudio:
             exact_seek=exact_buffer_seek,
         ):
             total_chunks_received += 1
+            received_bytes += len(chunk)
             tail_window.extend(chunk)
             del chunk
             hold_target = tail_hold_target(queue_item, crossfade_buffer_size, frame_size)
@@ -2107,7 +2110,10 @@ class StreamsAudio:
                         next_queue_item.queue_item_id,
                         applied_mode,
                         smart_fade,
-                        len(fade_out_data) / pcm_format.pcm_sample_size,
+                        discard_position
+                        + (received_bytes - len(fade_out_data))
+                        / pcm_format.pcm_sample_size
+                        * playback_speed,
                     )
                     next_handover = CrossfadeHandover(
                         stream=None,
@@ -2336,6 +2342,8 @@ class StreamsAudio:
         last_streamdetails: StreamDetails | None = None
         last_queue_track: QueueItem | None = None
         last_play_log_entry: PlayLogEntry | None = None
+        # song second where the held tail of the outgoing track starts
+        last_tail_start = 0.0
         # Snapshot the queue's current session_id. PlayerQueues rotates this on
         # every new stream session, so if a newer producer takes over the queue
         # (rapid track switch, sync-group reform, dynamic leader handoff) the
@@ -2621,7 +2629,7 @@ class StreamsAudio:
                                 queue_track.queue_item_id,
                                 applied_mode,
                                 crossfade_smart_fade,
-                                len(last_fadeout_part) / pcm_sample_size,
+                                last_tail_start,
                             )
                 # no fade is credited to this track until one is really rendered below
                 self._report_crossfade_mode(
@@ -2637,6 +2645,8 @@ class StreamsAudio:
                 flow_log.append(play_log_entry)
 
                 bytes_written = 0
+                # the item's source bytes, read here or pulled by the mixer
+                received_bytes = 0
                 crossfade_buffer = bytearray()
                 first_chunk_received = False
                 holding_back = item_crossfade_mode != CrossfadeMode.DISABLED
@@ -2670,6 +2680,7 @@ class StreamsAudio:
                             )
                             return
                         total_chunks_received += 1
+                        received_bytes += len(chunk)
                         if not first_chunk_received:
                             first_chunk_received = True
                             # inform the queue that the track is now loaded in the buffer
@@ -2736,8 +2747,9 @@ class StreamsAudio:
                                 # the mixer reads the incoming stream itself for the
                                 # length of the overlap, so the loop below cannot see
                                 # those bytes; the overshoot bookkeeping needs them
-                                nonlocal overlap_pulled
+                                nonlocal overlap_pulled, received_bytes
                                 overlap_pulled += count
+                                received_bytes += count
 
                             overlap_stream = _incoming_overlap_stream(
                                 bytes(crossfade_buffer),
@@ -2948,6 +2960,12 @@ class StreamsAudio:
                     flow_mode=True,
                 ):
                     last_fadeout_part = bytes(crossfade_buffer[-crossfade_buffer_size:])
+                    last_tail_start = (
+                        int(raw_seek_position)
+                        + (received_bytes - len(last_fadeout_part))
+                        / pcm_sample_size
+                        * track_playback_speed
+                    )
                     last_streamdetails = queue_track.streamdetails
                     last_queue_track = queue_track
                     last_play_log_entry = play_log_entry
@@ -4310,7 +4328,7 @@ class StreamsAudio:
         next_item_id: str,
         applied_mode: CrossfadeMode,
         smart_fade: SmartFade | None = None,
-        tail_seconds: float = 0.0,
+        tail_start: float | None = None,
     ) -> None:
         """
         Publish on the outgoing item how its boundary into the next item will play.
@@ -4325,7 +4343,7 @@ class StreamsAudio:
         :param next_item_id: Queue item the boundary leads into.
         :param applied_mode: Mode of the fade that will be applied, DISABLED for none.
         :param smart_fade: The built fade, None when there is none.
-        :param tail_seconds: Seconds of the outgoing tail the fade was built on.
+        :param tail_start: Song second where the outgoing tail the fade was built on starts.
         """
         attrs = outgoing.extra_attributes
         for key in [key for key in attrs if key.startswith("transition_")]:
@@ -4341,22 +4359,14 @@ class StreamsAudio:
                 plan = smart_fade.plan
                 if plan.tempo_plan.steps:
                     ratio = plan.tempo_plan.steps[-1][1]
-                # the assembler's own mapping of the plan onto the outgoing song
-                mix_end = smart_fade.planner.buffer_offset + plan.fade_out_window
+                if tail_start is not None:
+                    # the plan's exit is measured from the start of the held tail
+                    mix_end = tail_start + plan.fade_out_window
                 attrs["transition_tier"] = plan.tier.value
                 attrs["transition_strategy"] = plan.metrics.strategy.value
-            elif (
-                isinstance(smart_fade, StandardCrossFade)
-                and outgoing.streamdetails is not None
-                and outgoing.streamdetails.duration
-            ):
-                # a standard fade ends where the held tail ends
-                mix_end = (
-                    outgoing.streamdetails.duration
-                    - tail_seconds
-                    + timing.pre_crossfade_duration
-                    + timing.crossfade_duration
-                )
+            elif isinstance(smart_fade, StandardCrossFade) and tail_start is not None:
+                # a standard fade ends where its overlap ends in the held tail
+                mix_end = tail_start + timing.pre_crossfade_duration + timing.crossfade_duration
             attrs["transition_overlap"] = round(timing.crossfade_duration, 3)
             attrs["transition_incoming_entry"] = round(timing.fadein_trimmed_duration, 3)
             attrs["transition_tempo_ratio"] = round(ratio, 4)
