@@ -286,6 +286,22 @@ def test_without_an_exit_a_phrase_sung_to_the_end_still_falls_back() -> None:
     assert (planner.outcome, planner.reason) == ("fallback", "vocal")
 
 
+@pytest.mark.parametrize("adlib", [(226.0, 230.0), (234.0, 237.0)])
+@pytest.mark.parametrize("style", ["cut", "quick_fade"])
+def test_without_an_exit_a_late_ad_lib_does_not_hold_the_outro(
+    style: str, adlib: tuple[float, float]
+) -> None:
+    """Smart Fades leaves at 214 s; keeping an ad-lib 6+ bars into the quiet outro would not."""
+    out = _with_vocal_activity(
+        _analysis(120.0, rms_energy=_outro_from(215.0)), [(200.0, 213.0), adlib]
+    )
+
+    planner, plan = _plan(out, _analysis(122.0), style)
+
+    assert (planner.outcome, planner.reason) == ("fallback", "vocal")
+    assert plan == SmartCrossFadePlanner(LOGGER).plan(out, _analysis(122.0), 45.0)
+
+
 def test_without_an_exit_a_blend_never_walks_back_from_smart_fades_exit() -> None:
     """Past the end of A's beat grid (226 s) no blend fits; an exit at 224 s would leave A early."""
     out, inc = _grid_ending_at(_analysis(120.0), 226.0), _analysis(124.0)

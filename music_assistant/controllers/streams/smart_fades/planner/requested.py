@@ -63,6 +63,9 @@ _QUICK_FADE_DRIFT_S = 0.04
 # a vocal window starting this little before B's one is the 1800-bin timeline's
 # rounding, not a pickup
 _VOCAL_ONSET_SLACK_S = 0.25
+# how many bars past Smart Fades' own exit a phrase may move the exit when no exit is named;
+# further on, A would play its outro alone to keep a late ad-lib
+_MAX_EXIT_DELAY_BARS = 4
 
 
 @dataclass(frozen=True, slots=True)
@@ -238,10 +241,15 @@ class RequestedTransitionPlanner(TransitionPlanner):
             tries = [exit_s]
         else:
             # A's phrases are kept whole: the exit moves from Smart Fades' own to the nearest
-            # downbeat no sung phrase of A runs past (the later one on a tie)
+            # downbeat no sung phrase of A runs past (the later one on a tie), a few bars at most
             sung_end = ctx.vocal_out_scoring.last_end() if ctx.vocal_out_scoring else 0.0
+            latest = ctx.default_anchor + _MAX_EXIT_DELAY_BARS * bar_out
             tries = sorted(
-                (d for d in exits if d >= sung_end - VocalTruncationPolicy.max_truncated_vocal),
+                (
+                    d
+                    for d in exits
+                    if sung_end - VocalTruncationPolicy.max_truncated_vocal <= d <= latest
+                ),
                 key=lambda downbeat: (abs(downbeat - ctx.default_anchor), -downbeat),
             ) or [min(exits, key=lambda downbeat: abs(downbeat - ctx.default_anchor))]
             # when that one does not plan only later ones are tried: an earlier exit keeps no
