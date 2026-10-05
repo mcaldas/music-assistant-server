@@ -961,7 +961,10 @@ def test_filter_sweep_is_the_blend_handed_over_by_filters(bars: int, exit_at: fl
     assert plan.sweep_out.steps[0] == (0.0, 10.0)
     assert plan.sweep_out.steps[1] == pytest.approx((start, 10.0))
     assert plan.sweep_out.steps[-1] == pytest.approx((plan.fade_out_window, 8000.0))
-    assert plan.sweep_out.mix_steps == []
+    # ...but dry until the overlap, its high-pass fading in over the overlap's first second
+    assert plan.sweep_out.mix_steps[0] == (0.0, 0.0)
+    assert plan.sweep_out.mix_steps[1] == pytest.approx((start, 0.0))
+    assert plan.sweep_out.mix_steps[-1] == pytest.approx((start + 1.0, 1.0))
     # B: opens from 250 Hz by 3/4 of the overlap, dry by 9/10 of it
     assert plan.sweep_in.steps[0] == (0.0, 250.0)
     assert plan.sweep_in.steps[-1][1] == pytest.approx(8000.0)

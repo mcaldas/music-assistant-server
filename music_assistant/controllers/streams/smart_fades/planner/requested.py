@@ -108,11 +108,14 @@ _FADED_FRACTION = 0.1
 # a gap in the incoming PCM head: this long under its audible line, as a room hears one; the
 # head shows gaps the analysis' ~0.1-0.2 s bins blur
 _GAP_S = 0.03
-# filter_sweep: the outgoing high-pass rises over the whole overlap; the incoming low-pass
-# opens over its first 3/4 and fades to dry by 9/10 of it, ahead of asendcmd's frame
+# filter_sweep: the outgoing high-pass rises from 10 Hz over the whole overlap; the incoming
+# low-pass opens over its first 3/4 and fades to dry by 9/10 of it, ahead of asendcmd's frame
 # granularity (~0.1s), so the incoming track plays on untouched
-# (10 Hz until the overlap leaves A's sub-bass alone)
 _SWEEP_OUT_HZ = (10.0, 8000.0)
+# the outgoing track plays dry until the overlap: even at 10 Hz a high-pass turns the phase of
+# its bass, which can rebuild a limited master's peaks past full scale. The filter's wet share
+# then rises over the first half of the overlap, at most this long, on asendcmd's 10 ms frames
+_SWEEP_OUT_WET_S = 1.0
 _SWEEP_IN_HZ = (250.0, 8000.0)
 _SWEEP_IN_OPEN = 0.75
 _SWEEP_IN_DRY = 0.9
@@ -756,7 +759,11 @@ def _with_sweeps(plan: TransitionPlan) -> TransitionPlan:
             [
                 (0.0, _SWEEP_OUT_HZ[0]),
                 *_hz_ramp(start_out, overlap * ratio, *_SWEEP_OUT_HZ, step),
-            ]
+            ],
+            [
+                (0.0, 0.0),
+                *db_ramp(start_out, min(_SWEEP_OUT_WET_S, overlap * ratio / 2), 0.0, 1.0, 0.01),
+            ],
         ),
         sweep_in=SweepSchedule(
             _hz_ramp(0.0, opened, *_SWEEP_IN_HZ, step),

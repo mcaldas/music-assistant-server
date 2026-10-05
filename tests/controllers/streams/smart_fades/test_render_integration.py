@@ -1086,7 +1086,7 @@ def _bursts(freq: float, seconds: float, beat: float = 0.5, length: float = 0.08
 
 @pytest.mark.asyncio
 async def test_a_filter_sweep_hands_over_through_the_filters() -> None:
-    """A loses its bass first and B its highs until late; B then plays on bit-exact."""
+    """A loses its bass first and B its highs until late; A plays bit-exact before, B after."""
     fade_out = _tone(100.0, 45.0, 0.1) + _tone(1000.0, 45.0, 0.1) + _tone(6000.0, 45.0, 0.1)
     fade_in = _tone(150.0, 45.0, 0.1) + _tone(1500.0, 45.0, 0.1) + _tone(7000.0, 45.0, 0.1)
     swept, sweep = await _render_request(
@@ -1126,6 +1126,9 @@ async def test_a_filter_sweep_hands_over_through_the_filters() -> None:
     # B: enters through the low-pass, its bass as in the blend, its top held back
     assert _band_rms(early, 6950, 7050) < 0.03 * _band_rms(plain_early, 6950, 7050)
     assert _band_rms(early, 145, 155) > 0.5 * _band_rms(plain_early, 145, 155)
+    # before the overlap A plays on untouched (a high-pass, even at 10 Hz, would turn the
+    # phase of its bass and move its peaks): its own samples
+    assert np.array_equal(swept[: pre * 2], fade_out[: pre * 2])
     # after the overlap B plays on untouched: its own samples, delayed by the pre-point
     assert np.array_equal(swept[(pre + overlap) * 2 :], fade_in[overlap * 2 : len(swept) - pre * 2])
     # no gap: no 10 ms window of the overlap falls 20 dB under a single tone's level
