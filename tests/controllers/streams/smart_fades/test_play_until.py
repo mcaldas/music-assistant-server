@@ -14,14 +14,21 @@ from music_assistant.controllers.streams.smart_fades.planner.context import (
     build_transition_context,
 )
 from music_assistant.controllers.streams.smart_fades.planner.requested import (
+    BLEND_STYLES,
+    REQUEST_STYLES,
     RequestedTransitionPlanner,
     TransitionRequest,
 )
 from music_assistant.controllers.streams.smart_fades.vocal import parse_vocal_probabilities
+from music_assistant.models.audio_analysis import AudioAnalysisData
 from tests.controllers.streams.smart_fades.conftest import _analysis_with_bands
 from tests.controllers.streams.smart_fades.test_planner import _analysis, _vocal_probabilities
 
 LOGGER = logging.getLogger(__name__)
+# every requested style, an 8-bar one where it takes bars
+STYLES = [(style, 8 if style in BLEND_STYLES else 0) for style in REQUEST_STYLES]
+# an end three quarters into a bar of a 120 BPM track (2 s bars, a downbeat at 120 s)
+MID_BAR_END = 121.5
 
 
 def test_analysis_until_keeps_the_envelopes_usable() -> None:
@@ -102,3 +109,23 @@ async def test_the_mixer_cuts_the_outgoing_analysis_only_when_told() -> None:
     assert plain.timing_info == unset.timing_info
     assert cut.fade_out_analysis.duration == 150.0
     assert out.duration == 240.0
+
+
+def _requested(
+    out: AudioAnalysisData, style: str, bars: int, exit_at: float
+) -> tuple[RequestedTransitionPlanner, float]:
+    """Plan a request on a 45 s tail; return the planner and the exit in song seconds."""
+    planner = RequestedTransitionPlanner(LOGGER, TransitionRequest(style, "n", bars, exit_at), 45.0)
+    plan = planner.plan(out, _analysis(122.0), 45.0)
+    assert out.duration is not None
+    return planner, out.duration - 45.0 + plan.fade_out_window
+
+
+@pytest.mark.parametrize(("style", "bars"), STYLES)
+def test_an_exit_at_an_end_past_the_last_downbeat_takes_it(style: str, bars: int) -> None:
+    """An exit_at at a mid-bar end: the next downbeat is past the end, so A leaves at 120 s."""
+    out = analysis_until(_analysis(120.0), MID_BAR_END)
+    planner, exit_s = _requested(out, style, bars, MID_BAR_END)
+
+    assert (planner.outcome, planner.reason) == ("applied", None)
+    assert exit_s == pytest.approx(120.0)

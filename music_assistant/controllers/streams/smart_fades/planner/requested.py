@@ -301,7 +301,10 @@ class RequestedTransitionPlanner(TransitionPlanner):
             # buffer-local; the client's exit is kept: only the downbeat nearest it is tried
             target = self.request.exit_at - ctx.buffer_offset
             exit_s = min(exits, key=lambda downbeat: abs(downbeat - target))
-            if abs(exit_s - target) > bar_out / 2:
+            # an exit asked past A's last downbeat, with no bar left after it before A's audio
+            # ends (an end position mid-bar): the next downbeat is past the end, so take that one
+            past_last = target > exits[-1] and exits[-1] + bar_out > ctx.audio_end
+            if not past_last and abs(exit_s - target) > bar_out / 2:
                 # no downbeat of A near the asked exit in the tail it holds
                 self._fallback("no_room")
                 return None
