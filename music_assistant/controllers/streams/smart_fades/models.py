@@ -293,3 +293,6 @@ class TransitionPlan:
     fadein_trim_start: float | None = None
     fadeout_curve: str = "qsin"
     metrics: PlanMetrics = field(default_factory=PlanMetrics)
+    # how long each track fades inside the overlap: the outgoing over its last seconds, the
+    # incoming over its first, both at full between; None fades both over the whole overlap
+    fade_seconds: float | None = None

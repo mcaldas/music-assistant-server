@@ -18,10 +18,12 @@ from music_assistant.controllers.streams.smart_fades.helpers import (
 )
 from music_assistant.controllers.streams.smart_fades.models import (
     FadeOutTrim,
+    PlanMetrics,
     TempoPlan,
     TransitionPlan,
     TransitionTier,
 )
+from music_assistant.controllers.streams.smart_fades.vocal import VOCAL_LEFT_PADDING
 
 from .assembly import PlanAssembler
 from .candidates import (
@@ -372,7 +374,7 @@ class RequestedTransitionPlanner(TransitionPlanner):
         exit_s: float,
         bar_out: float,
     ) -> list[list[Candidate]]:
-        """Build the unramped quick fade or cut ending on ``exit_s``, B entering on its one."""
+        """Build the unramped quick fade or cut ending on ``exit_s``, B's one on A's downbeat."""
         window = min(float(SMART_CROSSFADE_DURATION), self.fade_in_seconds)
         b_one = float(ctx.incoming.downbeats[0]) if len(ctx.incoming.downbeats) else 0.0
         # a cut's overlap, or a quick fade's whole bars
@@ -405,9 +407,14 @@ class RequestedTransitionPlanner(TransitionPlanner):
                     overlap = CUT_SECONDS
                 entry = max(0.0, one - overlap)
                 if self._sung_before(ctx, entry):
-                    # a lead-in B sings before its one: cut off, or B's silence heard after A stops
-                    self._fallback("vocal")
-                    return []
+                    # B sings a lead-in before its one: it comes in under A's last beats, so
+                    # B's one still lands on A's exit (a pre-roll). Longer than a bar of A it
+                    # is no cut any more: the default plan ships
+                    entry = self._pickup_start(ctx)
+                    overlap = one - entry
+                    if overlap > min(bar_out, exit_s):
+                        self._fallback("vocal")
+                        return []
                 if entry + overlap > window:
                     return []
                 if not _falls_quiet(ctx.incoming, one):
@@ -416,20 +423,29 @@ class RequestedTransitionPlanner(TransitionPlanner):
                 return []
         else:
             overlap = exit_s - exits[exits.index(exit_s) - bars]
-            # both decks on the one; B from its head, as today's quick fade, when that would
-            # skip more than the fade plays, skip sung material, or pass the received head
-            entry = b_one
+            # both decks on the one; a lead-in B sings before it fades in ahead of the bars
+            # (a pre-roll of at most a bar of A), so the one stays on A's downbeat. B from its
+            # head, as today's quick fade, when that would skip more than the fade plays, or
+            # pass the received head
+            entry, lead = b_one, 0.0
+            if self._sung_before(ctx, entry):
+                entry = self._pickup_start(ctx)
+                lead = b_one - entry
             if (
-                entry > overlap + _MAX_UNHEARD_INTRO_S
-                or self._sung_before(ctx, entry)
-                or entry + overlap > window
+                lead > min(bar_out, exit_s - overlap)
+                or entry > overlap + _MAX_UNHEARD_INTRO_S
+                or b_one + overlap > window
             ):
-                entry = 0.0
+                entry, lead = 0.0, 0.0
+            overlap += lead
             if overlap > window or _falls_quiet(ctx.incoming, entry + overlap):
                 # past the head of B the mix receives; or B's bar once A has faded out is
                 # near silence (a soft intro, a fade-in): the default plan ships
                 return []
         spec = CandidateSpec(TransitionTier.QUICK_FADE, bars, exit_s, None, source="requested")
+        # a cut's pre-roll holds both decks at full between its fades; a quick fade's stays
+        # one equal-power fade over the whole overlap
+        held = self.request.style != "quick_fade" and overlap > CUT_SECONDS
         plan = TransitionPlan(
             tier=TransitionTier.QUICK_FADE,
             fade_out_window=exit_s,
@@ -441,8 +457,29 @@ class RequestedTransitionPlanner(TransitionPlanner):
                 else None
             ),
             fadein_trim_start=entry if entry > 0.0 else None,
+            fade_seconds=CUT_SECONDS if held else None,
         )
-        return [[Candidate(spec, plan, factory.score(spec, plan), 1)]]
+        metrics = factory.score(spec, plan)
+        if held:
+            # both decks play at full over a pre-roll: every second both sing weighs one
+            metrics = _at_full(metrics)
+        return [[Candidate(spec, plan, metrics, 1)]]
+
+    @staticmethod
+    def _pickup_start(ctx: TransitionContext) -> float:
+        """Where B's sung lead-in starts, its detector lag padded, never before B's audio."""
+        import numpy as np  # noqa: PLC0415
+
+        assert ctx.vocal_in_scoring is not None  # narrowed by _sung_before
+        sung = ctx.vocal_in_scoring.windows[0][0]
+        rms = ctx.incoming.analysis.rms_energy
+        duration = ctx.incoming.analysis.duration
+        audible = sung
+        if rms is not None and len(rms) and duration:
+            loud = np.flatnonzero(np.asarray(rms, dtype=np.float32) > _SILENT_RMS)
+            if len(loud):
+                audible = min(sung, float(loud[0]) * duration / len(rms))
+        return max(0.0, sung - VOCAL_LEFT_PADDING, audible)
 
     @staticmethod
     def _sung_before(ctx: TransitionContext, entry: float) -> bool:
@@ -454,6 +491,11 @@ class RequestedTransitionPlanner(TransitionPlanner):
     def _fallback(self, reason: str) -> None:
         """Record why the default plan ships instead of the requested one."""
         self.outcome, self.reason = "fallback", reason
+
+
+def _at_full(metrics: PlanMetrics) -> PlanMetrics:
+    """Weigh every second of vocal collision as one, as for two decks both at full."""
+    return replace(metrics, weighted_collision_seconds=metrics.collision_seconds)
 
 
 def _falls_quiet(deck: Deck, start: float, seconds: float = 0.0) -> bool:

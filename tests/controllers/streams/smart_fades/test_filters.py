@@ -83,6 +83,26 @@ def test_streaming_crossfade_positions_the_blend() -> None:
     ]
 
 
+def test_streaming_crossfade_holds_both_streams_between_short_fades() -> None:
+    """
+    With a fade length the outgoing stream fades over the overlap's last samples only.
+
+    The incoming one fades in over its first samples: both play at full in between, as
+    for a pickup coming in under the outgoing track's last beats before a cut.
+    """
+    crossfade = StreamingCrossfadeFilter(
+        logger=LOGGER, crossfade_samples=44100, pre_crossfade_samples=882000, fade_samples=882
+    )
+    filter_strings = crossfade.apply("[fadein]", "[fadeout]")
+    assert filter_strings == [
+        "[fadeout]afade=t=out:start_sample=925218:nb_samples=882:curve=qsin,"
+        "atrim=end_sample=926100[xfade_out]",
+        "[fadein]afade=t=in:start_sample=0:nb_samples=882:curve=qsin,"
+        "adelay=882000S:all=1[xfade_in]",
+        "[xfade_out][xfade_in]amix=inputs=2:normalize=0",
+    ]
+
+
 class TestShelfFilter:
     """asendcmd-driven shelving EQ on one stream, passthrough on the other."""
 

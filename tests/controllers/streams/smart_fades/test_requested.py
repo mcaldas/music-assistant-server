@@ -288,16 +288,16 @@ def test_cut_lands_on_a_vocal_that_starts_on_the_one() -> None:
 @pytest.mark.parametrize(
     ("incoming", "fade_in_seconds", "reason"),
     [
-        (_with_vocal_activity(_shifted(_analysis(120.0), 3.0), [(1.2, 9.0)]), 45.0, "vocal"),
+        (_with_vocal_activity(_shifted(_analysis(120.0), 3.0), [(0.5, 9.0)]), 45.0, "vocal"),
         (_shifted(_analysis(120.0), 7.87), 7.0, "no_room"),
-        (_with_vocal_activity(_silent_after_its_one(), [(2.2, 9.0)]), 45.0, "vocal"),
+        (_with_vocal_activity(_silent_after_its_one(), [(0.5, 9.0)]), 45.0, "vocal"),
         (_silent_after_its_one(), 2.5, "no_room"),
         (_soft_intro(8), 10.0, "no_room"),
     ],
     ids=[
-        "sung-lead-in-before-the-one",
+        "sung-lead-in-longer-than-a-bar",
         "one-beyond-the-received-head",
-        "sung-before-the-downbeat-after-a-silent-bar",
+        "sung-lead-in-to-the-downbeat-after-a-silent-bar-longer-than-a-bar",
         "downbeat-after-a-silent-bar-beyond-the-received-head",
         "downbeat-after-a-quiet-intro-beyond-the-received-head",
     ],
@@ -305,12 +305,101 @@ def test_cut_lands_on_a_vocal_that_starts_on_the_one() -> None:
 def test_a_cut_that_cannot_land_on_the_one_ships_the_default_plan(
     incoming: AudioAnalysisData, fade_in_seconds: float, reason: str
 ) -> None:
-    """A cut would behead B's lead-in, or play B's silence after A stops: it falls back."""
+    """A cut would pre-roll more than a bar of B's lead-in, or play B's silence: it falls back."""
     planner, _ = _plan(
         _analysis(120.0), incoming, "cut", exit_at=225.0, fade_in_seconds=fade_in_seconds
     )
 
     assert (planner.outcome, planner.reason) == ("fallback", reason)
+
+
+def _sung_pickup(silent_bins: int = 0) -> AudioAnalysisData:
+    """Return a track sung from 0.32 s, its one at 1.1 s, silent for its first bins (Pepas)."""
+    rms = np.full(1800, 0.5, dtype=np.float32)
+    rms[:silent_bins] = 0.0
+    return _with_vocal_activity(_shifted(_analysis(120.0, rms_energy=rms), 1.1), [(0.32, 30.0)])
+
+
+# the 240 s test tracks' analysis bins: the timeline has B sung from its third, at 0.27 s
+BIN = 240.0 / 1800
+
+
+@pytest.mark.parametrize(("silent_bins", "entry"), [(0, 2 * BIN - 0.25), (1, BIN)])
+def test_a_cut_into_a_sung_pickup_pre_rolls_it_under_the_outgoing_track(
+    silent_bins: int, entry: float
+) -> None:
+    """B's pickup plays under A's last beats from a detector lag before it is sung, never silent."""
+    planner, plan = _plan(_analysis(120.0), _sung_pickup(silent_bins), "cut", exit_at=224.0)
+
+    assert (planner.outcome, planner.reason) == ("applied", None)
+    assert TAIL_START + plan.fade_out_window == pytest.approx(224.0)
+    assert plan.fadein_trim_start == pytest.approx(entry, abs=1e-6)
+    assert plan.fadein_trim_start + plan.crossfade_duration == pytest.approx(1.1)
+    # A at full to its exit, B at full from the start of the overlap
+    assert plan.fade_seconds == CUT_SECONDS
+
+
+def test_a_cut_pre_rolls_a_pickup_to_the_downbeat_after_a_silent_bar() -> None:
+    """B's one is followed by silence and B sings into its next one: the pickup to that one rolls."""
+    inc = _with_vocal_activity(_silent_after_its_one(), [(2.2, 9.0)])
+    planner, plan = _plan(_analysis(120.0), inc, "cut", exit_at=225.0)
+
+    assert (planner.outcome, planner.reason) == ("applied", None)
+    assert plan.fadein_trim_start == pytest.approx(16 * BIN - 0.25)
+    assert plan.fadein_trim_start + plan.crossfade_duration == pytest.approx(3.0)
+
+
+@pytest.mark.parametrize(
+    ("sung", "outcome", "reason"),
+    [((221.0, 222.0), "applied", None), ((223.6, 224.0), "fallback", "vocal")],
+    ids=["phrase-ends-before-the-pickup", "last-words-over-the-pickup"],
+)
+def test_a_pre_roll_never_sings_over_the_outgoing_vocal(
+    sung: tuple[float, float], outcome: str, reason: str | None
+) -> None:
+    """Both decks play at full over a pre-roll: A's last words over B's pickup fall back."""
+    out = _with_vocal_activity(_analysis(120.0), [sung])
+
+    planner, plan = _plan(out, _sung_pickup(), "cut", exit_at=224.0)
+
+    assert (planner.outcome, planner.reason) == (outcome, reason)
+    if outcome == "applied":
+        assert plan.metrics.collision_seconds == 0.0
+
+
+@pytest.mark.parametrize(
+    ("incoming", "entry", "lead"),
+    [
+        (_sung_pickup(), 2 * BIN - 0.25, 1.1 - 2 * BIN + 0.25),
+        (_with_vocal_activity(_shifted(_analysis(120.0), 3.0), [(0.5, 9.0)]), None, 0.0),
+    ],
+    ids=["pickup-under-the-fade", "lead-in-longer-than-a-bar-plays-from-the-head"],
+)
+def test_a_quick_fade_keeps_the_one_of_a_sung_pickup_on_the_downbeat(
+    incoming: AudioAnalysisData, entry: float | None, lead: float
+) -> None:
+    """The fade starts as B's pickup does, so B's one lands on A's downbeat four bars from the exit."""
+    planner, plan = _plan(_analysis(120.0), incoming, "quick_fade", exit_at=224.0)
+
+    assert (planner.outcome, planner.reason) == ("applied", None)
+    assert plan.fadein_trim_start == (pytest.approx(entry) if entry else None)
+    assert plan.crossfade_duration == pytest.approx(8.0 + lead)
+    assert plan.fade_seconds is None
+
+
+def test_a_quick_fade_under_a_bar_fades_over_a_sung_pickup_onto_the_one() -> None:
+    """Between far tempos B's sung lead-in fades in under A's last beats, its one on A's exit."""
+    inc = _with_vocal_activity(_shifted(_analysis(128.0), 1.1), [(0.32, 30.0)])
+    planner, plan = _plan(_analysis(100.0), inc, "quick_fade", exit_at=224.0)
+
+    assert (planner.outcome, planner.reason) == ("applied", "shortened")
+    assert TAIL_START + plan.fade_out_window == pytest.approx(223.2)
+    assert plan.fadein_trim_start == pytest.approx(2 * BIN - 0.25)
+    assert plan.fadein_trim_start + plan.crossfade_duration == pytest.approx(1.1)
+    # one equal-power fade over the whole pickup, as any quick fade
+    assert plan.fade_seconds is None
+    assert plan.fadeout_curve == "qsin"
+    assert not plan.tempo_plan
 
 
 @pytest.mark.parametrize(

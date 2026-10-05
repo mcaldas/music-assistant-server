@@ -401,3 +401,73 @@ async def test_a_requested_quick_fade_between_far_tempos_never_doubles_a_beat(pi
     around = mix[int((end - 0.5) * SR) : int((end + 0.5) * SR)]
     rms = np.sqrt(np.mean(around[: len(around) // 441 * 441].reshape(-1, 441) ** 2, axis=1))
     assert rms.min() > 0.1 / np.sqrt(2) * 10 ** (-30 / 20)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("style", ["cut", "quick_fade"])
+async def test_a_sung_pickup_pre_rolls_under_the_outgoing_track(style: str) -> None:
+    """
+    B sung 0.7 s before its one: it plays under A's last beats, its one landing on A's exit.
+
+    A cut holds both tracks at full over the pickup; a quick fade between these tempos (they
+    drift apart within a bar) fades over it.
+    """
+    fade_out, fade_in = _tone(440.0, 45.0), np.zeros(int(45.0 * SR) * 2, dtype=np.float32)
+    # B (Pepas): silent, its voice (1760 Hz) from 0.4 s, its one 1.1 s in at 130 bpm
+    fade_in[int(0.4 * SR) * 2 :] = _tone(1760.0, 45.0)[int(0.4 * SR) * 2 :]
+    out, inc = _analysis(120.0, 240.0), _analysis(130.0, 240.0)
+    assert out.beats is not None
+    assert inc.beats is not None
+    assert inc.rms_energy is not None
+    # a click on A's downbeats, B's one, and B's later downbeats
+    for downbeat in np.arange(1.0, 45.0, 2.0):
+        fade_out[int(downbeat * SR) * 2 : int(downbeat * SR) * 2 + 2] += 0.8
+    inc.beats = [beat + 0.18 for beat in inc.beats]
+    inc.downbeats = inc.beats[2::4]
+    for downbeat in inc.downbeats:
+        if downbeat < 45.0:
+            fade_in[int(downbeat * SR) * 2 : int(downbeat * SR) * 2 + 2] += 0.8
+    inc.rms_energy[0] = 0.0
+    inc.extra_data = {"vocal_activity": [0.9 if i >= 2 else 0.05 for i in range(1800)]}
+    planner = RequestedTransitionPlanner(
+        logging.getLogger(), TransitionRequest(style, "n", 0, 224.0)
+    )
+    fade = SmartCrossFade(logging.getLogger(), out, inc, planner)
+    fade.build(fade_out.nbytes, fade_in.nbytes, PCM)
+    chunks = [chunk async for chunk in fade.apply(fade_out.tobytes(), fade_in.tobytes(), PCM)]
+    mix = np.frombuffer(b"".join(chunks), dtype=np.float32)
+    timing = fade.timing_info
+    cut = timing.pre_crossfade_duration + timing.crossfade_duration
+
+    def window(start: float, end: float) -> np.ndarray:
+        return mix[int(start * SR) * 2 : int(end * SR) * 2]
+
+    assert (planner.outcome, planner.reason) == (
+        "applied",
+        None if style == "cut" else "shortened",
+    )
+    assert cut == pytest.approx(29.0, abs=0.001)
+    assert timing.crossfade_duration > 0.7
+    # one click within 60 ms of A's exit: B's one, on it to the millisecond; A's is cut away
+    edges = np.flatnonzero(np.abs(np.diff(window(cut - 0.06, cut + 0.06)[0::2])) > 0.3)
+    assert len(edges) > 0
+    assert (edges.max() - edges.min()) / SR < 0.003
+    assert (edges.min() + 1) / SR - 0.06 == pytest.approx(0.0, abs=0.002)
+    pre, alone_a, alone_b = (
+        window(cut - 0.5, cut - 0.03),
+        window(cut - 3.0, cut - 2.53),
+        window(cut + 0.03, cut + 0.5),
+    )
+    a_level, b_level = _band_rms(pre, 430, 450), _band_rms(pre, 1750, 1770)
+    if style == "cut":
+        # A at full to its exit, B's pickup at full under it, as each plays alone
+        assert a_level == pytest.approx(_band_rms(alone_a, 430, 450), rel=0.1)
+        assert b_level == pytest.approx(_band_rms(alone_b, 1750, 1770), rel=0.1)
+    else:
+        # A fades out under B's pickup, heard before its one
+        assert a_level < 0.7 * _band_rms(alone_a, 430, 450)
+        assert b_level > 0.7 * _band_rms(alone_b, 1750, 1770)
+    # no 10 ms stretch from A's last bar to B's first drops more than 30 dB below a tone
+    around = window(cut - 2.0, cut + 2.0)[0::2]
+    rms = np.sqrt(np.mean(around[: len(around) // 441 * 441].reshape(-1, 441) ** 2, axis=1))
+    assert rms.min() > 0.2 / np.sqrt(2) * 10 ** (-30 / 20)

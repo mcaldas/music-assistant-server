@@ -164,6 +164,21 @@ class TestTransitionRenderer:
         assert isinstance(crossfade, StreamingCrossfadeFilter)
         assert "curve=nofade" in crossfade.apply("[fadein]", "[fadeout]")[0]
 
+    @pytest.mark.parametrize(
+        ("fade_seconds", "samples"), [(None, 441000), (0.02, 882), (20.0, 441000)]
+    )
+    def test_fade_seconds_flow_into_the_crossfade_filter(
+        self, fade_seconds: float | None, samples: int
+    ) -> None:
+        """The plan's fade length becomes both streams' fade, never longer than the overlap."""
+        plan = _plan(fade_seconds=fade_seconds)
+        filters, _ = TransitionRenderer(LOGGER).render(plan, PCM, _seconds(45))
+        crossfade = filters[-1]
+        assert isinstance(crossfade, StreamingCrossfadeFilter)
+        fadeout, fadein, _ = crossfade.apply("[fadein]", "[fadeout]")
+        assert f"start_sample={30 * 44100 + 441000 - samples}:nb_samples={samples}:" in fadeout
+        assert f"start_sample=0:nb_samples={samples}:" in fadein
+
     def test_stretch_savings_shorten_fadeout_accounting(self) -> None:
         """A speed-up ramp removes time from the rendered fade-out total."""
         plan = _plan(tempo_plan=TempoPlan(steps=[(30.0, 1.0), (35.0, 1.02)]))

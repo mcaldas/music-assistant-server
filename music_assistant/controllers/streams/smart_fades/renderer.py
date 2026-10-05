@@ -72,7 +72,9 @@ class TransitionRenderer:
         pre_crossfade_samples = int(
             max(0.0, fade_out_seconds - crossfade_seconds) * pcm_format.sample_rate
         )
-        filters = self._build_filters(plan, crossfade_samples, pre_crossfade_samples)
+        filters = self._build_filters(
+            plan, crossfade_samples, pre_crossfade_samples, pcm_format.sample_rate
+        )
         timing = CrossfadeTimingInfo(
             pre_crossfade_duration=max(0.0, fade_out_seconds - crossfade_seconds),
             crossfade_duration=crossfade_seconds,
@@ -82,7 +84,11 @@ class TransitionRenderer:
         return filters, timing
 
     def _build_filters(
-        self, plan: TransitionPlan, crossfade_samples: int, pre_crossfade_samples: int
+        self,
+        plan: TransitionPlan,
+        crossfade_samples: int,
+        pre_crossfade_samples: int,
+        sample_rate: int,
     ) -> list[Filter]:
         """Assemble the ordered filter chain from the plan."""
         filters: list[Filter] = []
@@ -116,6 +122,7 @@ class TransitionRenderer:
                 logger=self.logger,
                 crossfade_samples=crossfade_samples,
                 pre_crossfade_samples=pre_crossfade_samples,
+                fade_samples=int((plan.fade_seconds or 0.0) * sample_rate),
                 fadeout_curve=plan.fadeout_curve,
             )
         )

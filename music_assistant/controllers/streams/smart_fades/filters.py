@@ -273,6 +273,7 @@ class StreamingCrossfadeFilter(Filter):
         crossfade_samples: int,
         *,
         pre_crossfade_samples: int = 0,
+        fade_samples: int = 0,
         fadeout_curve: str = "qsin",
         fadein_curve: str = "qsin",
     ):
@@ -282,11 +283,15 @@ class StreamingCrossfadeFilter(Filter):
         :param crossfade_samples: Overlap length in PCM samples.
         :param pre_crossfade_samples: Samples of the outgoing stream played
             untouched before the overlap begins.
+        :param fade_samples: How long each stream fades: the outgoing over the
+            overlap's last samples, the incoming over its first, both at full
+            between; 0 fades both over the whole overlap.
         :param fadeout_curve: afade curve applied to the outgoing stream.
         :param fadein_curve: afade curve applied to the incoming stream.
         """
         self.crossfade_samples = crossfade_samples
         self.pre_crossfade_samples = pre_crossfade_samples
+        self.fade_samples = fade_samples
         self.fadeout_curve = fadeout_curve
         self.fadein_curve = fadein_curve
         super().__init__(logger)
@@ -295,8 +300,9 @@ class StreamingCrossfadeFilter(Filter):
         """Apply the afade+adelay+amix filter chain."""
         ns = self.crossfade_samples
         pre = self.pre_crossfade_samples
-        fadeout_chain = f"afade=t=out:start_sample={pre}:nb_samples={ns}:curve={self.fadeout_curve}"
-        fadein_chain = f"afade=t=in:start_sample=0:nb_samples={ns}:curve={self.fadein_curve}"
+        fade = min(self.fade_samples, ns) or ns
+        fadeout_chain = f"afade=t=out:start_sample={pre + ns - fade}:nb_samples={fade}:curve={self.fadeout_curve}"
+        fadein_chain = f"afade=t=in:start_sample=0:nb_samples={fade}:curve={self.fadein_curve}"
         if pre:
             fadeout_chain += f",atrim=end_sample={pre + ns}"
             fadein_chain += f",adelay={pre}S:all=1"
