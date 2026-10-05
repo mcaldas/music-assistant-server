@@ -250,14 +250,14 @@ def test_sweeps_wrap_the_stretch_like_the_shelves() -> None:
 
 
 def test_echo_out_renders_on_the_crossfade_timeline() -> None:
-    """The echo sits right before the crossfade, sized by its pre-point and overlap."""
+    """The echo sits right before the crossfade, sized by its pre-point and overlap, in samples."""
     plan = _plan(
         tier=TransitionTier.QUICK_FADE,
         eq_plan=EqPlan.neutral(),
         fade_out_window=29.0,
         crossfade_duration=0.02,
         fadeout_trim=FadeOutTrim(29.0, 16.0),
-        echo_out=EchoOut(beat=0.5, repeats=8),
+        echo_out=EchoOut(beat=0.5, period=0.4, repeats=8, lead=0.01),
     )
     filters, _ = TransitionRenderer(LOGGER).render(plan, PCM, _seconds(45.0))
 
@@ -273,4 +273,10 @@ def test_echo_out_renders_on_the_crossfade_timeline() -> None:
         crossfade.pre_crossfade_samples,
         crossfade.crossfade_samples,
     )
-    assert (echo.beat_samples, echo.repeats, echo.sample_rate) == (22050, 8, 44100)
+    assert (
+        echo.beat_samples,
+        echo.period_samples,
+        echo.lead_samples,
+        echo.repeats,
+        echo.sample_rate,
+    ) == (22050, 17640, 441, 8, 44100)

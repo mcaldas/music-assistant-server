@@ -985,16 +985,16 @@ def test_filter_sweep_where_smart_fades_will_not_beatmatch_ships_the_default_pla
 @pytest.mark.parametrize("incoming_bpm", [120.0, 150.0], ids=["same-tempo", "tempo-jump"])
 def test_echo_out_is_the_cut_with_its_last_beat_ringing_on(incoming_bpm: float) -> None:
     """
-    An echo out keeps the cut's exit and entry; A's beat repeats for two of its bars.
+    An echo out keeps the cut's exit and entry; A's beat repeats for two of B's bars.
 
-    Across a tempo jump the repeats would drift off B's beat, so only the first two ring.
+    The repeats ring under B, so they keep to B's beat: across a tempo jump all of them ring.
     """
     out, inc = _analysis(120.0), _shifted(_analysis(incoming_bpm), 7.87)
     _, cut = _plan(out, inc, "cut", exit_at=224.3)
     planner, plan = _plan(out, inc, "echo_out", exit_at=224.3)
 
     assert (planner.outcome, planner.reason) == ("applied", None)
-    assert plan.echo_out == EchoOut(beat=0.5, repeats=8 if incoming_bpm == 120.0 else 2)
+    assert plan.echo_out == EchoOut(beat=0.5, period=60.0 / incoming_bpm, repeats=8)
     assert plan.sweep_out is None
     assert (
         plan.fade_out_window,
@@ -1045,18 +1045,66 @@ def test_echo_out_never_echoes_a_sung_beat_over_the_incoming_vocal(
     assert (planner.outcome, planner.reason) == outcome
 
 
-def test_echo_out_repeats_the_outgoing_tracks_real_last_beat() -> None:
-    """A grid running slower than its bpm says echoes its own beat, not the nominal one."""
-    out = _analysis(120.0)
+@pytest.mark.parametrize(
+    ("grid", "bpm"), [(0.52, 120.0), (0.5, 123.0)], ids=["slower-than-its-bpm", "bpm-off-the-grid"]
+)
+def test_echo_out_repeats_the_outgoing_tracks_real_last_beat(grid: float, bpm: float) -> None:
+    """
+    A grid running at another tempo than its bpm says echoes its own beat, not the nominal one.
+
+    Only the first repeat is that beat, landed on B's one: the rest keep to B's beat, all
+    two bars of them, however far A's beat is from it.
+    """
+    out = _analysis(bpm)
     assert out.beats is not None
-    assert out.downbeats is not None
-    out.beats = [index * 0.52 for index in range(len(out.beats))]
+    out.beats = [index * grid for index in range(len(out.beats))]
     out.downbeats = out.beats[::4]
     planner, plan = _plan(out, _analysis(120.0), "echo_out", exit_at=224.0)
 
     assert planner.outcome == "applied"
     assert plan.echo_out is not None
-    assert plan.echo_out.beat == pytest.approx(0.52, abs=1e-3)
+    assert plan.echo_out.beat == pytest.approx(grid, abs=1e-3)
+    assert (plan.echo_out.period, plan.echo_out.repeats) == (0.5, 8)
+
+
+@pytest.mark.parametrize("bpm", [95.0, 128.0, 174.0])
+def test_echo_out_reads_a_steady_tempo_through_a_grid_on_analysis_frames(bpm: float) -> None:
+    """
+    A grid on the analysis' 20 ms frames reads the bpm's tempo, wherever the exit falls.
+
+    Its beats are a frame long or short; the echo keeps the bpm's beat over them, so its
+    repeats never drift off B's.
+    """
+    out, inc = _analysis(bpm), _shifted(_analysis(bpm), 7.87)
+    for analysis in (out, inc):
+        assert analysis.beats is not None
+        analysis.beats = [round(beat * 50) / 50 for beat in analysis.beats]
+        analysis.downbeats = analysis.beats[::4]
+    for exit_at in np.arange(224.0, 232.0, 0.5):
+        planner, plan = _plan(out, inc, "echo_out", exit_at=float(exit_at))
+
+        assert planner.outcome == "applied"
+        assert plan.echo_out == EchoOut(beat=60.0 / bpm, period=60.0 / bpm, repeats=8)
+
+
+@pytest.mark.parametrize(
+    ("one", "lead"),
+    [(0.0, CUT_SECONDS), (0.01, 0.01), (CUT_SECONDS, 0.0), (0.3, 0.0)],
+    ids=["one-on-the-first-sample", "one-inside-the-cut", "one-at-the-cut", "one-trimmed-to"],
+)
+def test_echo_out_starts_on_an_incoming_one_inside_the_cut(one: float, lead: float) -> None:
+    """
+    B cannot start before its first sample, so a one in its first 20 ms plays before A ends.
+
+    The echo then starts on B's one too, that much before A's end.
+    """
+    planner, plan = _plan(
+        _analysis(120.0), _shifted(_analysis(120.0), one), "echo_out", exit_at=224.0
+    )
+
+    assert planner.outcome == "applied"
+    assert plan.echo_out is not None
+    assert plan.echo_out.lead == pytest.approx(lead, abs=1e-6)
 
 
 def test_a_one_bar_filter_sweep_steps_finely_enough_not_to_zipper() -> None:

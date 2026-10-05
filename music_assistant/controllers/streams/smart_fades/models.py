@@ -247,11 +247,17 @@ class SweepSchedule:
 
 @dataclass(slots=True)
 class EchoOut:
-    """The outgoing track's last beat, repeated on past the point where its audio ends."""
+    """The outgoing track's last beat, repeated on the incoming one's beat past its own end."""
 
-    # one outgoing beat in seconds: the echoed slice, and the gap between repeats
+    # one outgoing beat in seconds: the echoed beat starts this long before the outgoing
+    # audio ends
     beat: float
+    # one incoming beat in seconds: the gap between repeats, which ring under that track
+    period: float
     repeats: int
+    # seconds before the outgoing audio ends where the incoming track's one plays, and the
+    # first repeat lands: only a one inside the cut's own overlap comes early
+    lead: float = 0.0
 
 
 class TransitionStrategy(StrEnum):

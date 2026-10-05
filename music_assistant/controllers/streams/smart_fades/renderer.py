@@ -146,6 +146,8 @@ class TransitionRenderer:
                     pre_crossfade_samples,
                     crossfade_samples,
                     round(plan.echo_out.beat * sample_rate),
+                    round(plan.echo_out.period * sample_rate),
+                    round(plan.echo_out.lead * sample_rate),
                     plan.echo_out.repeats,
                     sample_rate,
                 )

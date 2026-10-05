@@ -9,6 +9,7 @@ own pieces and ships the default plan, with a reason, when the request cannot be
 
 from __future__ import annotations
 
+import itertools
 import math
 from dataclasses import asdict, dataclass, replace
 from typing import TYPE_CHECKING
@@ -119,8 +120,12 @@ _SWEEP_OUT_WET_S = 1.0
 _SWEEP_IN_HZ = (250.0, 8000.0)
 _SWEEP_IN_OPEN = 0.75
 _SWEEP_IN_DRY = 0.9
-# echo_out: how long the outgoing track's last beat rings on, in its bars
+# echo_out: how long the outgoing track's last beat rings on, in bars of the incoming track
+# (it repeats on that track's beat); each tempo is read over this many bars of its grid
 _ECHO_BARS = 2
+# two bars of a grid on the analysis' 20 ms frames read a steady tempo within about 1%: a
+# grid this far off the bpm is a tempo the track really plays at there
+_GRID_TEMPO_SLACK = 0.02
 
 
 @dataclass(frozen=True, slots=True)
@@ -625,18 +630,21 @@ class RequestedTransitionPlanner(TransitionPlanner):
     def _with_echo(self, ctx: TransitionContext, plan: TransitionPlan) -> TransitionPlan | None:
         """Ring the cut's last outgoing beat on under the incoming track, or None to fall back."""
         exit_s, entry = plan.fade_out_window, plan.fadein_trim_start or 0.0
-        # A's real last beat before the exit, from its grid (its tempo can drift from the bpm)
-        nominal = 60.0 / ctx.outgoing.bpm
-        last = [float(b) for b in ctx.outgoing.beats if b < exit_s - 0.25 * nominal]
-        beat = exit_s - last[-1] if last and exit_s - last[-1] < 1.5 * nominal else nominal
-        # incoming-song seconds where the outgoing audio ends and the echo starts
-        start = entry + plan.crossfade_duration
+        b_one = float(ctx.incoming.downbeats[0]) if len(ctx.incoming.downbeats) else 0.0
+        bar = ctx.incoming.beats_per_bar
+        out_beat, in_beat = 60.0 / ctx.outgoing.bpm, 60.0 / ctx.incoming.bpm
+        # A's last beat before the exit, from the bars of its grid before it (its tempo can
+        # drift from the bpm): the first repeat lands that beat on B's one
+        last = [float(b) for b in ctx.outgoing.beats if b < exit_s - 0.25 * out_beat]
+        beat = _grid_beat([*last[-_ECHO_BARS * ctx.outgoing.beats_per_bar :], exit_s], out_beat)
+        # the repeats ring under B, so the rest land on B's beat, from its grid after its one
+        head = [float(b) for b in ctx.incoming.beats if b > b_one - 0.25 * in_beat]
+        period = _grid_beat(head[: _ECHO_BARS * bar + 1], in_beat)
+        # a one inside the cut's overlap plays before A's end: the echo starts on it there too
+        lead = max(0.0, CUT_SECONDS - b_one)
         window = min(float(SMART_CROSSFADE_DURATION), self.fade_in_seconds)
-        bar = ctx.outgoing.beats_per_bar
-        # repeats on A's beat drift off B's once the tempos differ: then only the first two
-        wanted = _ECHO_BARS * bar if abs(ctx.incoming.bpm / ctx.outgoing.bpm - 1.0) <= 0.02 else 2
-        repeats = min(wanted, int((window - start) / beat))
-        if exit_s < beat or repeats < min(bar, wanted):
+        repeats = min(_ECHO_BARS * bar, int((window - b_one) / period))
+        if exit_s < beat or repeats < bar:
             # the last beat, or a bar of its echo, is not in the audio the mix receives
             self._fallback("no_room")
             return None
@@ -649,14 +657,14 @@ class RequestedTransitionPlanner(TransitionPlanner):
                 for left, right in ctx.vocal_out_scoring.windows
             )
             and any(
-                left < start + repeats * beat and right > entry
+                left < b_one + repeats * period and right > entry
                 for left, right in ctx.vocal_in_scoring.windows
             )
         ):
             # a sung beat echoing over the incoming vocal is the collision the checks guard
             self._fallback("vocal")
             return None
-        return replace(plan, echo_out=EchoOut(beat, repeats))
+        return replace(plan, echo_out=EchoOut(beat, period, repeats, lead))
 
     def _fallback(self, reason: str) -> None:
         """Record why the default plan ships instead of the requested one."""
@@ -770,6 +778,24 @@ def _with_sweeps(plan: TransitionPlan) -> TransitionPlan:
             db_ramp(opened, dry - opened, 1.0, 0.0, step),
         ),
     )
+
+
+def _grid_beat(times: list[float], nominal: float) -> float:
+    """
+    Return the beat a run of consecutive grid times plays at, or ``nominal`` (the bpm's).
+
+    One beat of the grid is a whole number of the analysis' 20 ms frames, so the run's mean
+    beat stands in for the bpm only where it departs from it by more than that error.
+
+    :param times: Consecutive beat times of one track's grid, in order.
+    :param nominal: The beat its bpm gives; also the answer where the run has a gap or an
+        extra beat, or is too short to measure.
+    """
+    gaps = [later - earlier for earlier, later in itertools.pairwise(times)]
+    if not gaps or any(abs(gap / nominal - 1.0) > 0.5 for gap in gaps):
+        return nominal
+    mean = (times[-1] - times[0]) / len(gaps)
+    return mean if abs(mean / nominal - 1.0) > _GRID_TEMPO_SLACK else nominal
 
 
 def _hz_ramp(

@@ -317,10 +317,11 @@ class EchoOutFilter(Filter):
     Echo the outgoing stream's last beat on into the incoming one, past the outgoing's end.
 
     A copy of the outgoing stream keeps only the beat before the point where the crossfade
-    cuts it, low-cut and with click-free edges; ``aecho`` repeats it every beat, each repeat
-    at half the level of the one before. The copy is moved onto the incoming stream's
-    timeline and mixed into it, so the echo rings on under the incoming track while the
-    crossfade, the timing and the output length stay as they are.
+    cuts it, low-cut and with click-free edges; ``aecho`` lands it on the incoming track's
+    one and repeats it on every incoming beat after it, each repeat at half the level of the
+    one before. The copy is moved onto the incoming stream's timeline and mixed into it, so
+    the echo rings on under the incoming track while the crossfade, the timing and the
+    output length stay as they are.
     """
 
     output_fadeout_label: str = "fadeout_echo_dry"
@@ -337,6 +338,8 @@ class EchoOutFilter(Filter):
         pre_crossfade_samples: int,
         crossfade_samples: int,
         beat_samples: int,
+        period_samples: int,
+        lead_samples: int,
         repeats: int,
         sample_rate: int,
     ):
@@ -345,13 +348,19 @@ class EchoOutFilter(Filter):
 
         :param pre_crossfade_samples: Where the incoming stream starts in the mix.
         :param crossfade_samples: Overlap; the outgoing stream is cut at pre + overlap.
-        :param beat_samples: One outgoing beat: the echoed slice and the gap between repeats.
+        :param beat_samples: One outgoing beat: the echoed beat starts this long before the cut.
+        :param period_samples: One incoming beat: the gap between repeats, and the most of
+            the outgoing beat each one plays, so a repeat never runs into the next.
+        :param lead_samples: How long before the cut the incoming one plays, where the first
+            repeat lands.
         :param repeats: How many times the beat repeats.
         :param sample_rate: Sample rate of both streams.
         """
         self.pre_crossfade_samples = pre_crossfade_samples
         self.crossfade_samples = crossfade_samples
         self.beat_samples = beat_samples
+        self.period_samples = period_samples
+        self.lead_samples = lead_samples
         self.repeats = repeats
         self.sample_rate = sample_rate
         super().__init__(logger)
@@ -359,19 +368,25 @@ class EchoOutFilter(Filter):
     def apply(self, input_fadein_label: str, input_fadeout_label: str) -> list[str]:
         """Split the beat off the outgoing stream, echo it, and mix it into the incoming one."""
         end = self.pre_crossfade_samples + self.crossfade_samples
+        start = max(0, end - self.beat_samples)
+        # a repeat plays at most an incoming beat of it, so it never runs into the next; at
+        # the cut it ends 1 ms early: the outgoing trim rounds its end to the millisecond
+        stop = min(end - self.sample_rate // 1000, start + self.period_samples)
         edge = self.sample_rate // 100
-        beats = range(1, self.repeats + 1)
+        repeats = range(self.repeats)
+        # the first repeat lands on the incoming one, the others an incoming beat apart;
         # aecho truncates each delay to whole samples: aim at the middle of the sample
+        to_one = self.beat_samples - self.lead_samples
         delays = "|".join(
-            f"{(k * self.beat_samples + 0.5) * 1000 / self.sample_rate:.6f}" for k in beats
+            f"{(to_one + k * self.period_samples + 0.5) * 1000 / self.sample_rate:.6f}"
+            for k in repeats
         )
-        decays = "|".join(f"{self.first * self.decay ** (k - 1):.6f}" for k in beats)
+        decays = "|".join(f"{self.first * self.decay**k:.6f}" for k in repeats)
         return [
             f"{input_fadeout_label}asplit=2[{self.output_fadeout_label}][echo_send]",
             f"[echo_send]highpass=f={self.low_cut_hz},"
-            f"afade=t=in:start_sample={max(0, end - self.beat_samples)}:nb_samples={edge},"
-            # ends 1 ms early: the outgoing trim rounds its end to the millisecond
-            f"afade=t=out:start_sample={end - edge - self.sample_rate // 1000}:nb_samples={edge},"
+            f"afade=t=in:start_sample={start}:nb_samples={edge},"
+            f"afade=t=out:start_sample={stop - edge}:nb_samples={edge},"
             f"aecho=0:1:{delays}:{decays},"
             f"atrim=start_sample={self.pre_crossfade_samples},asetpts=PTS-STARTPTS[echo_wet]",
             f"{input_fadein_label}[echo_wet]amix=inputs=2:normalize=0:duration=first"
@@ -380,7 +395,7 @@ class EchoOutFilter(Filter):
 
     def __repr__(self) -> str:
         """Return string representation of EchoOutFilter."""
-        return f"EchoOut({self.repeats}x{self.beat_samples} samples)"
+        return f"EchoOut({self.beat_samples} samples, {self.repeats}x{self.period_samples})"
 
 
 class StreamingCrossfadeFilter(Filter):

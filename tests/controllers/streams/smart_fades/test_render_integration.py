@@ -43,10 +43,10 @@ def _tone(freq: float, seconds: float, level: float = 0.2) -> np.ndarray:
     return np.repeat(mono, 2)
 
 
-def _analysis(bpm: float, duration: float) -> AudioAnalysisData:
-    """Synthetic flat-energy analysis with a steady beat grid."""
+def _analysis(bpm: float, duration: float, first: float = 0.0) -> AudioAnalysisData:
+    """Synthetic flat-energy analysis with a steady beat grid, its first downbeat at ``first``."""
     interval = 60.0 / bpm
-    beats = np.arange(0.0, duration, interval, dtype=np.float32)
+    beats = np.arange(first, duration, interval, dtype=np.float32)
     return AudioAnalysisData(
         duration=duration,
         bpm=bpm,
@@ -1062,12 +1062,18 @@ async def test_without_its_head_a_cut_never_lands_in_a_silent_b_before_it_starts
 
 
 async def _render_request(
-    request: TransitionRequest, fade_out: np.ndarray, fade_in: np.ndarray
+    request: TransitionRequest,
+    fade_out: np.ndarray,
+    fade_in: np.ndarray,
+    incoming: AudioAnalysisData | None = None,
 ) -> tuple[np.ndarray, SmartCrossFade]:
-    """Plan a request between two steady 120 BPM tracks and render it through ffmpeg."""
+    """Plan a request out of a steady 120 BPM track (by default into another) and render it."""
     planner = RequestedTransitionPlanner(logging.getLogger(), request)
     fade = SmartCrossFade(
-        logging.getLogger(), _analysis(120.0, 240.0), _analysis(120.0, 240.0), planner
+        logging.getLogger(),
+        _analysis(120.0, 240.0),
+        incoming or _analysis(120.0, 240.0),
+        planner,
     )
     fade.build(fade_out.nbytes, fade_in.nbytes, PCM)
     chunks = [chunk async for chunk in fade.apply(fade_out.tobytes(), fade_in.tobytes(), PCM)]
@@ -1138,37 +1144,60 @@ async def test_a_filter_sweep_hands_over_through_the_filters() -> None:
 
 
 @pytest.mark.asyncio
-async def test_an_echo_out_rings_the_last_beat_on_under_the_incoming_track() -> None:
-    """The cut, plus A's last beat repeating from B's one, 6 dB quieter each beat."""
+@pytest.mark.parametrize(
+    ("incoming_bpm", "one", "lead"),
+    [(120.0, 0.0, int(CUT_SECONDS * SR)), (150.0, 0.3, 0)],
+    ids=["one-inside-the-cut", "tempo-jump"],
+)
+async def test_an_echo_out_rings_the_last_beat_on_under_the_incoming_track(
+    incoming_bpm: float, one: float, lead: int
+) -> None:
+    """
+    The cut, plus A's last beat repeating on B's beat from B's one, 6 dB quieter each time.
+
+    A one on B's first sample plays inside the cut's 20 ms overlap, before A ends: the echo
+    starts on it there too. Into a faster track the repeats keep to its beat, not A's.
+    """
     fade_out, fade_in = _bursts(440.0, 45.0), _tone(1760.0, 45.0)
     echoed, echo = await _render_request(
-        TransitionRequest("echo_out", "n", 0, 224.0), fade_out, fade_in
+        TransitionRequest("echo_out", "n", 0, 224.0),
+        fade_out,
+        fade_in,
+        _analysis(incoming_bpm, 240.0, one),
     )
     cut, cut_fade = await _render_request(
-        TransitionRequest("cut", "n", 0, 224.0), fade_out, fade_in
+        TransitionRequest("cut", "n", 0, 224.0),
+        fade_out,
+        fade_in,
+        _analysis(incoming_bpm, 240.0, one),
     )
     crossfade = echo.filters[-1]
     assert isinstance(crossfade, StreamingCrossfadeFilter)
     end = crossfade.pre_crossfade_samples + crossfade.crossfade_samples
-    beat = SR // 2
+    # B's one, and the gap between B's beats
+    start, beat = end - lead, round(SR * 60.0 / incoming_bpm)
 
     # the cut's geometry: same timing, same length; A's audio ends at its exit downbeat
     assert echo.timing_info == cut_fade.timing_info
     assert len(echoed) == len(cut)
     assert end == pytest.approx(29.0 * SR, abs=2)
-    # identical to the cut before A ends and once eight repeats have rung out
-    assert np.array_equal(echoed[: end * 2], cut[: end * 2])
-    assert np.array_equal(echoed[(end + 8 * beat) * 2 :], cut[(end + 8 * beat) * 2 :])
+    # identical to the cut before B's one and once eight repeats have rung out
+    assert np.array_equal(echoed[: start * 2], cut[: start * 2])
+    assert np.array_equal(echoed[(start + 8 * beat) * 2 :], cut[(start + 8 * beat) * 2 :])
     # the difference is A's echo alone: no trace of B in it
-    wet = (echoed - cut)[end * 2 : (end + 8 * beat) * 2]
+    wet = (echoed - cut)[start * 2 : (start + 8 * beat) * 2]
     assert _band_rms(wet, 1750, 1770) < 1e-4 * _band_rms(
-        cut[end * 2 : (end + beat) * 2], 1750, 1770
+        cut[start * 2 : (start + beat) * 2], 1750, 1770
     )
-    # each repeat lands on a beat from A's end, about 6 dB under the one before
+    for k in range(8):
+        repeat = np.abs(wet[k * beat * 2 : (k + 1) * beat * 2 : 2])
+        # each repeat starts on one of B's beats (its 80 ms burst rises over a few ms)...
+        assert np.argmax(repeat > 0.1 * repeat.max()) < 0.005 * SR
+        # ...and is silent once its burst is over, until the next beat
+        assert float(repeat[int(0.1 * SR) :].max()) < 1e-3
+    # about 6 dB under the one before
     levels = [
         float(np.sqrt(np.mean(wet[k * beat * 2 : (k * beat + 3528) * 2] ** 2))) for k in range(8)
     ]
     for louder, quieter in itertools.pairwise(levels):
         assert 20 * np.log10(louder / quieter) == pytest.approx(6.02, abs=0.5)
-    # between the repeats (after each 80 ms burst) the echo is silent
-    assert float(np.abs(wet[(beat // 2) * 2 : beat * 2]).max()) < 1e-3

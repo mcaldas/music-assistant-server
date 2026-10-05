@@ -231,7 +231,7 @@ def test_echo_out_filter_echoes_the_last_beat_into_the_incoming_stream() -> None
     pre-point moves the echo onto the incoming stream's timeline, and ``duration=first``
     keeps the incoming stream's length.
     """
-    echo = EchoOutFilter(LOGGER, 1278018, 882, 22050, 2, 44100)
+    echo = EchoOutFilter(LOGGER, 1278018, 882, 22050, 22050, 0, 2, 44100)
     assert echo.apply("[fadein]", "[fadeout]") == [
         "[fadeout]asplit=2[fadeout_echo_dry][echo_send]",
         "[echo_send]highpass=f=300,"
@@ -241,3 +241,21 @@ def test_echo_out_filter_echoes_the_last_beat_into_the_incoming_stream() -> None
         "atrim=start_sample=1278018,asetpts=PTS-STARTPTS[echo_wet]",
         "[fadein][echo_wet]amix=inputs=2:normalize=0:duration=first[fadein_echo]",
     ]
+
+
+def test_echo_out_filter_repeats_on_the_incoming_beat_from_its_one() -> None:
+    """
+    Into a faster track the repeats land on its beat; a one in the overlap takes the first.
+
+    The outgoing beat (0.5 s) still lands on the incoming one, here 882 samples before the
+    cut, and the rest follow 0.4 s apart; each repeat plays only 0.4 s of the outgoing beat,
+    so it ends where the next starts.
+    """
+    echo = EchoOutFilter(LOGGER, 1278018, 882, 22050, 17640, 882, 3, 44100)
+    assert echo.apply("[fadein]", "[fadeout]")[1] == (
+        "[echo_send]highpass=f=300,"
+        "afade=t=in:start_sample=1256850:nb_samples=441,"
+        "afade=t=out:start_sample=1274049:nb_samples=441,"
+        "aecho=0:1:480.011338|880.011338|1280.011338:0.350000|0.175000|0.087500,"
+        "atrim=start_sample=1278018,asetpts=PTS-STARTPTS[echo_wet]"
+    )
