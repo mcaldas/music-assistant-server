@@ -357,33 +357,35 @@ def test_nothing_is_held_back_until_the_source_has_delivered_it_all() -> None:
 
     # still delivering, however far ahead it has run: nothing may be held
     filling = SimpleNamespace(eof=False, has_error=False, duration_available=300.0)
-    assert tail_hold_target(_item(filling), window, frame_size) == 0
+    assert tail_hold_target(_item(filling), window, pcm_format) == 0
 
     # delivered in full: the whole window, aligned to a frame
     done = SimpleNamespace(eof=True, has_error=False, duration_available=300.0)
-    target = tail_hold_target(_item(done), window, frame_size)
+    target = tail_hold_target(_item(done), window, pcm_format)
     assert target == window
     assert target % frame_size == 0
 
     # a failed source is skipped without a fade, so its remainder plays out
     failed = SimpleNamespace(eof=True, has_error=True, duration_available=300.0)
-    assert tail_hold_target(_item(failed), window, frame_size) == 0
+    assert tail_hold_target(_item(failed), window, pcm_format) == 0
 
     # no buffer yet: opening the stream is what creates it
-    assert tail_hold_target(_item(None), window, frame_size) == 0
-    assert tail_hold_target(cast("Any", SimpleNamespace(streamdetails=None)), window, 4) == 0
+    assert tail_hold_target(_item(None), window, pcm_format) == 0
+    assert (
+        tail_hold_target(cast("Any", SimpleNamespace(streamdetails=None)), window, pcm_format) == 0
+    )
 
     # the buffer is read at decision time, so a capacity reselection that replaces
     # the item's details is picked up rather than remembered from before
     item = _item(filling)
-    assert tail_hold_target(item, window, frame_size) == 0
+    assert tail_hold_target(item, window, pcm_format) == 0
     item.streamdetails = SimpleNamespace(buffer=done, duration=300, seek_position=0)
-    assert tail_hold_target(item, window, frame_size) == window
+    assert tail_hold_target(item, window, pcm_format) == window
 
     # a window narrower than the source has left is still the cap: the caller keeps
     # yielding above it, so only the last part of the item is retained
     narrow = 8 * pcm_format.pcm_sample_size
-    assert tail_hold_target(_item(done), narrow, frame_size) == narrow
+    assert tail_hold_target(_item(done), narrow, pcm_format) == narrow
 
 
 # -- StreamsAudio._select_buffered_crossfade --

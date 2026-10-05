@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import struct
 from array import array
-from collections.abc import AsyncGenerator, Callable
+from collections.abc import AsyncGenerator, Awaitable, Callable
 from types import SimpleNamespace
 from typing import Any, cast
 from unittest.mock import AsyncMock, MagicMock
@@ -39,6 +39,8 @@ FRAME = 4
 FADE = int(END_POSITION_FADE * SR)
 
 MixStandIn = Callable[..., AsyncGenerator[bytes]]
+# called with the stream's StreamsAudio and how much it has emitted, after each chunk
+WhilePlaying = Callable[[StreamsAudio, int], Awaitable[None]]
 
 
 def _pcm(tag: int, seconds: int) -> AsyncGenerator[bytes]:
@@ -136,6 +138,7 @@ async def _run_flow(
     *,
     single_slot: bool = False,
     mix: Callable[[StreamsAudio], MixStandIn] | None = None,
+    while_playing: WhilePlaying | None = None,
 ) -> tuple[bytes, StreamsAudio, MagicMock, list[Any]]:
     """Stream ``first`` then ``second`` as one flow stream; return what it emitted."""
     await _filled(first, second)
@@ -161,6 +164,8 @@ async def _run_flow(
         cast("Any", queue), cast("Any", first), TEST_PCM_FORMAT, session_id="session-1"
     ):
         out.extend(chunk)
+        if while_playing is not None:
+            await while_playing(audio, len(out))
         await asyncio.sleep(0)
     return bytes(out), audio, mass, mass.player_queues.queue_data.return_value.flow_mode_stream_log
 
@@ -201,7 +206,10 @@ def _single_audio(
 
 
 async def _run_single(
-    audio: StreamsAudio, current: Any, mode: CrossfadeMode = CrossfadeMode.STANDARD_CROSSFADE
+    audio: StreamsAudio,
+    current: Any,
+    mode: CrossfadeMode = CrossfadeMode.STANDARD_CROSSFADE,
+    while_playing: WhilePlaying | None = None,
 ) -> bytes:
     """Stream one item in single-item mode; return what its stream emitted."""
     out = bytearray()
@@ -213,6 +221,8 @@ async def _run_single(
         standard_crossfade_duration=STANDARD_CROSSFADE_DURATION,
     ):
         out.extend(chunk)
+        if while_playing is not None:
+            await while_playing(audio, len(out))
         await asyncio.sleep(0)
     return bytes(out)
 
@@ -262,6 +272,44 @@ async def test_flow_smart_mode_plans_on_the_cut_tail(monkeypatch: pytest.MonkeyP
     assert build.call_args.kwargs["fade_out_end"] == 70.5
     # the smart window is capped at half of what A plays (70.5 / 2 -> 35)
     assert 34 * SECOND < len(build.call_args.kwargs["fade_out_data"]) <= 35 * SECOND
+
+
+def _move_end(item: Any, position: float) -> WhilePlaying:
+    """Have the client move (0: clear) the item's end once 5 s of the stream have gone out."""
+
+    async def _while_playing(audio: StreamsAudio, emitted: int) -> None:
+        if emitted == 5 * SECOND:
+            queues = MagicMock()
+            queues.get_item.return_value = item
+            queues.mass.streams.audio = audio
+            await PlayerQueuesController.set_end_position(queues, "queue-1", "a", position)
+
+    return _while_playing
+
+
+@pytest.mark.parametrize("single", [False, True], ids=["flow", "single"])
+@pytest.mark.parametrize("moved_to", [120.0, 0.0], ids=["moved", "cleared"])
+async def test_the_held_tail_follows_an_end_moved_while_the_item_plays(
+    monkeypatch: pytest.MonkeyPatch, single: bool, moved_to: float
+) -> None:
+    """An end at 60 s holds a 30 s tail; moved to 120 s or cleared, Smart Fades' full 45 s."""
+    first = _item("a", 1, 300, BufferSize.BALANCED, end=60.0)
+    second = _item("b", 2, 60, BufferSize.BALANCED)
+    if single:
+        await _filled(first, second)
+        audio, _mass = _single_audio(monkeypatch, second)
+        await _run_single(audio, first, CrossfadeMode.SMART_CROSSFADE, _move_end(first, moved_to))
+    else:
+        _out, audio, _mass, _log = await _run_flow(
+            monkeypatch,
+            first,
+            second,
+            CrossfadeMode.SMART_CROSSFADE,
+            while_playing=_move_end(first, moved_to),
+        )
+    build = cast("AsyncMock", audio.smart_fades_mixer.build)
+    assert build.call_args.kwargs["fade_out_end"] == (moved_to or None)
+    assert 44 * SECOND < len(build.call_args.kwargs["fade_out_data"]) <= 45 * SECOND
 
 
 @pytest.mark.parametrize("single_slot", [True, False])

@@ -318,32 +318,37 @@ def get_end_position(queue_item: QueueItem) -> float | None:
     return float(end) if isinstance(end, int | float) and end > start else None
 
 
-def tail_hold_target(queue_item: QueueItem, max_bytes: int, frame_size: int) -> int:
+def tail_hold_target(queue_item: QueueItem, max_bytes: int, pcm_format: AudioFormat) -> int:
     """
     Return how many bytes of tail may be held back for a fade right now.
 
     Nothing until the source has delivered the whole item (up to its end position, when
     one is set), the full window after: an earlier hold would come out of audio the
-    player is still waiting for.
+    player is still waiting for. An item that ends early holds at most half of what it
+    plays, read from its end as it is now, so the held tail follows a moved end.
 
     :param queue_item: The item being streamed.
     :param max_bytes: The full fade-out window (the cap).
-    :param frame_size: PCM frame size the target is aligned down to.
+    :param pcm_format: PCM format of the stream; the target is aligned down to its frames.
     """
     streamdetails = queue_item.streamdetails
     audio_buffer = cast("AudioBuffer | None", streamdetails.buffer) if streamdetails else None
     if audio_buffer is None:
         return 0
     # an item that ends early has all it will play once its buffer reaches that end
+    end = get_end_position(queue_item)
     if not audio_buffer.eof and (
-        (end := get_end_position(queue_item)) is None
-        or audio_buffer.first_buffered_chunk + audio_buffer.seconds_available < end
+        end is None or audio_buffer.first_buffered_chunk + audio_buffer.seconds_available < end
     ):
         return 0
     if audio_buffer.has_error:
         # a failed source is skipped without a fade, so its remaining audio is
         # better off played out than held back for one
         return 0
+    if end is not None and (half := int(end / 2)) * pcm_format.pcm_sample_size < max_bytes:
+        # at most half of what the item plays, and none when that is too little to fade
+        max_bytes = half * pcm_format.pcm_sample_size if half >= MIN_CROSSFADE_DURATION else 0
+    frame_size = pcm_format.bit_depth // 8 * pcm_format.channels
     return max_bytes // frame_size * frame_size
 
 
@@ -1985,11 +1990,11 @@ class StreamsAudio:
             if crossfade_mode == CrossfadeMode.SMART_CROSSFADE
             else standard_crossfade_duration
         )
-        # an item that ends early (set_end_position) holds at most half of what it plays
-        item_stop = get_end_position(queue_item) or streamdetails.duration
         crossfade_buffer_duration = min(
             crossfade_buffer_duration,
-            int(item_stop / 2) if item_stop else crossfade_buffer_duration,
+            int(streamdetails.duration / 2)
+            if streamdetails.duration
+            else crossfade_buffer_duration,
         )
         # skip crossfade if buffer would be too small to be meaningful
         if crossfade_buffer_duration < MIN_CROSSFADE_DURATION:
@@ -2057,7 +2062,7 @@ class StreamsAudio:
             received_bytes += len(chunk)
             tail_window.extend(chunk)
             del chunk
-            hold_target = tail_hold_target(queue_item, crossfade_buffer_size, frame_size)
+            hold_target = tail_hold_target(queue_item, crossfade_buffer_size, pcm_format)
             if len(tail_window) <= hold_target:
                 await asyncio.sleep(0)
                 continue
@@ -2613,10 +2618,11 @@ class StreamsAudio:
                     if item_crossfade_mode == CrossfadeMode.SMART_CROSSFADE
                     else standard_crossfade_duration
                 )
-                item_stop = get_end_position(queue_track) or queue_track.streamdetails.duration
                 crossfade_buffer_duration = min(
                     crossfade_buffer_duration,
-                    int(item_stop / 2) if item_stop else crossfade_buffer_duration,
+                    int(queue_track.streamdetails.duration / 2)
+                    if queue_track.streamdetails.duration
+                    else crossfade_buffer_duration,
                 )
                 # skip crossfade if buffer would be too small to be meaningful
                 if crossfade_buffer_duration < MIN_CROSSFADE_DURATION:
@@ -2833,7 +2839,7 @@ class StreamsAudio:
                         crossfade_buffer.extend(chunk)
                         del chunk
                         hold_target = (
-                            tail_hold_target(queue_track, crossfade_buffer_size, frame_size)
+                            tail_hold_target(queue_track, crossfade_buffer_size, pcm_format)
                             if holding_back
                             else 0
                         )

@@ -616,7 +616,8 @@ class PlayerQueuesController(QueueLoaderMixin, PlaybackTrackerMixin, StreamFeede
 
         The item's stream stops at ``position`` with a short fade-out, and its transition
         into the next item plays there: Smart Fades plans it in the item's last 45 s before
-        ``position``, and a ``set_transition`` exit_at must lie in that stretch. Setting,
+        ``position`` (half of what plays when shorter; it follows a moved or cleared end),
+        and a ``set_transition`` exit_at must lie in that stretch. Setting,
         moving or clearing the end drops a transition request pending on the item, as it was
         made for the old end: send it again afterwards. The end is stored on the item as the
         ``end_position`` extra attribute and lapses when the item stops playing; a seek past
