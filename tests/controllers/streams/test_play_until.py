@@ -468,6 +468,25 @@ async def test_reader_follows_an_end_set_while_it_reads(monkeypatch: pytest.Monk
     assert audio.read_positions["a"] == float("inf")
 
 
+async def test_a_cut_is_final_from_its_last_chunk(monkeypatch: pytest.MonkeyPatch) -> None:
+    """While the cut chunk is still with its consumer, a later end or a clear is refused."""
+    item = _item("a", 1, 120, BufferSize.BALANCED, end=33.25)
+    await _filled(item)
+    audio, _mass = _single_audio(monkeypatch, None)
+    queues = MagicMock()
+    queues.get_item.return_value = item
+    queues.mass.streams.audio = audio
+    out = bytearray()
+    async for chunk in audio.get_queue_item_stream(cast("Any", item), TEST_PCM_FORMAT):
+        out.extend(chunk)
+        if len(out) == int(33.25 * SR) * FRAME:
+            for position in (60.0, 0.0):
+                with pytest.raises(ActionUnavailable):
+                    await PlayerQueuesController.set_end_position(queues, "queue-1", "a", position)
+    assert len(out) == int(33.25 * SR) * FRAME
+    assert item.extra_attributes["end_position"] == 33.25
+
+
 async def test_an_end_fades_out_24_bit_audio_read_in_chunks_that_split_frames(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

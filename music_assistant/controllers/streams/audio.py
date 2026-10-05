@@ -1783,9 +1783,12 @@ class StreamsAudio:
                         chunk, split_frame = chunk[:whole], chunk[whole:]
                     chunk = fade_out_pcm(chunk, pcm_format, left, end_fade_bytes)
                 bytes_received += len(chunk)
+                # once cut, the pass is read to its end: that end can no longer move
                 self._mark_read(
                     queue_item.queue_item_id,
-                    read_from + bytes_received / pcm_format.pcm_sample_size * playback_speed,
+                    float("inf")
+                    if cut
+                    else read_from + bytes_received / pcm_format.pcm_sample_size * playback_speed,
                 )
                 if not first_chunk_received:
                     first_chunk_received = True
