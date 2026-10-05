@@ -22,7 +22,12 @@ from music_assistant.controllers.streams.smart_fades.planner.requested import (
 from music_assistant.controllers.streams.smart_fades.vocal import parse_vocal_probabilities
 from music_assistant.models.audio_analysis import AudioAnalysisData
 from tests.controllers.streams.smart_fades.conftest import _analysis_with_bands
-from tests.controllers.streams.smart_fades.test_planner import _analysis, _vocal_probabilities
+from tests.controllers.streams.smart_fades.test_planner import (
+    _analysis,
+    _vocal_probabilities,
+    _with_vocal_activity,
+)
+from tests.controllers.streams.smart_fades.test_requested import _outro_from
 
 LOGGER = logging.getLogger(__name__)
 # every requested style, an 8-bar one where it takes bars
@@ -112,10 +117,12 @@ async def test_the_mixer_cuts_the_outgoing_analysis_only_when_told() -> None:
 
 
 def _requested(
-    out: AudioAnalysisData, style: str, bars: int, exit_at: float
+    out: AudioAnalysisData, style: str, bars: int, exit_at: float, cut_at_end: bool = True
 ) -> tuple[RequestedTransitionPlanner, float]:
     """Plan a request on a 45 s tail; return the planner and the exit in song seconds."""
-    planner = RequestedTransitionPlanner(LOGGER, TransitionRequest(style, "n", bars, exit_at), 45.0)
+    planner = RequestedTransitionPlanner(
+        LOGGER, TransitionRequest(style, "n", bars, exit_at), 45.0, cut_at_end=cut_at_end
+    )
     plan = planner.plan(out, _analysis(122.0), 45.0)
     assert out.duration is not None
     return planner, out.duration - 45.0 + plan.fade_out_window
@@ -129,3 +136,75 @@ def test_an_exit_at_an_end_past_the_last_downbeat_takes_it(style: str, bars: int
 
     assert (planner.outcome, planner.reason) == ("applied", None)
     assert exit_s == pytest.approx(120.0)
+
+
+@pytest.mark.parametrize(("style", "bars"), STYLES)
+def test_a_phrase_sung_through_the_end_does_not_hold_the_exit_back(style: str, bars: int) -> None:
+    """A vocal running through a mid-bar end is cut there whatever the exit: every style plays."""
+    out = analysis_until(_with_vocal_activity(_analysis(120.0), [(60.0, 160.0)]), MID_BAR_END)
+    for exit_at in (MID_BAR_END, 0.0):
+        planner, exit_s = _requested(out, style, bars, exit_at)
+
+        assert planner.outcome == "applied"
+        assert 120.0 - 1e-6 <= exit_s <= MID_BAR_END + 1e-6
+
+
+@pytest.mark.parametrize(("style", "bars"), STYLES)
+def test_without_an_exit_a_phrase_sung_into_the_end_leaves_the_exit_to_the_others(
+    style: str, bars: int
+) -> None:
+    """
+    Smart Fades' exit (108 s) is inside a phrase; the next phrase runs into a mid-bar end.
+
+    The end cuts that later phrase whatever the exit, so A leaves on the first downbeat
+    after the earlier phrase instead of falling back.
+    """
+    out = _with_vocal_activity(
+        _analysis(120.0, rms_energy=_outro_from(108.0)), [(100.0, 111.5), (113.0, 160.0)]
+    )
+    planner, exit_s = _requested(analysis_until(out, MID_BAR_END), style, bars, 0.0)
+
+    assert (planner.outcome, planner.reason) == ("applied", None)
+    assert exit_s == pytest.approx(112.0)
+
+
+def test_a_phrase_that_ends_before_the_end_still_holds_the_exit_back() -> None:
+    """A phrase ending after the exit but before the end, or at the song's own end, still counts."""
+    before = analysis_until(_with_vocal_activity(_analysis(120.0), [(60.0, 120.9)]), MID_BAR_END)
+    through = analysis_until(_with_vocal_activity(_analysis(120.0), [(60.0, 160.0)]), MID_BAR_END)
+    for out, cut_at_end in ((before, True), (through, False)):
+        planner, _ = _requested(out, "cut", 0, MID_BAR_END, cut_at_end)
+
+        assert (planner.outcome, planner.reason) == ("fallback", "vocal")
+
+
+async def test_the_mixer_tells_a_request_that_its_tail_is_cut_at_the_end() -> None:
+    """Through the mixer, an end position spares the phrase it cuts, as the planner is told."""
+    from music_assistant_models.enums import CrossfadeMode  # noqa: PLC0415
+
+    from music_assistant.controllers.streams.smart_fades.fades import (  # noqa: PLC0415
+        SmartCrossFade,
+    )
+    from tests.controllers.streams.test_smartfade_transition_timings import (  # noqa: PLC0415
+        PCM,
+        _make_mixer,
+        _seconds,
+        _streamdetails,
+    )
+
+    out = _with_vocal_activity(_analysis(120.0), [(60.0, 160.0)])
+    mixer = _make_mixer({"out": out, "in": _analysis(122.0)})
+    fade = await mixer.build(
+        fade_in_streamdetails=_streamdetails("in"),
+        fade_out_streamdetails=_streamdetails("out"),
+        pcm_format=PCM,
+        standard_crossfade_duration=10,
+        mode=CrossfadeMode.SMART_CROSSFADE,
+        fade_out_data=b"\x00" * _seconds(45),
+        fade_in_bytes_len=_seconds(45),
+        request=TransitionRequest("echo_out", "in", 0, MID_BAR_END),
+        fade_out_end=MID_BAR_END,
+    )
+    assert isinstance(fade, SmartCrossFade)
+    assert isinstance(fade.planner, RequestedTransitionPlanner)
+    assert (fade.planner.outcome, fade.planner.reason) == ("applied", None)

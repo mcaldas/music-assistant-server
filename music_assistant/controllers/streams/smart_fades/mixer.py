@@ -278,6 +278,7 @@ class SmartFadesMixer:
                         self.logger,
                         request,
                         fade_in_bytes_len / pcm_format.pcm_sample_size,
+                        cut_at_end=fade_out_end is not None,
                         incoming_head=audible_head,
                     )
                     if request is not None

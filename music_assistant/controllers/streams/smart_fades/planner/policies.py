@@ -10,6 +10,7 @@ compose/reorder/disable them without touching the scoring math itself.
 
 from __future__ import annotations
 
+import math
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 
@@ -96,21 +97,41 @@ class VocalTruncationPolicy(Policy):
     # truncation rather than an inaudible tail sliver
     max_truncated_vocal: float = 0.25
 
+    def __init__(self, cut_at_end: bool = False) -> None:
+        """
+        Initialize the policy.
+
+        :param cut_at_end: The held tail ends where the queue item's audio is cut at its
+            end position (``set_end_position``), not where the song ends. A phrase still
+            sung there is cut whatever the exit, so it is not counted as truncated.
+        """
+        self.cut_at_end = cut_at_end
+
     def evaluate(self, candidate: Candidate, ctx: TransitionContext) -> Verdict:
         """Judge one candidate against the shared per-transition context."""
-        if ctx.vocal_out_scoring is None:
-            return Verdict.ok()
         # truncation = audible vocal BEYOND the candidate's anchor (cut off by the
         # trim), not vocal inside the fade - a phrase riding the fade is normal
         anchor = candidate.plan.fade_out_window
         truncated = sum(
             min(right, ctx.audio_end) - max(left, anchor)
-            for left, right in ctx.vocal_out_scoring.windows
+            for left, right in self.phrases(ctx)
             if min(right, ctx.audio_end) > max(left, anchor)
         )
         if truncated > self.max_truncated_vocal:
             return Verdict.reject("truncates an audible outgoing vocal phrase")
         return Verdict.ok()
+
+    def phrases(self, ctx: TransitionContext) -> list[tuple[float, float]]:
+        """
+        Return the outgoing vocal windows an exit can cut short, in buffer-local seconds.
+
+        :param ctx: The shared per-transition context.
+        """
+        if ctx.vocal_out_scoring is None:
+            return []
+        # the tail's end is the cut: a phrase that runs up to it never finishes
+        cut = ctx.buffer_duration - self.max_truncated_vocal if self.cut_at_end else math.inf
+        return [(left, right) for left, right in ctx.vocal_out_scoring.windows if right < cut]
 
 
 class AudibleTrimPolicy(Policy):

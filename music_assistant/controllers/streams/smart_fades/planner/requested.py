@@ -198,12 +198,10 @@ class _PhraseCutPolicy(VocalTruncationPolicy):
 
     def evaluate(self, candidate: Candidate, ctx: TransitionContext) -> Verdict:
         """Judge one candidate against the shared per-transition context."""
-        if ctx.vocal_out_scoring is None:
-            return Verdict.ok()
         exit_s = candidate.plan.fade_out_window
         if any(
             left < exit_s and min(right, ctx.audio_end) - exit_s > self.max_truncated_vocal
-            for left, right in ctx.vocal_out_scoring.windows
+            for left, right in self.phrases(ctx)
         ):
             return Verdict.reject("cuts into an audible outgoing vocal phrase")
         return Verdict.ok()
@@ -227,6 +225,7 @@ class RequestedTransitionPlanner(TransitionPlanner):
         logger: logging.Logger,
         request: TransitionRequest,
         fade_in_seconds: float = float(SMART_CROSSFADE_DURATION),
+        cut_at_end: bool = False,
         incoming_head: npt.NDArray[np.bool_] | None = None,
     ) -> None:
         """
@@ -235,12 +234,15 @@ class RequestedTransitionPlanner(TransitionPlanner):
         :param logger: Logger for debug output.
         :param request: The client's request for this boundary.
         :param fade_in_seconds: Length of the incoming track's head the mix will receive.
+        :param cut_at_end: Whether the outgoing tail ends where the queue item's audio is cut
+            at its end position (``set_end_position``) rather than where the song ends.
         :param incoming_head: Which 10 ms windows of the incoming track's head are audible,
             from its start, read from the PCM the mixer holds; None when unknown.
         """
         super().__init__(logger)
         self.request = request
         self.fade_in_seconds = fade_in_seconds
+        self.cut_at_end = cut_at_end
         self.incoming_head = incoming_head
         # where the incoming track's audio starts to sound, in its seconds
         self.incoming_audible_from = None if incoming_head is None else audible_start(incoming_head)
@@ -311,15 +313,13 @@ class RequestedTransitionPlanner(TransitionPlanner):
             tries = [exit_s]
         else:
             # A's phrases are kept whole: the exit moves from Smart Fades' own to the nearest
-            # downbeat no sung phrase of A runs past (the later one on a tie), a few bars at most
-            sung_end = ctx.vocal_out_scoring.last_end() if ctx.vocal_out_scoring else 0.0
+            # downbeat no sung phrase of A runs past (the later one on a tie), a few bars at most;
+            # a phrase sung through an end position is cut there whatever the exit
+            truncation = VocalTruncationPolicy(self.cut_at_end)
+            sung_end = max((right for _, right in truncation.phrases(ctx)), default=0.0)
             latest = ctx.default_anchor + _MAX_EXIT_DELAY_BARS * bar_out
             tries = sorted(
-                (
-                    d
-                    for d in exits
-                    if sung_end - VocalTruncationPolicy.max_truncated_vocal <= d <= latest
-                ),
+                (d for d in exits if sung_end - truncation.max_truncated_vocal <= d <= latest),
                 key=lambda downbeat: (abs(downbeat - ctx.default_anchor), -downbeat),
             ) or [min(exits, key=lambda downbeat: abs(downbeat - ctx.default_anchor))]
             # when that one does not plan only later ones are tried: an earlier exit keeps no
@@ -341,11 +341,14 @@ class RequestedTransitionPlanner(TransitionPlanner):
     ) -> TransitionPlan | None:
         """Build the requested plan ending on ``exit_s``, or None with the reason recorded."""
         # the request sets the exit and the length: the policies judging those stand down;
-        # an exit the client named leaves A's later phrases out, so only a cut into one counts
+        # an exit the client named leaves A's later phrases out, so only a cut into one
+        # counts; a phrase sung through an end position is cut there whatever the exit
         selector = CandidateSelector(
             [
-                _PhraseCutPolicy()
-                if self.request.exit_at and isinstance(policy, VocalTruncationPolicy)
+                (_PhraseCutPolicy if self.request.exit_at else VocalTruncationPolicy)(
+                    self.cut_at_end
+                )
+                if isinstance(policy, VocalTruncationPolicy)
                 else policy
                 for policy in default_policies()
                 if not isinstance(policy, (AudibleTrimPolicy, OverlapPreferencePolicy))
