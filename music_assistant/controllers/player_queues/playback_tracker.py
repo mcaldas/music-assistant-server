@@ -48,7 +48,7 @@ from music_assistant.controllers.player_queues.helpers import (
     find_dynamic_source,
     get_current_playback_speed,
 )
-from music_assistant.controllers.streams.smart_fades.planner.requested import TransitionRequest
+from music_assistant.controllers.streams.smart_fades.planner.requested import REQUEST_PREFIX
 from music_assistant.controllers.webserver.helpers.auth_middleware import (
     set_current_user,
 )
@@ -294,9 +294,12 @@ class PlaybackTrackerMixin(_PlayerQueuesBase):
             and (prev_item := self.get_item(queue_id, prev_item_id)) is not None
         ):
             attrs = prev_item.extra_attributes
-            TransitionRequest.drop(attrs)
-            for key in [key for key in attrs if key.startswith("transition_")]:
+            stale = [key for key in attrs if key.startswith(("transition_", REQUEST_PREFIX))]
+            for key in stale:
                 del attrs[key]
+            if stale:
+                # the queue is saved with its items: a restart must not bring them back
+                self._queue_data[queue_id].items_cache_dirty = True
 
         # refill the queue (dynamic mode or autoplay) when running low on tracks
         if "current_item_id" in changed_keys:

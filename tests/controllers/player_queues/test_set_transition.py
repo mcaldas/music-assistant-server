@@ -245,9 +245,10 @@ def test_an_item_that_stops_playing_loses_its_unused_request() -> None:
     queue.current_index, queue.current_item = 1, playing
     ctrl._update_queue_from_player(player)
 
-    # its request and its report described this pass only
+    # its request and its report described this pass only, and the saved queue forgets them
     assert not _request_keys(played)
     assert not any(key.startswith("transition_") for key in played.extra_attributes)
+    assert ctrl._queue_data["q1"].items_cache_dirty
     assert TransitionRequest.read(playing.extra_attributes) is not None
 
 
