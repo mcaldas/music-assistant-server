@@ -296,3 +296,34 @@ async def test_a_requested_cut_switches_tracks_at_the_exit_without_a_gap() -> No
     around = window(cut - 0.5, cut + 0.5)[0::2]
     rms = np.sqrt(np.mean(around[: len(around) // 441 * 441].reshape(-1, 441) ** 2, axis=1))
     assert rms.min() > 0.2 / np.sqrt(2) * 10 ** (-30 / 20)
+
+
+@pytest.mark.asyncio
+async def test_a_requested_cut_never_lands_on_silence_in_the_incoming_track() -> None:
+    """B falls silent in the bar after its one: the cut lands on B's next one, never on the gap."""
+    fade_out, fade_in = _tone(440.0, 45.0), _tone(1760.0, 45.0)
+    # B's one 1 s in, then 0.4 s of silence, as a pickup that dies away before the song starts
+    fade_in[int(1.6 * SR) * 2 : int(2.0 * SR) * 2] = 0.0
+    inc = _analysis(120.0, 240.0)
+    assert inc.beats is not None
+    assert inc.downbeats is not None
+    assert inc.rms_energy is not None
+    inc.beats = [beat + 1.0 for beat in inc.beats]
+    inc.downbeats = [downbeat + 1.0 for downbeat in inc.downbeats]
+    inc.rms_energy[int(1.6 / 240.0 * 1800) : int(2.0 / 240.0 * 1800)] = [0.001] * 3
+    planner = RequestedTransitionPlanner(
+        logging.getLogger(), TransitionRequest("cut", "n", 0, 224.0)
+    )
+    fade = SmartCrossFade(logging.getLogger(), _analysis(120.0, 240.0), inc, planner)
+    fade.build(fade_out.nbytes, fade_in.nbytes, PCM)
+    chunks = [chunk async for chunk in fade.apply(fade_out.tobytes(), fade_in.tobytes(), PCM)]
+    mix = np.frombuffer(b"".join(chunks), dtype=np.float32)
+    timing = fade.timing_info
+    cut = timing.pre_crossfade_duration + timing.crossfade_duration
+
+    assert planner.outcome == "applied"
+    assert cut == pytest.approx(29.0, abs=0.01)
+    # no 10 ms stretch of the bar after the cut falls under -50 dBFS
+    after = mix[int(cut * SR) * 2 : int((cut + 2.0) * SR) * 2][0::2]
+    rms = np.sqrt(np.mean(after[: len(after) // 441 * 441].reshape(-1, 441) ** 2, axis=1))
+    assert 20 * np.log10(rms.min() + 1e-12) > -50.0

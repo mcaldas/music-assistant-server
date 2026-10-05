@@ -58,6 +58,13 @@ def _grid_ending_at(analysis: AudioAnalysisData, seconds: float) -> AudioAnalysi
     return analysis
 
 
+def _silent_after_its_one(level: float = 0.001) -> AudioAnalysisData:
+    """Return a track whose one is 1 s in, its energy at ``level`` from 1.6 s to 2 s."""
+    rms = np.full(1800, 0.5, dtype=np.float32)
+    rms[int(1.6 / 240.0 * 1800) : int(2.0 / 240.0 * 1800)] = level
+    return _shifted(_analysis(120.0, rms_energy=rms), 1.0)
+
+
 def _bars_of_outgoing(plan: TransitionPlan, bpm: float) -> float:
     """Return the overlap's length in bars of the outgoing track (4/4)."""
     ratio = plan.tempo_plan.steps[-1][1] if plan.tempo_plan else 1.0
@@ -219,8 +226,15 @@ def test_cut_lands_on_a_vocal_that_starts_on_the_one() -> None:
     [
         (_with_vocal_activity(_shifted(_analysis(120.0), 3.0), [(1.2, 9.0)]), 45.0, "vocal"),
         (_shifted(_analysis(120.0), 7.87), 7.0, "no_room"),
+        (_with_vocal_activity(_silent_after_its_one(), [(2.2, 9.0)]), 45.0, "vocal"),
+        (_silent_after_its_one(), 2.5, "no_room"),
     ],
-    ids=["sung-lead-in-before-the-one", "one-beyond-the-received-head"],
+    ids=[
+        "sung-lead-in-before-the-one",
+        "one-beyond-the-received-head",
+        "sung-before-the-downbeat-after-a-silent-bar",
+        "downbeat-after-a-silent-bar-beyond-the-received-head",
+    ],
 )
 def test_a_cut_that_cannot_land_on_the_one_ships_the_default_plan(
     incoming: AudioAnalysisData, fade_in_seconds: float, reason: str
@@ -231,6 +245,31 @@ def test_a_cut_that_cannot_land_on_the_one_ships_the_default_plan(
     )
 
     assert (planner.outcome, planner.reason) == ("fallback", reason)
+
+
+@pytest.mark.parametrize(
+    ("level", "one"),
+    [(0.001, 3.0), (0.02, 1.0), (0.5, 1.0)],
+    ids=["silent", "quiet", "loud"],
+)
+def test_a_cut_lands_on_the_first_downbeat_whose_bar_sounds(level: float, one: float) -> None:
+    """B falling silent in the bar after its one would leave the room in silence: B's next one."""
+    planner, plan = _plan(_analysis(120.0), _silent_after_its_one(level), "cut", exit_at=224.0)
+
+    assert (planner.outcome, planner.reason) == ("applied", None)
+    assert plan.crossfade_duration == CUT_SECONDS
+    assert plan.fadein_trim_start == pytest.approx(one - CUT_SECONDS)
+
+
+def test_a_cut_reads_the_silence_before_the_one_as_before_it() -> None:
+    """A silent bin centred before B's one, as B starts late in it, keeps the cut on the one."""
+    rms = np.full(1800, 0.5, dtype=np.float32)
+    rms[: int(1.1 / 240.0 * 1800)] = 0.001
+    inc = _shifted(_analysis(120.0, rms_energy=rms), 1.05)
+    planner, plan = _plan(_analysis(120.0), inc, "cut", exit_at=224.0)
+
+    assert (planner.outcome, planner.reason) == ("applied", None)
+    assert plan.fadein_trim_start == pytest.approx(1.05 - CUT_SECONDS)
 
 
 def test_cut_inside_a_mastered_fade_keeps_its_fade_curve() -> None:

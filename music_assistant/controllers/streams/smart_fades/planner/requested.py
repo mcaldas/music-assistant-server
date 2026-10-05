@@ -46,6 +46,7 @@ if TYPE_CHECKING:
 
     from music_assistant_models.constants import EXTRA_ATTRIBUTES_TYPES
 
+    from music_assistant.controllers.streams.smart_fades.models import Deck
     from music_assistant.models.audio_analysis import AudioAnalysisData
 
     from .context import TransitionContext
@@ -66,6 +67,9 @@ _VOCAL_ONSET_SLACK_S = 0.25
 # how many bars past Smart Fades' own exit a phrase may move the exit when no exit is named;
 # further on, A would play its outro alone to keep a late ad-lib
 _MAX_EXIT_DELAY_BARS = 4
+# a bin of the stored, peak-normalized energy (~0.1-0.2s) at or under this is silent, as
+# Smart Fades' sustained energy floor counts it (-40 dB)
+_SILENT_RMS = 0.01
 
 
 @dataclass(frozen=True, slots=True)
@@ -362,13 +366,21 @@ class RequestedTransitionPlanner(TransitionPlanner):
         window = min(float(SMART_CROSSFADE_DURATION), self.fade_in_seconds)
         b_one = float(ctx.incoming.downbeats[0]) if len(ctx.incoming.downbeats) else 0.0
         if cut:
-            # B's one lands where A ends
-            overlap, entry = CUT_SECONDS, max(0.0, b_one - CUT_SECONDS)
-            if self._sung_before(ctx, entry):
-                # a lead-in B sings before its one: cut off, or B's silence heard after A stops
-                self._fallback("vocal")
-                return []
-            if entry + overlap > window:
+            # B's one lands where A ends; when B falls silent in the bar after it (a pickup
+            # dying away before the song starts), the room would hear that silence once A
+            # stops, so the cut lands on B's first later downbeat whose bar carries level
+            overlap = CUT_SECONDS
+            for one in [float(d) for d in ctx.incoming.downbeats] or [0.0]:
+                entry = max(0.0, one - CUT_SECONDS)
+                if self._sung_before(ctx, entry):
+                    # a lead-in B sings before its one: cut off, or B's silence heard after A stops
+                    self._fallback("vocal")
+                    return []
+                if entry + overlap > window:
+                    return []
+                if not _falls_silent(ctx.incoming, one):
+                    break
+            else:
                 return []
         else:
             # Smart Fades' quick-fade length, cut to the whole bars before the exit and to
@@ -418,3 +430,15 @@ class RequestedTransitionPlanner(TransitionPlanner):
     def _fallback(self, reason: str) -> None:
         """Record why the default plan ships instead of the requested one."""
         self.outcome, self.reason = "fallback", reason
+
+
+def _falls_silent(deck: Deck, start: float) -> bool:
+    """Whether the deck's stored energy has a silent bin centred in the bar from ``start``."""
+    rms = deck.analysis.rms_energy
+    duration = deck.analysis.duration
+    if rms is None or len(rms) == 0 or not duration:
+        return False
+    bin_seconds = duration / len(rms)
+    low = int(start / bin_seconds + 0.5)
+    high = int((start + deck.beats_per_bar * 60.0 / deck.bpm) / bin_seconds + 0.5)
+    return min(rms[low:high], default=1.0) <= _SILENT_RMS
