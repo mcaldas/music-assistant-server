@@ -1716,8 +1716,21 @@ class StreamsAudio:
         finished = False
         next_buffer_triggered = False
         stream_started_at = asyncio.get_event_loop().time()
+        # an exact seek (where a crossfade handed over) falls between milliseconds, and the
+        # buffer starts at the millisecond before it: drop the samples in between, or the
+        # handover replays them
+        skip_bytes = 0
+        if exact_seek and playback_speed == 1.0:
+            rate = pcm_format.sample_rate
+            skip_bytes = max(0, round(seek_position * rate) - seek_position_ms * rate // 1000) * (
+                pcm_format.bit_depth // 8 * pcm_format.channels
+            )
         try:
-            async for chunk in media_stream_gen:
+            async for source_chunk in media_stream_gen:
+                chunk = source_chunk[skip_bytes:] if skip_bytes else source_chunk
+                skip_bytes = max(0, skip_bytes - len(source_chunk))
+                if not chunk:
+                    continue
                 bytes_received += len(chunk)
                 if not first_chunk_received:
                     first_chunk_received = True
