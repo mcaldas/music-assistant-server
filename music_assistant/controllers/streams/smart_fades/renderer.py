@@ -15,6 +15,7 @@ import logging
 from typing import TYPE_CHECKING
 
 from music_assistant.controllers.streams.smart_fades.filters import (
+    EchoOutFilter,
     FadeInTrimFilter,
     FadeOutTrimFilter,
     Filter,
@@ -23,6 +24,7 @@ from music_assistant.controllers.streams.smart_fades.filters import (
     ShelfFilter,
     ShelfType,
     StreamingCrossfadeFilter,
+    SweepFilter,
 )
 from music_assistant.controllers.streams.smart_fades.models import (
     CrossfadeTimingInfo,
@@ -105,6 +107,17 @@ class TransitionRenderer:
         self._append_shelf(filters, plan.eq_plan.low_out, "fadeout")
         self._append_shelf(filters, plan.eq_plan.high_out, "fadeout")
         self._append_shelf(filters, plan.eq_plan.mid_out, "fadeout")
+        if plan.sweep_out is not None:
+            filters.append(
+                SweepFilter(
+                    self.logger,
+                    "highpass",
+                    plan.sweep_out.steps,
+                    plan.sweep_out.mix_steps,
+                    "fadeout",
+                    sample_rate,
+                )
+            )
         if plan.tempo_plan:
             filters.append(GradualTimeStretchFilter(self.logger, plan.tempo_plan.steps))
         if plan.fadein_trim_start is not None:
@@ -114,6 +127,29 @@ class TransitionRenderer:
         self._append_shelf(filters, plan.eq_plan.low_in, "fadein")
         self._append_shelf(filters, plan.eq_plan.high_in, "fadein")
         self._append_shelf(filters, plan.eq_plan.mid_in, "fadein")
+        if plan.sweep_in is not None:
+            filters.append(
+                SweepFilter(
+                    self.logger,
+                    "lowpass",
+                    plan.sweep_in.steps,
+                    plan.sweep_in.mix_steps,
+                    "fadein",
+                    sample_rate,
+                )
+            )
+        if plan.echo_out is not None:
+            # on the rendered timeline, where the crossfade cuts the outgoing stream
+            filters.append(
+                EchoOutFilter(
+                    self.logger,
+                    pre_crossfade_samples,
+                    crossfade_samples,
+                    round(plan.echo_out.beat * sample_rate),
+                    plan.echo_out.repeats,
+                    sample_rate,
+                )
+            )
         # the streaming blend is positioned at the planned pre-point, so it can
         # emit while the incoming window is still arriving; the hard cut at the
         # planned end keeps any time-stretch drift out of the incoming audio

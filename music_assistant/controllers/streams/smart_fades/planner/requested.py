@@ -17,11 +17,15 @@ from music_assistant.controllers.streams.smart_fades.helpers import (
     AUDIBLE_WINDOW_S,
     SMART_CROSSFADE_DURATION,
     audible_start,
+    db_ramp,
     sustained_energy_floor,
 )
 from music_assistant.controllers.streams.smart_fades.models import (
+    EchoOut,
+    EqPlan,
     FadeOutTrim,
     PlanMetrics,
+    SweepSchedule,
     TempoPlan,
     TransitionPlan,
     TransitionTier,
@@ -62,7 +66,9 @@ if TYPE_CHECKING:
     from .context import TransitionContext
 
 REQUEST_PREFIX = "requested_transition_"
-REQUEST_STYLES = ("blend", "quick_fade", "cut")
+REQUEST_STYLES = ("blend", "quick_fade", "cut", "filter_sweep", "echo_out")
+# the styles built on a blend's overlap; the others are built on a cut's or a quick fade's
+BLEND_STYLES = ("blend", "filter_sweep")
 # a cut's overlap: just long enough to keep the switch click-free
 CUT_SECONDS = 0.02
 # the shortest tempo ramp a requested blend ships; the factory fits one into the (up to)
@@ -102,6 +108,16 @@ _FADED_FRACTION = 0.1
 # a gap in the incoming PCM head: this long under its audible line, as a room hears one; the
 # head shows gaps the analysis' ~0.1-0.2 s bins blur
 _GAP_S = 0.03
+# filter_sweep: the outgoing high-pass rises over the whole overlap; the incoming low-pass
+# opens over its first 3/4 and fades to dry by 9/10 of it, ahead of asendcmd's frame
+# granularity (~0.1s), so the incoming track plays on untouched
+# (10 Hz until the overlap leaves A's sub-bass alone)
+_SWEEP_OUT_HZ = (10.0, 8000.0)
+_SWEEP_IN_HZ = (250.0, 8000.0)
+_SWEEP_IN_OPEN = 0.75
+_SWEEP_IN_DRY = 0.9
+# echo_out: how long the outgoing track's last beat rings on, in its bars
+_ECHO_BARS = 2
 
 
 @dataclass(frozen=True, slots=True)
@@ -192,9 +208,10 @@ class RequestedTransitionPlanner(TransitionPlanner):
     Unlike the default planner it may leave the outgoing track early, at the requested
     downbeat inside the held tail; a sung phrase after that exit is left out, one the exit
     cuts into is refused. Without a requested exit it leaves at the default planner's, moved
-    to the nearest downbeat no sung phrase runs past. It adds no effects. A request it
-    cannot honour ships the default planner's plan; ``outcome`` and ``reason`` say what
-    happened.
+    to the nearest downbeat no sung phrase runs past. A filter sweep is a blend handed over
+    by filters instead of EQ; an echo out is a cut whose last outgoing beat rings on. A
+    request it cannot honour ships the default planner's plan; ``outcome`` and ``reason``
+    say what happened.
     """
 
     def __init__(
@@ -325,7 +342,7 @@ class RequestedTransitionPlanner(TransitionPlanner):
             self.logger,
         )
         factory = CandidateFactory(ctx, self.logger)
-        if self.request.style == "blend":
+        if self.request.style in BLEND_STYLES:
             if choose_tier(ctx.outgoing, ctx.incoming, exit_s)[1] is TransitionTier.QUICK_FADE:
                 # the pair blends, but not this early in the tail (too few bars of A before it)
                 blendable = ctx.tier is not TransitionTier.QUICK_FADE
@@ -347,7 +364,7 @@ class RequestedTransitionPlanner(TransitionPlanner):
             # only the vocal policies reject in this set
             self._fallback("vocal")
             return None
-        if self.request.style == "blend" and winner.spec.bars < self.request.bars:
+        if self.request.style in BLEND_STYLES and winner.spec.bars < self.request.bars:
             self.reason = "shortened"
         plan = PlanAssembler(ctx, self.logger).finalize(winner)
         if not winner.spec.bars:
@@ -357,6 +374,10 @@ class RequestedTransitionPlanner(TransitionPlanner):
             if self.request.style == "quick_fade":
                 # Smart Fades' own quick fade lasts a bar at least
                 self.reason = "shortened"
+        if self.request.style == "filter_sweep":
+            return _with_sweeps(plan)
+        if self.request.style == "echo_out":
+            return self._with_echo(ctx, plan)
         return plan
 
     def _blend_candidates(
@@ -598,6 +619,42 @@ class RequestedTransitionPlanner(TransitionPlanner):
             left < entry - _VOCAL_ONSET_SLACK_S for left, _ in ctx.vocal_in_scoring.windows
         )
 
+    def _with_echo(self, ctx: TransitionContext, plan: TransitionPlan) -> TransitionPlan | None:
+        """Ring the cut's last outgoing beat on under the incoming track, or None to fall back."""
+        exit_s, entry = plan.fade_out_window, plan.fadein_trim_start or 0.0
+        # A's real last beat before the exit, from its grid (its tempo can drift from the bpm)
+        nominal = 60.0 / ctx.outgoing.bpm
+        last = [float(b) for b in ctx.outgoing.beats if b < exit_s - 0.25 * nominal]
+        beat = exit_s - last[-1] if last and exit_s - last[-1] < 1.5 * nominal else nominal
+        # incoming-song seconds where the outgoing audio ends and the echo starts
+        start = entry + plan.crossfade_duration
+        window = min(float(SMART_CROSSFADE_DURATION), self.fade_in_seconds)
+        bar = ctx.outgoing.beats_per_bar
+        # repeats on A's beat drift off B's once the tempos differ: then only the first two
+        wanted = _ECHO_BARS * bar if abs(ctx.incoming.bpm / ctx.outgoing.bpm - 1.0) <= 0.02 else 2
+        repeats = min(wanted, int((window - start) / beat))
+        if exit_s < beat or repeats < min(bar, wanted):
+            # the last beat, or a bar of its echo, is not in the audio the mix receives
+            self._fallback("no_room")
+            return None
+        if (
+            ctx.vocal_collision_reliable
+            and ctx.vocal_out_scoring is not None
+            and ctx.vocal_in_scoring is not None
+            and any(
+                left < exit_s and right > exit_s - beat
+                for left, right in ctx.vocal_out_scoring.windows
+            )
+            and any(
+                left < start + repeats * beat and right > entry
+                for left, right in ctx.vocal_in_scoring.windows
+            )
+        ):
+            # a sung beat echoing over the incoming vocal is the collision the checks guard
+            self._fallback("vocal")
+            return None
+        return replace(plan, echo_out=EchoOut(beat, repeats))
+
     def _fallback(self, reason: str) -> None:
         """Record why the default plan ships instead of the requested one."""
         self.outcome, self.reason = "fallback", reason
@@ -681,3 +738,38 @@ def _falls_quiet(
         float(landed.min()) <= _SILENT_FRACTION * floor
         or float(np.median(bar)) < _QUIET_BAR_FRACTION * floor
     )
+
+
+def _with_sweeps(plan: TransitionPlan) -> TransitionPlan:
+    """Hand a blend over with filters instead of EQ: A high-passed away, B opened from a low-pass."""
+    ratio = plan.tempo_plan.steps[-1][1] if plan.tempo_plan else 1.0
+    overlap = plan.crossfade_duration
+    # A-side in A-input time (its ramp ends before the overlap), B-side in post-trim time
+    start_out = plan.fade_out_window - overlap * ratio
+    opened, dry = _SWEEP_IN_OPEN * overlap, _SWEEP_IN_DRY * overlap
+    # about 150 steps over the overlap, 10-100 ms apart: a one-bar sweep must not zipper
+    step = min(0.1, max(0.01, overlap / 150))
+    return replace(
+        plan,
+        eq_plan=EqPlan.neutral(swap_at=plan.eq_plan.swap_at),
+        sweep_out=SweepSchedule(
+            [
+                (0.0, _SWEEP_OUT_HZ[0]),
+                *_hz_ramp(start_out, overlap * ratio, *_SWEEP_OUT_HZ, step),
+            ]
+        ),
+        sweep_in=SweepSchedule(
+            _hz_ramp(0.0, opened, *_SWEEP_IN_HZ, step),
+            db_ramp(opened, dry - opened, 1.0, 0.0, step),
+        ),
+    )
+
+
+def _hz_ramp(
+    start: float, duration: float, from_hz: float, to_hz: float, step: float
+) -> list[tuple[float, float]]:
+    """Return a cutoff schedule that moves evenly in octaves, on ``db_ramp``'s step grid."""
+    return [
+        (t, 2.0**octave)
+        for t, octave in db_ramp(start, duration, math.log2(from_hz), math.log2(to_hz), step)
+    ]

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import itertools
 import logging
 import sys
 from collections.abc import AsyncGenerator
@@ -20,6 +21,7 @@ from music_assistant.controllers.streams.smart_fades.fades import (
     StandardCrossFade,
     _feed_ffmpeg_stdin,
 )
+from music_assistant.controllers.streams.smart_fades.filters import StreamingCrossfadeFilter
 from music_assistant.controllers.streams.smart_fades.helpers import audible_windows
 from music_assistant.controllers.streams.smart_fades.mixer import SmartFadesMixer
 from music_assistant.controllers.streams.smart_fades.planner.requested import (
@@ -1057,3 +1059,113 @@ async def test_without_its_head_a_cut_never_lands_in_a_silent_b_before_it_starts
         onset - 0.04 + 2.0
     )
     assert _quietest_after(mix, cut, 1.0) > -50.0
+
+
+async def _render_request(
+    request: TransitionRequest, fade_out: np.ndarray, fade_in: np.ndarray
+) -> tuple[np.ndarray, SmartCrossFade]:
+    """Plan a request between two steady 120 BPM tracks and render it through ffmpeg."""
+    planner = RequestedTransitionPlanner(logging.getLogger(), request)
+    fade = SmartCrossFade(
+        logging.getLogger(), _analysis(120.0, 240.0), _analysis(120.0, 240.0), planner
+    )
+    fade.build(fade_out.nbytes, fade_in.nbytes, PCM)
+    chunks = [chunk async for chunk in fade.apply(fade_out.tobytes(), fade_in.tobytes(), PCM)]
+    assert planner.outcome == "applied"
+    return np.frombuffer(b"".join(chunks), dtype=np.float32), fade
+
+
+def _bursts(freq: float, seconds: float, beat: float = 0.5, length: float = 0.08) -> np.ndarray:
+    """Return a stereo-interleaved tone burst on every beat, with 5 ms edges."""
+    t = np.arange(int(SR * seconds)) / SR
+    phase = t % beat
+    envelope = np.clip(np.minimum(phase, length - phase) / 0.005, 0.0, 1.0)
+    mono = (0.3 * np.sin(2 * np.pi * freq * t) * envelope).astype(np.float32)
+    return np.repeat(mono, 2)
+
+
+@pytest.mark.asyncio
+async def test_a_filter_sweep_hands_over_through_the_filters() -> None:
+    """A loses its bass first and B its highs until late; B then plays on bit-exact."""
+    fade_out = _tone(100.0, 45.0, 0.1) + _tone(1000.0, 45.0, 0.1) + _tone(6000.0, 45.0, 0.1)
+    fade_in = _tone(150.0, 45.0, 0.1) + _tone(1500.0, 45.0, 0.1) + _tone(7000.0, 45.0, 0.1)
+    swept, sweep = await _render_request(
+        TransitionRequest("filter_sweep", "n", 8, 224.0), fade_out, fade_in
+    )
+    blended, blend = await _render_request(
+        TransitionRequest("blend", "n", 8, 224.0), fade_out, fade_in
+    )
+    timing = sweep.timing_info
+    crossfade = sweep.filters[-1]
+    assert isinstance(crossfade, StreamingCrossfadeFilter)
+    pre, overlap = crossfade.pre_crossfade_samples, crossfade.crossfade_samples
+
+    # the blend's own geometry: same overlap, same length, PRE + CF + POST
+    assert timing == blend.timing_info
+    assert overlap == pytest.approx(16.0 * SR, abs=1)
+    assert len(swept) == len(blended)
+    assert len(swept) // 2 == pytest.approx(
+        int(
+            (
+                timing.pre_crossfade_duration
+                + timing.crossfade_duration
+                + timing.post_crossfade_duration
+            )
+            * SR
+        ),
+        abs=2,
+    )
+    early, late = _cf_slice(swept, sweep, 0.05, 0.3), _cf_slice(swept, sweep, 0.6, 0.85)
+    plain_early, plain_late = (
+        _cf_slice(blended, blend, 0.05, 0.3),
+        _cf_slice(blended, blend, 0.6, 0.85),
+    )
+    # A: its bass is gone well before the end (over 26 dB down), while its top still plays
+    assert _band_rms(late, 95, 105) < 0.05 * _band_rms(plain_late, 95, 105)
+    assert _band_rms(late, 5950, 6050) > 0.5 * _band_rms(plain_late, 5950, 6050)
+    # B: enters through the low-pass, its bass as in the blend, its top held back
+    assert _band_rms(early, 6950, 7050) < 0.03 * _band_rms(plain_early, 6950, 7050)
+    assert _band_rms(early, 145, 155) > 0.5 * _band_rms(plain_early, 145, 155)
+    # after the overlap B plays on untouched: its own samples, delayed by the pre-point
+    assert np.array_equal(swept[(pre + overlap) * 2 :], fade_in[overlap * 2 : len(swept) - pre * 2])
+    # no gap: no 10 ms window of the overlap falls 20 dB under a single tone's level
+    window = swept[pre * 2 : (pre + overlap) * 2 : 2]
+    rms = np.sqrt(np.mean(window[: len(window) // 441 * 441].reshape(-1, 441) ** 2, axis=1))
+    assert rms.min() > 0.1 / np.sqrt(2) * 10 ** (-20 / 20)
+
+
+@pytest.mark.asyncio
+async def test_an_echo_out_rings_the_last_beat_on_under_the_incoming_track() -> None:
+    """The cut, plus A's last beat repeating from B's one, 6 dB quieter each beat."""
+    fade_out, fade_in = _bursts(440.0, 45.0), _tone(1760.0, 45.0)
+    echoed, echo = await _render_request(
+        TransitionRequest("echo_out", "n", 0, 224.0), fade_out, fade_in
+    )
+    cut, cut_fade = await _render_request(
+        TransitionRequest("cut", "n", 0, 224.0), fade_out, fade_in
+    )
+    crossfade = echo.filters[-1]
+    assert isinstance(crossfade, StreamingCrossfadeFilter)
+    end = crossfade.pre_crossfade_samples + crossfade.crossfade_samples
+    beat = SR // 2
+
+    # the cut's geometry: same timing, same length; A's audio ends at its exit downbeat
+    assert echo.timing_info == cut_fade.timing_info
+    assert len(echoed) == len(cut)
+    assert end == pytest.approx(29.0 * SR, abs=2)
+    # identical to the cut before A ends and once eight repeats have rung out
+    assert np.array_equal(echoed[: end * 2], cut[: end * 2])
+    assert np.array_equal(echoed[(end + 8 * beat) * 2 :], cut[(end + 8 * beat) * 2 :])
+    # the difference is A's echo alone: no trace of B in it
+    wet = (echoed - cut)[end * 2 : (end + 8 * beat) * 2]
+    assert _band_rms(wet, 1750, 1770) < 1e-4 * _band_rms(
+        cut[end * 2 : (end + beat) * 2], 1750, 1770
+    )
+    # each repeat lands on a beat from A's end, about 6 dB under the one before
+    levels = [
+        float(np.sqrt(np.mean(wet[k * beat * 2 : (k * beat + 3528) * 2] ** 2))) for k in range(8)
+    ]
+    for louder, quieter in itertools.pairwise(levels):
+        assert 20 * np.log10(louder / quieter) == pytest.approx(6.02, abs=0.5)
+    # between the repeats (after each 80 ms burst) the echo is silent
+    assert float(np.abs(wet[(beat // 2) * 2 : beat * 2]).max()) < 1e-3

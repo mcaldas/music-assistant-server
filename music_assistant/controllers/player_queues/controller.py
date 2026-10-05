@@ -90,6 +90,7 @@ from music_assistant.controllers.player_queues.stream_feeder import StreamFeeder
 from music_assistant.controllers.streams.smart_fades.helpers import SMART_CROSSFADE_DURATION
 from music_assistant.controllers.streams.smart_fades.planner.candidates import RUNG_LADDER
 from music_assistant.controllers.streams.smart_fades.planner.requested import (
+    BLEND_STYLES,
     REQUEST_STYLES,
     TransitionRequest,
 )
@@ -543,8 +544,12 @@ class PlayerQueuesController(QueueLoaderMixin, PlaybackTrackerMixin, StreamFeede
 
         :param queue_id: Queue the item is in.
         :param queue_item_id: Item whose ending the request shapes.
-        :param style: "blend", "quick_fade" or "cut"; "auto" drops the request.
-        :param bars: Blend length in bars of the outgoing track: 1, 2, 4, 8 or 16. Blend only.
+        :param style: "blend", "quick_fade" or "cut"; "filter_sweep", a blend that high-passes
+            the outgoing track away while the incoming one opens from a low-pass; "echo_out", a
+            cut whose last outgoing beat echoes on under the incoming track; "auto" drops the
+            request.
+        :param bars: Overlap in bars of the outgoing track: 1, 2, 4, 8 or 16. Blend and
+            filter_sweep only.
         :param exit_at: Second of the outgoing track where its audio should end, moved to the
             nearest downbeat; within its last 45 s (half the track when shorter). A sung phrase
             after it is left out; one it cuts into falls back ("vocal"). 0 lets Smart Fades
@@ -553,7 +558,7 @@ class PlayerQueuesController(QueueLoaderMixin, PlaybackTrackerMixin, StreamFeede
         self._check_player_permission(queue_id)
         if (
             style not in ("auto", *REQUEST_STYLES)
-            or ((bars not in RUNG_LADDER) if style == "blend" else bars != 0)
+            or ((bars not in RUNG_LADDER) if style in BLEND_STYLES else bars != 0)
             or exit_at < 0
             or (style == "auto" and exit_at)
         ):

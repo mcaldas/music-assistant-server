@@ -235,6 +235,25 @@ class FadeOutTrim:
     trimmed_seconds: float
 
 
+@dataclass(slots=True)
+class SweepSchedule:
+    """One cutoff schedule for a SweepFilter (a high- or low-pass filter sweep)."""
+
+    # (time_seconds, cutoff_hz); the first step sets the initial cutoff
+    steps: list[tuple[float, float]]
+    # (time_seconds, wet share 0..1); empty keeps the filter fully wet
+    mix_steps: list[tuple[float, float]] = field(default_factory=list)
+
+
+@dataclass(slots=True)
+class EchoOut:
+    """The outgoing track's last beat, repeated on past the point where its audio ends."""
+
+    # one outgoing beat in seconds: the echoed slice, and the gap between repeats
+    beat: float
+    repeats: int
+
+
 class TransitionStrategy(StrEnum):
     """How a vocal-aware plan's final overlap was ultimately decided."""
 
@@ -296,3 +315,9 @@ class TransitionPlan:
     # how long each track fades inside the overlap: the outgoing over its last seconds, the
     # incoming over its first, both at full between; None fades both over the whole overlap
     fade_seconds: float | None = None
+    # a filter transition: the outgoing high-pass in input time, the incoming low-pass in
+    # post-trim time (as the EQ schedules); None means no sweep
+    sweep_out: SweepSchedule | None = None
+    sweep_in: SweepSchedule | None = None
+    # an echo out: the outgoing track's last beat rings on under the incoming one
+    echo_out: EchoOut | None = None

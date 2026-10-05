@@ -97,6 +97,19 @@ async def test_stores_the_request_bound_to_the_next_item() -> None:
     ctrl.signal_update.assert_called_once_with("q1")
 
 
+@pytest.mark.parametrize(("style", "bars"), [("filter_sweep", 8), ("echo_out", 0)])
+async def test_stores_the_effect_styles_like_the_others(style: str, bars: int) -> None:
+    """A filter sweep takes a blend's bars, an echo out none; both are stored as asked."""
+    ctrl = _controller()
+    outgoing = _item(ctrl, 1)
+
+    await ctrl.set_transition("q1", outgoing.queue_item_id, style, bars=bars, exit_at=40.0)
+
+    assert TransitionRequest.read(outgoing.extra_attributes) == TransitionRequest(
+        style, _item(ctrl, 2).queue_item_id, bars, 40.0
+    )
+
+
 async def test_a_new_request_replaces_the_old_and_auto_drops_it() -> None:
     """A later request overwrites every key of the earlier one; "auto" removes it."""
     ctrl = _controller()
@@ -123,6 +136,9 @@ async def test_a_new_request_replaces_the_old_and_auto_drops_it() -> None:
         ("blend", 0, 0.0),
         ("blend", 3, 0.0),
         ("cut", 4, 0.0),
+        ("filter_sweep", 0, 0.0),
+        ("filter_sweep", 3, 0.0),
+        ("echo_out", 2, 0.0),
         ("cut", 0, -1.0),
         ("cut", 0, 25.0),  # outside the item's last 30s (half of its 60s)
         ("cut", 0, 61.0),

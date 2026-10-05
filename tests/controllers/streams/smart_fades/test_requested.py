@@ -2,13 +2,18 @@
 
 from __future__ import annotations
 
+import itertools
 import logging
 
 import numpy as np
 import numpy.typing as npt
 import pytest
 
-from music_assistant.controllers.streams.smart_fades.models import TransitionPlan, TransitionTier
+from music_assistant.controllers.streams.smart_fades.models import (
+    EchoOut,
+    TransitionPlan,
+    TransitionTier,
+)
 from music_assistant.controllers.streams.smart_fades.planner import SmartCrossFadePlanner
 from music_assistant.controllers.streams.smart_fades.planner.requested import (
     CUT_SECONDS,
@@ -893,9 +898,11 @@ def test_a_named_exit_between_phrases_leaves_the_later_phrase_out(style: str, ba
         ("blend", 4, 230.0, 122.0),
         ("quick_fade", 0, 224.0, 122.0),
         ("cut", 0, 224.0, 122.0),
+        ("filter_sweep", 4, 230.0, 122.0),
+        ("echo_out", 0, 224.0, 122.0),
         ("blend", 8, 0.0, 150.0),
     ],
-    ids=["blend", "quick_fade", "cut", "fallback"],
+    ids=["blend", "quick_fade", "cut", "filter_sweep", "echo_out", "fallback"],
 )
 def test_every_path_masks_the_outgoing_grid_to_its_exit(
     style: str, bars: int, exit_at: float, incoming_bpm: float
@@ -925,3 +932,135 @@ def test_request_round_trips_through_extra_attributes() -> None:
     assert attributes == {"playback_speed": 1.0, "transition_next_item_id": "next"}
     assert TransitionRequest.drop(attributes) is None
     assert TransitionRequest.read({f"{REQUEST_PREFIX}style": "bogus"}) is None
+
+
+@pytest.mark.parametrize(("bars", "exit_at"), [(8, 230.0), (16, 0.0)])
+def test_filter_sweep_is_the_blend_handed_over_by_filters(bars: int, exit_at: float) -> None:
+    """A sweep keeps the blend's exit, length and ramp; filters replace its EQ."""
+    out, inc = _analysis(120.0), _analysis(122.0)
+    blend_planner, blend = _plan(out, inc, "blend", bars=bars, exit_at=exit_at)
+    planner, plan = _plan(out, inc, "filter_sweep", bars=bars, exit_at=exit_at)
+
+    # sixteen bars are held to Smart Fades' cap of eight, as for the blend
+    expected = ("applied", None if bars == 8 else "shortened")
+    assert (planner.outcome, planner.reason) == (blend_planner.outcome, blend_planner.reason)
+    assert (planner.outcome, planner.reason) == expected
+    assert (plan.fade_out_window, plan.crossfade_duration, plan.tempo_plan) == (
+        blend.fade_out_window,
+        blend.crossfade_duration,
+        blend.tempo_plan,
+    )
+    assert plan.eq_plan.low_out is None
+    assert plan.eq_plan.low_in is None
+    assert plan.eq_plan.mid_out is None
+    assert plan.sweep_out is not None
+    assert plan.sweep_in is not None
+    # A: 10 Hz from the start, rising over exactly the overlap (in A-input time) to 8 kHz
+    ratio = plan.tempo_plan.steps[-1][1]
+    start = plan.fade_out_window - plan.crossfade_duration * ratio
+    assert plan.sweep_out.steps[0] == (0.0, 10.0)
+    assert plan.sweep_out.steps[1] == pytest.approx((start, 10.0))
+    assert plan.sweep_out.steps[-1] == pytest.approx((plan.fade_out_window, 8000.0))
+    assert plan.sweep_out.mix_steps == []
+    # B: opens from 250 Hz by 3/4 of the overlap, dry by 9/10 of it
+    assert plan.sweep_in.steps[0] == (0.0, 250.0)
+    assert plan.sweep_in.steps[-1][1] == pytest.approx(8000.0)
+    assert plan.sweep_in.mix_steps[0][1] == 1.0
+    assert plan.sweep_in.mix_steps[-1] == pytest.approx((0.9 * plan.crossfade_duration, 0.0))
+    assert _bars_of_outgoing(plan, 120.0) == pytest.approx(8.0, abs=0.01)
+
+
+def test_filter_sweep_where_smart_fades_will_not_beatmatch_ships_the_default_plan() -> None:
+    """A sweep falls back like the blend it is built on."""
+    out, inc = _analysis(120.0), _analysis(150.0)
+    planner, plan = _plan(out, inc, "filter_sweep", bars=8)
+
+    assert (planner.outcome, planner.reason) == ("fallback", "not_blendable")
+    assert plan == SmartCrossFadePlanner(LOGGER).plan(out, inc, 45.0)
+
+
+@pytest.mark.parametrize("incoming_bpm", [120.0, 150.0], ids=["same-tempo", "tempo-jump"])
+def test_echo_out_is_the_cut_with_its_last_beat_ringing_on(incoming_bpm: float) -> None:
+    """
+    An echo out keeps the cut's exit and entry; A's beat repeats for two of its bars.
+
+    Across a tempo jump the repeats would drift off B's beat, so only the first two ring.
+    """
+    out, inc = _analysis(120.0), _shifted(_analysis(incoming_bpm), 7.87)
+    _, cut = _plan(out, inc, "cut", exit_at=224.3)
+    planner, plan = _plan(out, inc, "echo_out", exit_at=224.3)
+
+    assert (planner.outcome, planner.reason) == ("applied", None)
+    assert plan.echo_out == EchoOut(beat=0.5, repeats=8 if incoming_bpm == 120.0 else 2)
+    assert plan.sweep_out is None
+    assert (
+        plan.fade_out_window,
+        plan.crossfade_duration,
+        plan.fadein_trim_start,
+        plan.fadeout_curve,
+    ) == (cut.fade_out_window, CUT_SECONDS, cut.fadein_trim_start, "qsin")
+
+
+@pytest.mark.parametrize(
+    ("fade_in_seconds", "outcome"),
+    [(12.0, ("applied", None)), (9.0, ("fallback", "no_room"))],
+    ids=["two-bars-fit", "under-a-bar-fits"],
+)
+def test_echo_out_needs_a_bar_of_the_incoming_head_for_its_tail(
+    fade_in_seconds: float, outcome: tuple[str, str | None]
+) -> None:
+    """The echo must fit the incoming audio the mix receives, at least for a bar."""
+    out, inc = _analysis(120.0), _shifted(_analysis(120.0), 7.87)
+    planner, plan = _plan(out, inc, "echo_out", exit_at=224.3, fade_in_seconds=fade_in_seconds)
+
+    assert (planner.outcome, planner.reason) == outcome
+    if outcome[0] == "fallback":
+        assert plan == SmartCrossFadePlanner(LOGGER).plan(out, inc, 45.0)
+
+
+@pytest.mark.parametrize(
+    ("outgoing_vocal", "incoming_vocal", "outcome"),
+    [
+        ((225.0, 229.9), (0.5, 12.0), ("fallback", "vocal")),
+        ((225.0, 229.9), (30.0, 40.0), ("applied", None)),
+        ((215.0, 222.0), (0.5, 12.0), ("applied", None)),
+    ],
+    ids=["sung-beat-over-sung-head", "incoming-sings-later", "last-beat-unsung"],
+)
+def test_echo_out_never_echoes_a_sung_beat_over_the_incoming_vocal(
+    outgoing_vocal: tuple[float, float],
+    incoming_vocal: tuple[float, float],
+    outcome: tuple[str, str | None],
+) -> None:
+    """A cut there is fine; its echo would repeat A's last word over B's vocal."""
+    out = _with_vocal_activity(_analysis(120.0), [outgoing_vocal])
+    inc = _with_vocal_activity(_analysis(120.0), [incoming_vocal])
+    cut_planner, _ = _plan(out, inc, "cut", exit_at=230.0)
+    planner, _ = _plan(out, inc, "echo_out", exit_at=230.0)
+
+    assert cut_planner.outcome == "applied"
+    assert (planner.outcome, planner.reason) == outcome
+
+
+def test_echo_out_repeats_the_outgoing_tracks_real_last_beat() -> None:
+    """A grid running slower than its bpm says echoes its own beat, not the nominal one."""
+    out = _analysis(120.0)
+    assert out.beats is not None
+    assert out.downbeats is not None
+    out.beats = [index * 0.52 for index in range(len(out.beats))]
+    out.downbeats = out.beats[::4]
+    planner, plan = _plan(out, _analysis(120.0), "echo_out", exit_at=224.0)
+
+    assert planner.outcome == "applied"
+    assert plan.echo_out is not None
+    assert plan.echo_out.beat == pytest.approx(0.52, abs=1e-3)
+
+
+def test_a_one_bar_filter_sweep_steps_finely_enough_not_to_zipper() -> None:
+    """The sweep's commands come about 150 to an overlap: 10-20 ms apart on a one-bar sweep."""
+    planner, plan = _plan(_analysis(120.0), _analysis(122.0), "filter_sweep", bars=1)
+
+    assert planner.outcome == "applied"
+    assert plan.sweep_in is not None
+    times = [t for t, _ in plan.sweep_in.steps]
+    assert max(b - a for a, b in itertools.pairwise(times)) <= 0.02

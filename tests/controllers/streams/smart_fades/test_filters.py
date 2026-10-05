@@ -5,11 +5,13 @@ from __future__ import annotations
 import logging
 
 from music_assistant.controllers.streams.smart_fades.filters import (
+    EchoOutFilter,
     FadeOutTrimFilter,
     PeakFilter,
     ShelfFilter,
     ShelfType,
     StreamingCrossfadeFilter,
+    SweepFilter,
 )
 
 LOGGER = logging.getLogger(__name__)
@@ -187,3 +189,55 @@ class TestPeakFilter:
         high = ShelfFilter(LOGGER, ShelfType.HIGH, 13000, [(0.0, -20.0)], "fadein")
         assert a.output_fadein_label not in {low.output_fadein_label, high.output_fadein_label}
         assert a.output_fadeout_label not in {low.output_fadeout_label, high.output_fadeout_label}
+
+
+def test_sweep_filter_drives_the_cutoff_and_the_wet_share() -> None:
+    """A sweep is an asendcmd schedule on a named high/low-pass; the other stream passes."""
+    high = SweepFilter(
+        LOGGER, "highpass", [(0.0, 20.0), (13.0, 20.0), (29.0, 8000.0)], [], "fadeout", 44100
+    )
+    assert high.apply("[fadein]", "[fadeout]") == [
+        "[fadein]anull[fadein_pt_sweep_out]",  # codespell:ignore anull
+        "[fadeout]asetnsamples=n=441:p=0,asendcmd=c='0.000 highpass@fadeout_sweep f 20.0; "
+        "13.000 highpass@fadeout_sweep f 20.0; 29.000 highpass@fadeout_sweep f 8000.0',"
+        "highpass@fadeout_sweep=f=20.0:width_type=q:width=0.707[fadeout_sweep]",
+    ]
+    low = SweepFilter(
+        LOGGER,
+        "lowpass",
+        [(0.0, 250.0), (12.0, 8000.0)],
+        [(12.0, 1.0), (14.4, 0.0)],
+        "fadein",
+        44100,
+    )
+    assert low.apply("[fadein]", "[fadeout]") == [
+        "[fadeout]anull[fadeout_pt_sweep_in]",  # codespell:ignore anull
+        "[fadein]asetnsamples=n=441:p=0,asendcmd=c='0.000 lowpass@fadein_sweep f 250.0; "
+        "12.000 lowpass@fadein_sweep f 8000.0; 12.000 lowpass@fadein_sweep m 1.000; "
+        "14.400 lowpass@fadein_sweep m 0.000',"
+        "lowpass@fadein_sweep=f=250.0:width_type=q:width=0.707[fadein_sweep]",
+    ]
+    # a 16 kHz stream: no cutoff at or past Nyquist, where the biquad blows up
+    capped = SweepFilter(LOGGER, "lowpass", [(0.0, 250.0), (12.0, 8000.0)], [], "fadein", 16000)
+    assert capped.steps == [(0.0, 250.0), (12.0, 7200.0)]
+
+
+def test_echo_out_filter_echoes_the_last_beat_into_the_incoming_stream() -> None:
+    """
+    The beat before the cut is split off, echoed wet-only and mixed into the incoming stream.
+
+    The gates are sample-exact around pre + overlap (where the crossfade cuts the outgoing
+    stream); the delays aim at mid-sample because aecho truncates them; the trim by the
+    pre-point moves the echo onto the incoming stream's timeline, and ``duration=first``
+    keeps the incoming stream's length.
+    """
+    echo = EchoOutFilter(LOGGER, 1278018, 882, 22050, 2, 44100)
+    assert echo.apply("[fadein]", "[fadeout]") == [
+        "[fadeout]asplit=2[fadeout_echo_dry][echo_send]",
+        "[echo_send]highpass=f=300,"
+        "afade=t=in:start_sample=1256850:nb_samples=441,"
+        "afade=t=out:start_sample=1278415:nb_samples=441,"
+        "aecho=0:1:500.011338|1000.011338:0.350000|0.175000,"
+        "atrim=start_sample=1278018,asetpts=PTS-STARTPTS[echo_wet]",
+        "[fadein][echo_wet]amix=inputs=2:normalize=0:duration=first[fadein_echo]",
+    ]

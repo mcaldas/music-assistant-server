@@ -247,6 +247,142 @@ class PeakFilter(Filter):
         return f"Peak({self.frequency}Hz {self.stream_type} {gains})"
 
 
+class SweepFilter(Filter):
+    """High- or low-pass whose cutoff (and wet share) follows a schedule (asendcmd-driven)."""
+
+    def __init__(
+        self,
+        logger: logging.Logger,
+        kind: str,
+        steps: list[tuple[float, float]],
+        mix_steps: list[tuple[float, float]],
+        stream_type: str,
+        sample_rate: int,
+    ):
+        """
+        Initialize the filter sweep.
+
+        :param kind: The ffmpeg filter: "highpass" or "lowpass".
+        :param steps: Schedule of (time_seconds, cutoff_hz); the first step sets the
+            initial cutoff.
+        :param mix_steps: Schedule of (time_seconds, wet share 0..1); empty keeps the
+            filter fully wet.
+        :param stream_type: 'fadeout' or 'fadein' - which stream to process.
+        :param sample_rate: Sample rate of the stream; cutoffs stay below its Nyquist.
+        """
+        self.kind = kind
+        # a cutoff at or past Nyquist makes the biquad blow up (16 kHz streams)
+        self.steps = [(t, min(hz, 0.45 * sample_rate)) for t, hz in steps]
+        self.sample_rate = sample_rate
+        self.mix_steps = mix_steps
+        self.stream_type = stream_type
+        if stream_type == "fadeout":
+            self.output_fadeout_label = "fadeout_sweep"
+            self.output_fadein_label = "fadein_pt_sweep_out"
+        else:
+            self.output_fadeout_label = "fadeout_pt_sweep_in"
+            self.output_fadein_label = "fadein_sweep"
+        super().__init__(logger)
+
+    def apply(self, input_fadein_label: str, input_fadeout_label: str) -> list[str]:
+        """Generate the sweep on this filter's stream and passthrough on the other."""
+        if self.stream_type == "fadeout":
+            input_label, output_label = input_fadeout_label, self.output_fadeout_label
+            pass_in, pass_out = input_fadein_label, self.output_fadein_label
+        else:
+            input_label, output_label = input_fadein_label, self.output_fadein_label
+            pass_in, pass_out = input_fadeout_label, self.output_fadeout_label
+        instance = f"{self.kind}@{self.stream_type}_sweep"
+        # asendcmd orders the commands by time itself
+        cmd = "; ".join(
+            [f"{t:.3f} {instance} f {hz:.1f}" for t, hz in self.steps]
+            + [f"{t:.3f} {instance} m {wet:.3f}" for t, wet in self.mix_steps]
+        )
+        # asendcmd applies a command once per frame: 10 ms frames keep the steps fine enough
+        # not to zipper on a one-bar sweep
+        return [
+            f"{pass_in}anull[{pass_out}]",  # codespell:ignore anull
+            f"{input_label}asetnsamples=n={self.sample_rate // 100}:p=0,asendcmd=c='{cmd}',"
+            f"{instance}=f={self.steps[0][1]:.1f}:width_type=q:width=0.707[{output_label}]",
+        ]
+
+    def __repr__(self) -> str:
+        """Return string representation of SweepFilter."""
+        cutoffs = f"{self.steps[0][1]:.0f}->{self.steps[-1][1]:.0f}Hz"
+        return f"Sweep({self.kind} {self.stream_type} {cutoffs})"
+
+
+class EchoOutFilter(Filter):
+    """
+    Echo the outgoing stream's last beat on into the incoming one, past the outgoing's end.
+
+    A copy of the outgoing stream keeps only the beat before the point where the crossfade
+    cuts it, low-cut and with click-free edges; ``aecho`` repeats it every beat, each repeat
+    at half the level of the one before. The copy is moved onto the incoming stream's
+    timeline and mixed into it, so the echo rings on under the incoming track while the
+    crossfade, the timing and the output length stay as they are.
+    """
+
+    output_fadeout_label: str = "fadeout_echo_dry"
+    output_fadein_label: str = "fadein_echo"
+    # the first repeat 9 dB below the beat (headroom: nothing limits the mix), each next one
+    # 6 dB below the one before; the low cut keeps the outgoing kick out of the incoming one's
+    first: float = 0.35
+    decay: float = 0.5
+    low_cut_hz: int = 300
+
+    def __init__(
+        self,
+        logger: logging.Logger,
+        pre_crossfade_samples: int,
+        crossfade_samples: int,
+        beat_samples: int,
+        repeats: int,
+        sample_rate: int,
+    ):
+        """
+        Initialize the echo out.
+
+        :param pre_crossfade_samples: Where the incoming stream starts in the mix.
+        :param crossfade_samples: Overlap; the outgoing stream is cut at pre + overlap.
+        :param beat_samples: One outgoing beat: the echoed slice and the gap between repeats.
+        :param repeats: How many times the beat repeats.
+        :param sample_rate: Sample rate of both streams.
+        """
+        self.pre_crossfade_samples = pre_crossfade_samples
+        self.crossfade_samples = crossfade_samples
+        self.beat_samples = beat_samples
+        self.repeats = repeats
+        self.sample_rate = sample_rate
+        super().__init__(logger)
+
+    def apply(self, input_fadein_label: str, input_fadeout_label: str) -> list[str]:
+        """Split the beat off the outgoing stream, echo it, and mix it into the incoming one."""
+        end = self.pre_crossfade_samples + self.crossfade_samples
+        edge = self.sample_rate // 100
+        beats = range(1, self.repeats + 1)
+        # aecho truncates each delay to whole samples: aim at the middle of the sample
+        delays = "|".join(
+            f"{(k * self.beat_samples + 0.5) * 1000 / self.sample_rate:.6f}" for k in beats
+        )
+        decays = "|".join(f"{self.first * self.decay ** (k - 1):.6f}" for k in beats)
+        return [
+            f"{input_fadeout_label}asplit=2[{self.output_fadeout_label}][echo_send]",
+            f"[echo_send]highpass=f={self.low_cut_hz},"
+            f"afade=t=in:start_sample={max(0, end - self.beat_samples)}:nb_samples={edge},"
+            # ends 1 ms early: the outgoing trim rounds its end to the millisecond
+            f"afade=t=out:start_sample={end - edge - self.sample_rate // 1000}:nb_samples={edge},"
+            f"aecho=0:1:{delays}:{decays},"
+            f"atrim=start_sample={self.pre_crossfade_samples},asetpts=PTS-STARTPTS[echo_wet]",
+            f"{input_fadein_label}[echo_wet]amix=inputs=2:normalize=0:duration=first"
+            f"[{self.output_fadein_label}]",
+        ]
+
+    def __repr__(self) -> str:
+        """Return string representation of EchoOutFilter."""
+        return f"EchoOut({self.repeats}x{self.beat_samples} samples)"
+
+
 class StreamingCrossfadeFilter(Filter):
     """
     Crossfade that emits blended output while the fade-in input is still arriving.

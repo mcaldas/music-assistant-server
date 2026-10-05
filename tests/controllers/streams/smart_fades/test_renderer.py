@@ -9,6 +9,7 @@ from music_assistant_models.enums import ContentType
 from music_assistant_models.media_items import AudioFormat
 
 from music_assistant.controllers.streams.smart_fades.filters import (
+    EchoOutFilter,
     FadeInTrimFilter,
     FadeOutTrimFilter,
     GradualTimeStretchFilter,
@@ -16,11 +17,14 @@ from music_assistant.controllers.streams.smart_fades.filters import (
     ShelfFilter,
     ShelfType,
     StreamingCrossfadeFilter,
+    SweepFilter,
 )
 from music_assistant.controllers.streams.smart_fades.models import (
+    EchoOut,
     EqPlan,
     FadeOutTrim,
     ShelfSchedule,
+    SweepSchedule,
     TempoPlan,
     TransitionPlan,
     TransitionTier,
@@ -212,3 +216,61 @@ class TestMidSwapRendering:
         """A bypassed (None) mid schedule emits no PeakFilter."""
         filters, _ = TransitionRenderer(LOGGER).render(_plan(), PCM, _seconds(45))
         assert not any(isinstance(f, PeakFilter) for f in filters)
+
+
+def test_sweeps_wrap_the_stretch_like_the_shelves() -> None:
+    """A's sweep runs before the stretch (input time), B's after B's trim and shelves."""
+    plan = _plan(
+        eq_plan=EqPlan.neutral(),
+        tempo_plan=TempoPlan(steps=[(0.0, 1.0), (20.0, 1.02)]),
+        fadeout_trim=FadeOutTrim(40.0, 5.0),
+        fadein_trim_start=1.5,
+        sweep_out=SweepSchedule([(0.0, 20.0), (29.8, 20.0), (40.0, 8000.0)]),
+        sweep_in=SweepSchedule([(0.0, 250.0), (7.5, 8000.0)], [(7.5, 1.0), (9.0, 0.0)]),
+    )
+    filters, _ = TransitionRenderer(LOGGER).render(plan, PCM, _seconds(45.0))
+
+    assert [type(f) for f in filters] == [
+        FadeOutTrimFilter,
+        SweepFilter,
+        GradualTimeStretchFilter,
+        FadeInTrimFilter,
+        SweepFilter,
+        StreamingCrossfadeFilter,
+    ]
+    sweep_out, sweep_in = filters[1], filters[4]
+    assert isinstance(sweep_out, SweepFilter)
+    assert isinstance(sweep_in, SweepFilter)
+    assert (sweep_out.kind, sweep_out.stream_type) == ("highpass", "fadeout")
+    assert (sweep_in.kind, sweep_in.stream_type, sweep_in.mix_steps) == (
+        "lowpass",
+        "fadein",
+        [(7.5, 1.0), (9.0, 0.0)],
+    )
+
+
+def test_echo_out_renders_on_the_crossfade_timeline() -> None:
+    """The echo sits right before the crossfade, sized by its pre-point and overlap."""
+    plan = _plan(
+        tier=TransitionTier.QUICK_FADE,
+        eq_plan=EqPlan.neutral(),
+        fade_out_window=29.0,
+        crossfade_duration=0.02,
+        fadeout_trim=FadeOutTrim(29.0, 16.0),
+        echo_out=EchoOut(beat=0.5, repeats=8),
+    )
+    filters, _ = TransitionRenderer(LOGGER).render(plan, PCM, _seconds(45.0))
+
+    assert [type(f) for f in filters] == [
+        FadeOutTrimFilter,
+        EchoOutFilter,
+        StreamingCrossfadeFilter,
+    ]
+    echo, crossfade = filters[1], filters[2]
+    assert isinstance(echo, EchoOutFilter)
+    assert isinstance(crossfade, StreamingCrossfadeFilter)
+    assert (echo.pre_crossfade_samples, echo.crossfade_samples) == (
+        crossfade.pre_crossfade_samples,
+        crossfade.crossfade_samples,
+    )
+    assert (echo.beat_samples, echo.repeats, echo.sample_rate) == (22050, 8, 44100)
