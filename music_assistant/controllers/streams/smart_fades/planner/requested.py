@@ -415,13 +415,20 @@ class RequestedTransitionPlanner(TransitionPlanner):
                     # B's one still lands on A's exit (a pre-roll). Longer than a bar of A it
                     # is no cut any more: the default plan ships
                     entry = self._pickup_start(ctx)
-                    overlap = one - entry
-                    if overlap > min(bar_out, exit_s):
+                    if one - entry > min(bar_out, exit_s):
                         self._fallback("vocal")
                         return []
+                    # a lead-in whose beats would drift off A's comes in under A only up to
+                    # its first beat, which lands on A's exit; the rest plays alone after A,
+                    # so it must carry level
+                    land = self._pickup_landing(ctx, entry, one)
+                    if land < one and _falls_quiet(ctx.incoming, land, one - land):
+                        self._fallback("vocal")
+                        return []
+                    overlap = max(CUT_SECONDS, land - entry)
                     # a lead-in that breaks or turns quiet where A has mostly faded out would
                     # leave the room a dip: a quick fade then holds both decks as the cut does
-                    hold = _falls_quiet(ctx.incoming, one - overlap / 2, overlap / 2)
+                    hold = land < one or _falls_quiet(ctx.incoming, one - overlap / 2, overlap / 2)
                 if entry + overlap > window:
                     return []
                 if not _falls_quiet(ctx.incoming, one):
@@ -489,6 +496,21 @@ class RequestedTransitionPlanner(TransitionPlanner):
             if len(loud):
                 audible = min(sung, float(loud[0]) * duration / len(rms))
         return max(0.0, sung - VOCAL_LEFT_PADDING, audible)
+
+    @staticmethod
+    def _pickup_landing(ctx: TransitionContext, entry: float, one: float) -> float:
+        """
+        Return where in B a lead-in played from ``entry`` meets A's exit downbeat.
+
+        B's one, when every beat B plays before it then falls within the quick fade's drift
+        budget of one of A's beats; otherwise B's first beat, so that none of B's beats plays
+        under A's.
+        """
+        beat = 60.0 / ctx.outgoing.bpm
+        lead = [float(b) for b in ctx.incoming.beats if entry <= b < one]
+        if all(abs(one - b - round((one - b) / beat) * beat) <= _QUICK_FADE_DRIFT_S for b in lead):
+            return one
+        return lead[0]
 
     @staticmethod
     def _sung_before(ctx: TransitionContext, entry: float) -> bool:

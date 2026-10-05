@@ -440,6 +440,51 @@ def test_a_quick_fade_under_a_bar_holds_a_over_a_break_in_a_sung_pickup() -> Non
     assert plan.fade_seconds == CUT_SECONDS
 
 
+@pytest.mark.parametrize("style", ["cut", "quick_fade"])
+@pytest.mark.parametrize(("incoming_bpm", "pickup"), [(128.0, 2), (104.0, 3)])
+def test_a_sung_pickup_whose_beats_would_drift_lands_its_first_beat_on_the_exit(
+    style: str, incoming_bpm: float, pickup: int
+) -> None:
+    """B's lead-in beats would drift over 40 ms off A's: B plays under A only to its first beat."""
+    inc = _with_vocal_activity(
+        _with_pickup(_shifted(_analysis(incoming_bpm), 0.1), pickup), [(0.13, 30.0)]
+    )
+    planner, plan = _plan(_analysis(100.0), inc, style, exit_at=224.0)
+
+    assert (planner.outcome, planner.reason) == (
+        "applied",
+        None if style == "cut" else "shortened",
+    )
+    assert TAIL_START + plan.fade_out_window == pytest.approx(223.2)
+    # from its start, its first beat on A's exit, both at full until then
+    assert plan.fadein_trim_start is None
+    assert plan.crossfade_duration == pytest.approx(0.1)
+    assert plan.fade_seconds == CUT_SECONDS
+
+
+def test_a_sung_pickup_whose_beats_keep_to_a_s_pre_rolls_onto_the_one() -> None:
+    """At 120 vs 122 BPM B's two lead-in beats drift 8 and 16 ms: its one lands on A's exit."""
+    inc = _with_vocal_activity(_with_pickup(_shifted(_analysis(122.0), 0.1), 2), [(0.13, 30.0)])
+    planner, plan = _plan(_analysis(120.0), inc, "cut", exit_at=224.0)
+
+    assert (planner.outcome, planner.reason) == ("applied", None)
+    assert plan.fadein_trim_start is None
+    assert plan.crossfade_duration == pytest.approx(0.1 + 2 * 60.0 / 122.0)
+
+
+@pytest.mark.parametrize("style", ["cut", "quick_fade"])
+def test_a_sung_pickup_whose_beats_would_drift_never_plays_a_break_alone(style: str) -> None:
+    """After its first beat B's lead-in breaks before its one: alone after A, the room would go quiet."""
+    rms = np.full(1800, 0.5, dtype=np.float32)
+    rms[int(0.6 / 240.0 * 1800) : int(1.0 / 240.0 * 1800)] = 0.001
+    inc = _with_vocal_activity(
+        _with_pickup(_shifted(_analysis(128.0, rms_energy=rms), 0.1), 2), [(0.13, 30.0)]
+    )
+    planner, _ = _plan(_analysis(100.0), inc, style, exit_at=224.0)
+
+    assert (planner.outcome, planner.reason) == ("fallback", "vocal")
+
+
 @pytest.mark.parametrize(
     ("level", "one"),
     [(0.001, 3.0), (0.02, 1.0), (0.5, 1.0)],

@@ -407,13 +407,13 @@ async def test_a_requested_quick_fade_between_far_tempos_never_doubles_a_beat(pi
 @pytest.mark.parametrize("style", ["cut", "quick_fade"])
 async def test_a_sung_pickup_pre_rolls_under_the_outgoing_track(style: str) -> None:
     """
-    B sung 0.7 s before its one: it plays under A's last beats, its one landing on A's exit.
+    B sung 0.7 s before its one, no beat before it: it plays under A's last beats, onto A's exit.
 
     A cut holds both tracks at full over the pickup; a quick fade between these tempos (they
     drift apart within a bar) fades over it.
     """
     fade_out, fade_in = _tone(440.0, 45.0), np.zeros(int(45.0 * SR) * 2, dtype=np.float32)
-    # B (Pepas): silent, its voice (1760 Hz) from 0.4 s, its one 1.1 s in at 130 bpm
+    # B: silent, its voice (1760 Hz) from 0.4 s, its one and first beat 1.1 s in at 130 bpm
     fade_in[int(0.4 * SR) * 2 :] = _tone(1760.0, 45.0)[int(0.4 * SR) * 2 :]
     out, inc = _analysis(120.0, 240.0), _analysis(130.0, 240.0)
     assert out.beats is not None
@@ -422,8 +422,8 @@ async def test_a_sung_pickup_pre_rolls_under_the_outgoing_track(style: str) -> N
     # a click on A's downbeats, B's one, and B's later downbeats
     for downbeat in np.arange(1.0, 45.0, 2.0):
         fade_out[int(downbeat * SR) * 2 : int(downbeat * SR) * 2 + 2] += 0.8
-    inc.beats = [beat + 0.18 for beat in inc.beats]
-    inc.downbeats = inc.beats[2::4]
+    inc.beats = [beat + 1.1 for beat in inc.beats]
+    inc.downbeats = inc.beats[::4]
     for downbeat in inc.downbeats:
         if downbeat < 45.0:
             fade_in[int(downbeat * SR) * 2 : int(downbeat * SR) * 2 + 2] += 0.8
@@ -471,6 +471,57 @@ async def test_a_sung_pickup_pre_rolls_under_the_outgoing_track(style: str) -> N
     around = window(cut - 2.0, cut + 2.0)[0::2]
     rms = np.sqrt(np.mean(around[: len(around) // 441 * 441].reshape(-1, 441) ** 2, axis=1))
     assert rms.min() > 0.2 / np.sqrt(2) * 10 ** (-30 / 20)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("style", ["cut", "quick_fade"])
+@pytest.mark.parametrize(
+    ("outgoing_bpm", "incoming_bpm", "pickup"),
+    [(100.0, 128.0, 2), (120.0, 126.0, 3)],
+    ids=["100-128", "120-126"],
+)
+async def test_a_sung_pickup_never_plays_its_beats_against_the_outgoing_ones(
+    style: str, outgoing_bpm: float, incoming_bpm: float, pickup: int
+) -> None:
+    """
+    B ticks on the beats of its sung lead-in, which would drift more than 40 ms off A's.
+
+    Under A, B plays only up to its first beat, which lands on A's exit; the rest of the
+    lead-in follows alone, so no beat is heard doubled and the room never goes quiet.
+    """
+    out, inc = _analysis(outgoing_bpm, 240.0), _analysis(incoming_bpm, 240.0)
+    assert out.beats is not None
+    assert inc.beats is not None
+    # B is silent until its first beat; its bars start ``pickup`` beats later
+    inc.beats = [beat + 0.1 for beat in inc.beats]
+    inc.downbeats = inc.beats[pickup::4]
+    inc.extra_data = {"vocal_activity": [0.9 if i >= 1 else 0.05 for i in range(1800)]}
+    fade_out = _ticking(out.beats, 240.0 - 45.0, 45.0, 2000.0, 220.0, 0.0)
+    fade_in = _ticking(inc.beats, 0.0, 45.0, 6000.0, 330.0, 0.1)
+    planner = RequestedTransitionPlanner(
+        logging.getLogger(), TransitionRequest(style, "n", 0, 224.0)
+    )
+    fade = SmartCrossFade(logging.getLogger(), out, inc, planner)
+    fade.build(fade_out.nbytes, fade_in.nbytes, PCM)
+    chunks = [chunk async for chunk in fade.apply(fade_out.tobytes(), fade_in.tobytes(), PCM)]
+    mix = np.frombuffer(b"".join(chunks), dtype=np.float32)[0::2]
+    end = fade.timing_info.pre_crossfade_duration + fade.timing_info.crossfade_duration
+
+    assert planner.outcome == "applied"
+    # A ends on its downbeat nearest 224 s into the song
+    assert out.downbeats is not None
+    assert end == pytest.approx(min(out.downbeats, key=lambda d: abs(d - 224.0)) - 195.0, abs=1e-3)
+    a_ticks = _ticks_heard(mix, 2000.0, end - 3.0, end + 3.0)
+    b_ticks = _ticks_heard(mix, 6000.0, end - 3.0, end + 3.0)
+    apart = [min(abs(a - b) for a in a_ticks) for b in b_ticks]
+    # a beat of one deck heard within a quarter second of the other's is one beat played twice
+    assert [gap for gap in apart if 0.045 < gap < 0.25] == []
+    # B's first beat ticks on A's exit; none of its beats plays before it
+    assert min(b_ticks) == pytest.approx(end, abs=0.005)
+    # no 10 ms stretch around the switch drops 30 dB under the pads
+    around = mix[int((end - 0.5) * SR) : int((end + 0.5) * SR)]
+    rms = np.sqrt(np.mean(around[: len(around) // 441 * 441].reshape(-1, 441) ** 2, axis=1))
+    assert rms.min() > 0.1 / np.sqrt(2) * 10 ** (-30 / 20)
 
 
 @pytest.mark.asyncio
