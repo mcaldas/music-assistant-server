@@ -134,6 +134,16 @@ def test_a_blend_past_the_end_of_the_beat_grid_never_ships_short(bars: int, exit
         assert planner.reason == "no_room"
 
 
+def test_a_blend_stays_inside_the_head_of_the_incoming_track_the_mix_receives() -> None:
+    """With 12 s of B in hand an 8-bar blend (15.7 s) shortens; with 1.5 s none fits."""
+    planner, plan = _plan(_analysis(120.0), _analysis(122.0), "blend", bars=8, fade_in_seconds=12.0)
+    assert (planner.outcome, planner.reason) == ("applied", "shortened")
+    assert (plan.fadein_trim_start or 0.0) + plan.crossfade_duration <= 12.0
+
+    planner, _ = _plan(_analysis(120.0), _analysis(122.0), "blend", bars=8, fade_in_seconds=1.5)
+    assert (planner.outcome, planner.reason) == ("fallback", "no_room")
+
+
 def test_an_exit_with_no_downbeat_near_it_falls_back() -> None:
     """An exit before a short held tail is not moved bars away: the default plan ships."""
     planner, _ = _plan(_analysis(120.0), _analysis(120.0), "cut", exit_at=205.0, buffer=30.0)

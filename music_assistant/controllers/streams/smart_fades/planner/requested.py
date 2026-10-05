@@ -264,17 +264,22 @@ class RequestedTransitionPlanner(TransitionPlanner):
                 )
                 is not None
             ]
-            rungs.append([c for c in built if self._full_blend(c, bars, bar_out, ramped)])
+            rungs.append([c for c in built if self._fits(c, bars, bar_out, ramped)])
         return [rung for rung in rungs if rung]
 
-    @staticmethod
-    def _full_blend(candidate: Candidate, bars: int, bar_out: float, ramped: bool) -> bool:
-        """Whether a built blend lasts its bars of A and, when the tempos differ, ramps in time."""
+    def _fits(self, candidate: Candidate, bars: int, bar_out: float, ramped: bool) -> bool:
+        """Whether a built blend lasts its bars of A in the head of B it gets, ramped in time."""
         plan = candidate.plan
         steps = plan.tempo_plan.steps
         ratio = steps[-1][1] if steps else 1.0
         if candidate.spec.bars != bars or plan.crossfade_duration * ratio < (bars - 0.5) * bar_out:
             # capped, or snapped short of its bars (an exit past the end of A's beat grid)
+            return False
+        if (plan.fadein_trim_start or 0.0) + plan.crossfade_duration > min(
+            float(SMART_CROSSFADE_DURATION), self.fade_in_seconds
+        ):
+            # past the head of B the mix receives the overlap is cut short, and B's own
+            # stream takes over mid-fade
             return False
         # a squeezed ramp, or none, would blend the decks out of time
         return not ramped or (bool(steps) and steps[-1][0] - steps[0][0] >= _MIN_RAMP_SECONDS)
