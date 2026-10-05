@@ -61,8 +61,8 @@ CUT_SECONDS = 0.02
 # the shortest tempo ramp a requested blend ships; the factory fits one into the (up to)
 # 10s before the overlap, and clips it at the tail's start (a 16-bar blend's spans ~7.7s)
 _MIN_RAMP_SECONDS = 6.0
-# how far apart two unramped decks' beats may drift over a requested quick fade; it never
-# gets shorter than a bar, so far-apart tempos drift more, as in the default quick fade
+# how far apart two unramped decks' beats may drift over a requested quick fade; when a
+# bar would drift further, the fade is that much shorter and lands B's one on A's exit
 _QUICK_FADE_DRIFT_S = 0.04
 # a vocal window starting this little before B's one is the 1800-bin timeline's
 # rounding, not a pickup
@@ -301,7 +301,7 @@ class RequestedTransitionPlanner(TransitionPlanner):
                 return None
             candidates = self._blend_candidates(ctx, factory, exit_s, bar_out)
         else:
-            candidates = self._short_candidates(ctx, factory, exits, exit_s)
+            candidates = self._short_candidates(ctx, factory, exits, exit_s, bar_out)
         if not candidates:
             if self.outcome != "fallback":
                 self._fallback("no_room")
@@ -318,9 +318,13 @@ class RequestedTransitionPlanner(TransitionPlanner):
         if self.request.style == "blend" and winner.spec.bars < self.request.bars:
             self.reason = "shortened"
         plan = PlanAssembler(ctx, self.logger).finalize(winner)
-        if self.request.style == "cut":
-            # inside a mastered fade the assembler picks "nofade", which would stop A dead
+        if not winner.spec.bars:
+            # a cut, or a quick fade under a bar: inside a mastered fade the assembler picks
+            # "nofade", which would stop A dead
             plan = replace(plan, fadeout_curve="qsin")
+            if self.request.style == "quick_fade":
+                # Smart Fades' own quick fade lasts a bar at least
+                self.reason = "shortened"
         return plan
 
     def _blend_candidates(
@@ -366,19 +370,40 @@ class RequestedTransitionPlanner(TransitionPlanner):
         factory: CandidateFactory,
         exits: list[float],
         exit_s: float,
+        bar_out: float,
     ) -> list[list[Candidate]]:
         """Build the unramped quick fade or cut ending on ``exit_s``, B entering on its one."""
-        cut = self.request.style == "cut"
         window = min(float(SMART_CROSSFADE_DURATION), self.fade_in_seconds)
         b_one = float(ctx.incoming.downbeats[0]) if len(ctx.incoming.downbeats) else 0.0
-        if cut:
+        # a cut's overlap, or a quick fade's whole bars
+        bars, fade = 0, CUT_SECONDS
+        if self.request.style == "quick_fade":
+            # Smart Fades' quick-fade length, cut to the whole bars before the exit and to
+            # what keeps the two unramped grids from audibly drifting apart
+            bars = min(bars_ladder(ctx, TransitionTier.QUICK_FADE)[0], exits.index(exit_s))
+            if bars == 0:
+                return []
+            drift = ctx.outgoing.beats_per_bar * abs(
+                60.0 / ctx.outgoing.bpm - 60.0 / ctx.incoming.bpm
+            )
+            if drift > 0.0:
+                bars = min(bars, int(_QUICK_FADE_DRIFT_S / drift))
+                # how long the decks stay together when even a bar drifts too far
+                fade = _QUICK_FADE_DRIFT_S / drift * bar_out
+        if bars == 0:
             # B's one lands where A ends; when B falls silent in the bar after it (a pickup
             # dying away before the song starts) or stays quiet through it (a soft intro, a
             # fade-in), the room would hear near silence once A stops, so the cut lands on
-            # B's first later downbeat whose bar carries level
-            overlap = CUT_SECONDS
+            # B's first later downbeat whose bar carries level. A quick fade under a bar
+            # fades in what B plays before that one under A's last beats (they meet on the
+            # one and drift apart going back), only from B's first beat and only where it
+            # carries level: A fading out over B's silence leaves the room a dip
+            first_beat = float(ctx.incoming.beats[0]) if len(ctx.incoming.beats) else b_one
             for one in [float(d) for d in ctx.incoming.downbeats] or [0.0]:
-                entry = max(0.0, one - CUT_SECONDS)
+                overlap = max(CUT_SECONDS, min(fade, one - first_beat))
+                if overlap > CUT_SECONDS and _falls_quiet(ctx.incoming, one - overlap, overlap):
+                    overlap = CUT_SECONDS
+                entry = max(0.0, one - overlap)
                 if self._sung_before(ctx, entry):
                     # a lead-in B sings before its one: cut off, or B's silence heard after A stops
                     self._fallback("vocal")
@@ -390,16 +415,6 @@ class RequestedTransitionPlanner(TransitionPlanner):
             else:
                 return []
         else:
-            # Smart Fades' quick-fade length, cut to the whole bars before the exit and to
-            # what keeps the two unramped grids from audibly drifting apart
-            drift = ctx.outgoing.beats_per_bar * abs(
-                60.0 / ctx.outgoing.bpm - 60.0 / ctx.incoming.bpm
-            )
-            bars = min(bars_ladder(ctx, TransitionTier.QUICK_FADE)[0], exits.index(exit_s))
-            if drift > 0.0:
-                bars = min(bars, max(1, int(_QUICK_FADE_DRIFT_S / drift)))
-            if bars == 0:
-                return []
             overlap = exit_s - exits[exits.index(exit_s) - bars]
             # both decks on the one; B from its head, as today's quick fade, when that would
             # skip more than the fade plays, skip sung material, or pass the received head
@@ -414,7 +429,7 @@ class RequestedTransitionPlanner(TransitionPlanner):
                 # past the head of B the mix receives; or B's bar once A has faded out is
                 # near silence (a soft intro, a fade-in): the default plan ships
                 return []
-        spec = CandidateSpec(TransitionTier.QUICK_FADE, 1, exit_s, None, source="requested")
+        spec = CandidateSpec(TransitionTier.QUICK_FADE, bars, exit_s, None, source="requested")
         plan = TransitionPlan(
             tier=TransitionTier.QUICK_FADE,
             fade_out_window=exit_s,
@@ -441,8 +456,8 @@ class RequestedTransitionPlanner(TransitionPlanner):
         self.outcome, self.reason = "fallback", reason
 
 
-def _falls_quiet(deck: Deck, start: float) -> bool:
-    """Whether the deck's bar from ``start`` has a silent bin, or is quiet for most of it."""
+def _falls_quiet(deck: Deck, start: float, seconds: float = 0.0) -> bool:
+    """Whether the deck's bar, or ``seconds``, from ``start`` has a silent bin or is mostly quiet."""
     import numpy as np  # noqa: PLC0415
 
     rms = deck.analysis.rms_energy
@@ -452,7 +467,7 @@ def _falls_quiet(deck: Deck, start: float) -> bool:
     bins = np.asarray(rms, dtype=np.float32)
     bin_seconds = duration / len(bins)
     low = int(start / bin_seconds + 0.5)
-    high = int((start + deck.beats_per_bar * 60.0 / deck.bpm) / bin_seconds + 0.5)
+    high = int((start + (seconds or deck.beats_per_bar * 60.0 / deck.bpm)) / bin_seconds + 0.5)
     bar = bins[low:high]
     # the bins centred in the bar; their median is deaf to a loud bin at its edge (the next
     # bar's onset, as the bins round it)

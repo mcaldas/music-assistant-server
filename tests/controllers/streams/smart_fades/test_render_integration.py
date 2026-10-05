@@ -327,3 +327,77 @@ async def test_a_requested_cut_never_lands_on_silence_in_the_incoming_track() ->
     after = mix[int(cut * SR) * 2 : int((cut + 2.0) * SR) * 2][0::2]
     rms = np.sqrt(np.mean(after[: len(after) // 441 * 441].reshape(-1, 441) ** 2, axis=1))
     assert 20 * np.log10(rms.min() + 1e-12) > -50.0
+
+
+def _ticking(
+    beats: list[float], start: float, seconds: float, tick_hz: float, pad_hz: float, pad_from: float
+) -> np.ndarray:
+    """Return a stereo track ticking at ``tick_hz`` on each beat, over a quiet pad from ``pad_from``."""
+    t = start + np.arange(int(SR * seconds)) / SR
+    mono = np.where(t >= pad_from, 0.1 * np.sin(2 * np.pi * pad_hz * t), 0.0)
+    width = int(0.004 * SR)
+    tick = 0.5 * np.hanning(width) * np.sin(2 * np.pi * tick_hz * np.arange(width) / SR)
+    for beat in beats:
+        at = round((beat - start) * SR)
+        if 0 <= at <= len(mono) - width:
+            mono[at : at + width] += tick
+    return np.repeat(mono.astype(np.float32), 2)
+
+
+def _ticks_heard(mono: np.ndarray, tick_hz: float, start: float, end: float) -> list[float]:
+    """Return where the mix carries a tick at ``tick_hz`` between two times, within 30 dB of the loudest."""
+    smooth = np.hanning(int(0.004 * SR))
+    level = np.abs(
+        np.convolve(
+            mono * np.exp(-2j * np.pi * tick_hz * np.arange(len(mono)) / SR),
+            smooth / smooth.sum(),
+            mode="same",
+        )
+    )
+    floor = level.max() * 10 ** (-30 / 20)
+    lo, hi = int(start * SR), int(end * SR)
+    window = level[lo:hi]
+    peaks = np.flatnonzero(
+        (window[1:-1] > window[:-2]) & (window[1:-1] >= window[2:]) & (window[1:-1] > floor)
+    )
+    return [(lo + 1 + peak) / SR for peak in peaks]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("pickup", [0, 2], ids=["no-pickup", "pickup"])
+async def test_a_requested_quick_fade_between_far_tempos_never_doubles_a_beat(pickup: int) -> None:
+    """At 100 vs 128 BPM the beats heard together stay 40 ms apart at most, and B lands on A's end."""
+    out, inc = _analysis(100.0, 240.0), _analysis(128.0, 240.0)
+    assert out.beats is not None
+    assert inc.beats is not None
+    # B is silent until its first beat; with a pickup its bars start two beats later
+    inc.beats = [beat + 0.1 for beat in inc.beats]
+    inc.downbeats = inc.beats[pickup::4]
+    fade_out = _ticking(out.beats, 240.0 - 45.0, 45.0, 2000.0, 220.0, 0.0)
+    fade_in = _ticking(inc.beats, 0.0, 45.0, 6000.0, 330.0, 0.1)
+    planner = RequestedTransitionPlanner(
+        logging.getLogger(), TransitionRequest("quick_fade", "n", 0, 224.0)
+    )
+    fade = SmartCrossFade(logging.getLogger(), out, inc, planner)
+    fade.build(fade_out.nbytes, fade_in.nbytes, PCM)
+    chunks = [chunk async for chunk in fade.apply(fade_out.tobytes(), fade_in.tobytes(), PCM)]
+    mix = np.frombuffer(b"".join(chunks), dtype=np.float32)[0::2]
+    timing = fade.timing_info
+    start = timing.pre_crossfade_duration
+    end = start + timing.crossfade_duration
+
+    a_ticks = _ticks_heard(mix, 2000.0, start - 0.01, end + 0.01)
+    b_ticks = _ticks_heard(mix, 6000.0, start - 0.01, end + 0.01)
+    apart = [min(abs(a - b) for a in a_ticks) for b in b_ticks if a_ticks]
+    # a beat of one deck heard within a quarter second of the other's is one beat played twice
+    assert [gap for gap in apart if 0.045 < gap < 0.25] == []
+    # A ends on its downbeat 223.2 s into the song; B's one ticks right there
+    assert end == pytest.approx(223.2 - 195.0, abs=0.001)
+    assert (
+        min(abs(tick - end) for tick in _ticks_heard(mix, 6000.0, end - 0.05, end + 0.05)) < 0.005
+    )
+    assert (planner.outcome, planner.reason) == ("applied", "shortened")
+    # no 10 ms stretch around the switch drops 30 dB under the pads
+    around = mix[int((end - 0.5) * SR) : int((end + 0.5) * SR)]
+    rms = np.sqrt(np.mean(around[: len(around) // 441 * 441].reshape(-1, 441) ** 2, axis=1))
+    assert rms.min() > 0.1 / np.sqrt(2) * 10 ** (-30 / 20)

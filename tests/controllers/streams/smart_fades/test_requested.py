@@ -206,6 +206,63 @@ def test_quick_fade_keeps_a_long_intro_as_todays_quick_fade_does() -> None:
     assert plan.fadein_trim_start is None
 
 
+def _with_pickup(analysis: AudioAnalysisData, beats: int) -> AudioAnalysisData:
+    """Start a track's bars ``beats`` beats into its grid, as a pickup before its first one."""
+    assert analysis.beats is not None
+    analysis.downbeats = analysis.beats[beats::4]
+    return analysis
+
+
+@pytest.mark.parametrize(
+    ("incoming_bpm", "pickup", "overlap"),
+    [
+        # 100 vs 128 BPM drift 0.525 s a bar: 40 ms of it is 0.183 s
+        (128.0, 0, CUT_SECONDS),
+        (128.0, 2, 0.04 / 0.525 * 2.4),
+        # 100 vs 104 BPM drift 0.092 s a bar: 40 ms of it is 1.04 s, more than a beat of pickup
+        (104.0, 1, 60.0 / 104.0),
+        (104.0, 3, 0.04 / (4 * (0.6 - 60.0 / 104.0)) * 2.4),
+    ],
+    ids=["far-no-pickup", "far-pickup", "near-short-pickup", "near-long-pickup"],
+)
+def test_a_quick_fade_that_would_drift_in_a_bar_meets_on_the_one_within_the_drift(
+    incoming_bpm: float, pickup: int, overlap: float
+) -> None:
+    """Under a bar, B's pickup fades in under A's last beats and B's one lands on A's exit."""
+    inc = _with_pickup(_shifted(_analysis(incoming_bpm), 0.1), pickup)
+    assert inc.downbeats is not None
+    planner, plan = _plan(_analysis(100.0), inc, "quick_fade", exit_at=224.0)
+
+    assert (planner.outcome, planner.reason) == ("applied", "shortened")
+    assert TAIL_START + plan.fade_out_window == pytest.approx(223.2)
+    assert plan.crossfade_duration == pytest.approx(overlap)
+    # A ends where B's one plays
+    assert plan.fadein_trim_start == pytest.approx(inc.downbeats[0] - overlap)
+    assert plan.fadeout_curve == "qsin"
+    assert not plan.tempo_plan
+
+
+def test_a_quick_fade_under_a_bar_never_fades_a_out_over_silence_of_b() -> None:
+    """A pickup that falls silent before B's one is no fade-in: the switch is a cut's."""
+    rms = np.full(1800, 0.5, dtype=np.float32)
+    rms[int(0.6 / 240.0 * 1800) : int(1.0 / 240.0 * 1800)] = 0.001
+    inc = _with_pickup(_shifted(_analysis(128.0, rms_energy=rms), 0.1), 2)
+    planner, plan = _plan(_analysis(100.0), inc, "quick_fade", exit_at=224.0)
+
+    assert (planner.outcome, planner.reason) == ("applied", "shortened")
+    assert plan.crossfade_duration == CUT_SECONDS
+    assert plan.fadein_trim_start == pytest.approx(0.1 + 2 * 60.0 / 128.0 - CUT_SECONDS)
+
+
+def test_a_quick_fade_under_a_bar_onto_a_later_one_fades_in_the_bar_before_it() -> None:
+    """B's first bar falls silent: the fade lands on its next one, over the end of that bar."""
+    _, plan = _plan(_analysis(150.0), _silent_after_its_one(), "quick_fade", exit_at=224.0)
+
+    # 150 vs 120 BPM drift 0.4 s a bar of 1.6 s: 40 ms of it is 0.16 s
+    assert plan.crossfade_duration == pytest.approx(0.16)
+    assert plan.fadein_trim_start == pytest.approx(3.0 - 0.16)
+
+
 def test_cut_ends_the_outgoing_on_a_downbeat_and_lands_the_incoming_one_there() -> None:
     """A cut stops A on its downbeat; B plays from just before its first downbeat."""
     planner, plan = _plan(_analysis(120.0), _shifted(_analysis(120.0), 7.87), "cut", exit_at=224.3)
@@ -304,12 +361,18 @@ def test_a_cut_reads_the_silence_before_the_one_as_before_it() -> None:
     assert plan.fadein_trim_start == pytest.approx(1.05 - CUT_SECONDS)
 
 
-def test_cut_inside_a_mastered_fade_keeps_its_fade_curve() -> None:
+@pytest.mark.parametrize(
+    ("style", "incoming_bpm"),
+    [("cut", 120.0), ("quick_fade", 150.0)],
+    ids=["cut", "quick-fade-under-a-bar"],
+)
+def test_cut_inside_a_mastered_fade_keeps_its_fade_curve(style: str, incoming_bpm: float) -> None:
     """A cut inside the record's own fade-out still fades its few milliseconds, never stops dead."""
-    out, inc = _mastered_fade_pair()
-    planner, plan = _plan(out, inc, "cut", exit_at=239.0)
+    out, _ = _mastered_fade_pair()
+    planner, plan = _plan(out, _analysis(incoming_bpm), style, exit_at=239.0)
 
     assert planner.outcome == "applied"
+    assert plan.crossfade_duration == CUT_SECONDS
     assert plan.fadeout_curve == "qsin"
 
 

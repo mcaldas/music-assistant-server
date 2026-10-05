@@ -535,9 +535,10 @@ class PlayerQueuesController(QueueLoaderMixin, PlaybackTrackerMixin, StreamFeede
         it lapses when the item stops playing. It is stored on the item as
         ``requested_transition_*`` extra attributes. When the boundary is planned, the item's
         ``transition_request`` extra attribute says what came of it: "applied" (with
-        ``transition_request_reason`` "shortened" for a blend shorter than asked), "fallback"
-        (Smart Fades' own transition plays; the reason is "not_blendable", "no_room" or
-        "vocal") or "ignored" (no smart fade plays). The transition is fixed well before the
+        ``transition_request_reason`` "shortened" for a blend shorter than asked, or a quick
+        fade under a bar, between tempos that drift apart within one), "fallback" (Smart
+        Fades' own transition plays; the reason is "not_blendable", "no_room" or "vocal") or
+        "ignored" (no smart fade plays). The transition is fixed well before the
         item ends (on Sonos about two minutes before); after that a request fails.
 
         :param queue_id: Queue the item is in.
