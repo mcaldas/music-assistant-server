@@ -484,7 +484,7 @@ async def test_a_sung_pickup_pre_rolls_under_the_outgoing_track(style: str) -> N
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("style", ["cut", "quick_fade"])
+@pytest.mark.parametrize("style", ["cut", "quick_fade", "echo_out"])
 @pytest.mark.parametrize(
     ("outgoing_bpm", "incoming_bpm", "pickup"),
     [(100.0, 128.0, 2), (120.0, 126.0, 3)],
@@ -497,7 +497,8 @@ async def test_a_sung_pickup_never_plays_its_beats_against_the_outgoing_ones(
     B ticks on the beats of its sung lead-in, which would drift more than 40 ms off A's.
 
     Under A, B plays only up to its first beat, which lands on A's exit; the rest of the
-    lead-in follows alone, so no beat is heard doubled and the room never goes quiet.
+    lead-in follows alone, so no beat is heard doubled and the room never goes quiet. An echo
+    out's repeats of A's last beat land on B's beats from there.
     """
     out, inc = _analysis(outgoing_bpm, 240.0), _analysis(incoming_bpm, 240.0)
     assert out.beats is not None

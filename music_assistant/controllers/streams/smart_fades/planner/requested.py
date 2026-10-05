@@ -630,21 +630,23 @@ class RequestedTransitionPlanner(TransitionPlanner):
     def _with_echo(self, ctx: TransitionContext, plan: TransitionPlan) -> TransitionPlan | None:
         """Ring the cut's last outgoing beat on under the incoming track, or None to fall back."""
         exit_s, entry = plan.fade_out_window, plan.fadein_trim_start or 0.0
-        # the one the cut lands on: B's first, or a later one when B falls silent after it
-        b_one = next((float(d) for d in ctx.incoming.downbeats if d >= entry), 0.0)
+        # B's beat on A's exit: the one the cut lands on (B's first, or a later one when B falls
+        # silent after it), or the first beat of a lead-in whose beats would drift off A's
+        at = entry + plan.crossfade_duration
+        landing = min((float(b) for b in ctx.incoming.beats), key=lambda b: abs(b - at), default=at)
         bar = ctx.incoming.beats_per_bar
         out_beat, in_beat = 60.0 / ctx.outgoing.bpm, 60.0 / ctx.incoming.bpm
         # A's last beat before the exit, from the bars of its grid before it (its tempo can
-        # drift from the bpm): the first repeat lands that beat on B's one
+        # drift from the bpm): the first repeat lands that beat on B's
         last = [float(b) for b in ctx.outgoing.beats if b < exit_s - 0.25 * out_beat]
         beat = _grid_beat([*last[-_ECHO_BARS * ctx.outgoing.beats_per_bar :], exit_s], out_beat)
-        # the repeats ring under B, so the rest land on B's beat, from its grid after its one
-        head = [float(b) for b in ctx.incoming.beats if b > b_one - 0.25 * in_beat]
+        # the repeats ring under B, so the rest land on B's beat, from its grid after that one
+        head = [float(b) for b in ctx.incoming.beats if b > landing - 0.25 * in_beat]
         period = _grid_beat(head[: _ECHO_BARS * bar + 1], in_beat)
-        # a one inside the cut's overlap plays before A's end: the echo starts on it there too
-        lead = max(0.0, CUT_SECONDS - b_one)
+        # a beat inside the cut's overlap plays before A's end: the echo starts on it there too
+        lead = max(0.0, at - landing)
         window = min(float(SMART_CROSSFADE_DURATION), self.fade_in_seconds)
-        repeats = min(_ECHO_BARS * bar, int((window - b_one) / period))
+        repeats = min(_ECHO_BARS * bar, int((window - landing) / period))
         if exit_s < beat or repeats < bar:
             # the last beat, or a bar of its echo, is not in the audio the mix receives
             self._fallback("no_room")
@@ -658,7 +660,7 @@ class RequestedTransitionPlanner(TransitionPlanner):
                 for left, right in ctx.vocal_out_scoring.windows
             )
             and any(
-                left < b_one + repeats * period and right > entry
+                left < landing + repeats * period and right > entry
                 for left, right in ctx.vocal_in_scoring.windows
             )
         ):

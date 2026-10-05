@@ -1044,6 +1044,18 @@ def test_echo_out_into_a_sung_pickup_rings_from_its_one_on_the_exit() -> None:
     assert plan.echo_out == EchoOut(beat=0.5, period=0.5, repeats=8)
 
 
+def test_echo_out_into_a_drifting_lead_in_rings_from_its_first_beat_on_the_exit() -> None:
+    """B's lead-in beats would drift off A's: its first beat lands on A's exit, the echo on it."""
+    inc = _with_vocal_activity(_with_pickup(_shifted(_analysis(150.0), 0.1), 2), [(0.13, 30.0)])
+    planner, plan = _plan(_analysis(120.0), inc, "echo_out", exit_at=224.0, fade_in_seconds=1.8)
+
+    assert (planner.outcome, planner.reason) == ("applied", None)
+    assert plan.fadein_trim_start is None
+    assert plan.crossfade_duration == pytest.approx(0.1)
+    # four repeats from B's first beat fill the 1.8 s of B the mix receives
+    assert plan.echo_out == EchoOut(beat=0.5, period=0.4, repeats=4)
+
+
 def test_without_an_exit_an_echo_never_rings_the_phrase_end_over_the_incoming_vocal() -> None:
     """A's last beat before the phrase-end exit is sung and B sings from its one: a bar later."""
     out = _with_vocal_activity(_analysis(120.0, rms_energy=_outro_from(228.0)), [(215.0, 231.9)])

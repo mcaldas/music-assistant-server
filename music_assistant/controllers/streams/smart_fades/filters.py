@@ -318,10 +318,10 @@ class EchoOutFilter(Filter):
 
     A copy of the outgoing stream keeps only the beat before the point where the crossfade
     cuts it, low-cut and with click-free edges; ``aecho`` lands it on the incoming track's
-    one and repeats it on every incoming beat after it, each repeat at half the level of the
-    one before. The copy is moved onto the incoming stream's timeline and mixed into it, so
-    the echo rings on under the incoming track while the crossfade, the timing and the
-    output length stay as they are.
+    beat at the cut and repeats it on every incoming beat after it, each repeat at half the
+    level of the one before. The copy is moved onto the incoming stream's timeline and mixed
+    into it, so the echo rings on under the incoming track while the crossfade, the timing
+    and the output length stay as they are.
     """
 
     output_fadeout_label: str = "fadeout_echo_dry"
@@ -351,8 +351,8 @@ class EchoOutFilter(Filter):
         :param beat_samples: One outgoing beat: the echoed beat starts this long before the cut.
         :param period_samples: One incoming beat: the gap between repeats, and the most of
             the outgoing beat each one plays, so a repeat never runs into the next.
-        :param lead_samples: How long before the cut the incoming one plays, where the first
-            repeat lands.
+        :param lead_samples: How long before the cut the incoming beat on it plays, where the
+            first repeat lands.
         :param repeats: How many times the beat repeats.
         :param sample_rate: Sample rate of both streams.
         """

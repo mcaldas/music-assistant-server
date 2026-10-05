@@ -255,8 +255,9 @@ class EchoOut:
     # one incoming beat in seconds: the gap between repeats, which ring under that track
     period: float
     repeats: int
-    # seconds before the outgoing audio ends where the incoming track's one plays, and the
-    # first repeat lands: only a one inside the cut's own overlap comes early
+    # seconds before the outgoing audio ends where the incoming track's beat on the exit (its
+    # one, or a lead-in's first beat) plays, and the first repeat lands: only a beat inside
+    # the cut's own overlap comes early
     lead: float = 0.0
 
 
