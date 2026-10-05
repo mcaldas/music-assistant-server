@@ -1021,6 +1021,17 @@ def test_echo_out_needs_a_bar_of_the_incoming_head_for_its_tail(
         assert plan == SmartCrossFadePlanner(LOGGER).plan(out, inc, 45.0)
 
 
+def test_without_an_exit_an_echo_never_rings_the_phrase_end_over_the_incoming_vocal() -> None:
+    """A's last beat before the phrase-end exit is sung and B sings from its one: a bar later."""
+    out = _with_vocal_activity(_analysis(120.0, rms_energy=_outro_from(228.0)), [(215.0, 231.9)])
+    inc = _with_vocal_activity(_analysis(120.0), [(0.0, 20.0)])
+
+    planner, plan = _plan(out, inc, "echo_out")
+
+    assert (planner.outcome, planner.reason) == ("applied", None)
+    assert TAIL_START + plan.fade_out_window == pytest.approx(234.0)
+
+
 @pytest.mark.parametrize(
     ("outgoing_vocal", "incoming_vocal", "outcome"),
     [
