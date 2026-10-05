@@ -434,11 +434,12 @@ class RequestedTransitionPlanner(TransitionPlanner):
             if self._sung_before(ctx, entry):
                 entry = self._pickup_start(ctx)
                 lead = b_one - entry
-            if (
-                lead > min(bar_out, exit_s - overlap)
-                or entry > overlap + _MAX_UNHEARD_INTRO_S
-                or b_one + overlap > window
-            ):
+                if lead > min(bar_out, exit_s - overlap):
+                    # from its head B's one would miss A's downbeat by the lead-in, its beats
+                    # off A's: as for a cut, the default plan ships
+                    self._fallback("vocal")
+                    return []
+            if entry > overlap + _MAX_UNHEARD_INTRO_S or b_one + overlap > window:
                 entry, lead = 0.0, 0.0
             overlap += lead
             if overlap > window or _falls_quiet(ctx.incoming, entry + overlap):

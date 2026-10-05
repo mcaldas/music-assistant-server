@@ -381,24 +381,32 @@ def test_a_pre_roll_never_sings_over_the_outgoing_vocal(
         assert plan.metrics.collision_seconds == 0.0
 
 
-@pytest.mark.parametrize(
-    ("incoming", "entry", "lead"),
-    [
-        (_sung_pickup(), 2 * BIN - 0.25, 1.1 - 2 * BIN + 0.25),
-        (_with_vocal_activity(_shifted(_analysis(120.0), 3.0), [(0.5, 9.0)]), None, 0.0),
-    ],
-    ids=["pickup-under-the-fade", "lead-in-longer-than-a-bar-plays-from-the-head"],
-)
-def test_a_quick_fade_keeps_the_one_of_a_sung_pickup_on_the_downbeat(
-    incoming: AudioAnalysisData, entry: float | None, lead: float
-) -> None:
+def test_a_quick_fade_keeps_the_one_of_a_sung_pickup_on_the_downbeat() -> None:
     """The fade starts as B's pickup does, so B's one lands on A's downbeat four bars from the exit."""
-    planner, plan = _plan(_analysis(120.0), incoming, "quick_fade", exit_at=224.0)
+    planner, plan = _plan(_analysis(120.0), _sung_pickup(), "quick_fade", exit_at=224.0)
 
     assert (planner.outcome, planner.reason) == ("applied", None)
-    assert plan.fadein_trim_start == (pytest.approx(entry) if entry else None)
-    assert plan.crossfade_duration == pytest.approx(8.0 + lead)
+    assert plan.fadein_trim_start == pytest.approx(2 * BIN - 0.25)
+    assert plan.crossfade_duration == pytest.approx(8.0 + 1.1 - 2 * BIN + 0.25)
     assert plan.fade_seconds is None
+
+
+@pytest.mark.parametrize(
+    "incoming",
+    [
+        _with_vocal_activity(_shifted(_analysis(120.0), 3.0), [(0.5, 9.0)]),
+        _with_vocal_activity(_with_pickup(_shifted(_analysis(120.0), 0.2), 5), [(0.27, 30.0)]),
+    ],
+    ids=["lead-in-before-the-grid", "lead-in-over-five-beats"],
+)
+def test_a_quick_fade_never_plays_a_lead_in_longer_than_a_bar_from_the_head(
+    incoming: AudioAnalysisData,
+) -> None:
+    """From its head B's one would land the lead-in after A's downbeat, off A's beats: it falls back."""
+    planner, plan = _plan(_analysis(120.0), incoming, "quick_fade", exit_at=224.0)
+
+    assert (planner.outcome, planner.reason) == ("fallback", "vocal")
+    assert plan == SmartCrossFadePlanner(LOGGER).plan(_analysis(120.0), incoming, 45.0)
 
 
 def test_a_quick_fade_under_a_bar_fades_over_a_sung_pickup_onto_the_one() -> None:
