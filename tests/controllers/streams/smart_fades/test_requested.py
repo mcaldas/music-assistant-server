@@ -65,6 +65,13 @@ def _silent_after_its_one(level: float = 0.001) -> AudioAnalysisData:
     return _shifted(_analysis(120.0, rms_energy=rms), 1.0)
 
 
+def _soft_intro(bars: int, level: float = 0.015) -> AudioAnalysisData:
+    """Return a track whose one is 1 s in, its energy at ``level`` for ``bars`` bars after it."""
+    rms = np.full(1800, 0.5, dtype=np.float32)
+    rms[: int((1.0 + bars * 2.0) / 240.0 * 1800)] = level
+    return _shifted(_analysis(120.0, rms_energy=rms), 1.0)
+
+
 def _bars_of_outgoing(plan: TransitionPlan, bpm: float) -> float:
     """Return the overlap's length in bars of the outgoing track (4/4)."""
     ratio = plan.tempo_plan.steps[-1][1] if plan.tempo_plan else 1.0
@@ -228,12 +235,14 @@ def test_cut_lands_on_a_vocal_that_starts_on_the_one() -> None:
         (_shifted(_analysis(120.0), 7.87), 7.0, "no_room"),
         (_with_vocal_activity(_silent_after_its_one(), [(2.2, 9.0)]), 45.0, "vocal"),
         (_silent_after_its_one(), 2.5, "no_room"),
+        (_soft_intro(8), 10.0, "no_room"),
     ],
     ids=[
         "sung-lead-in-before-the-one",
         "one-beyond-the-received-head",
         "sung-before-the-downbeat-after-a-silent-bar",
         "downbeat-after-a-silent-bar-beyond-the-received-head",
+        "downbeat-after-a-quiet-intro-beyond-the-received-head",
     ],
 )
 def test_a_cut_that_cannot_land_on_the_one_ships_the_default_plan(
@@ -259,6 +268,29 @@ def test_a_cut_lands_on_the_first_downbeat_whose_bar_sounds(level: float, one: f
     assert (planner.outcome, planner.reason) == ("applied", None)
     assert plan.crossfade_duration == CUT_SECONDS
     assert plan.fadein_trim_start == pytest.approx(one - CUT_SECONDS)
+
+
+@pytest.mark.parametrize(("level", "one"), [(0.015, 17.0), (0.05, 1.0)], ids=["quiet", "soft"])
+def test_a_cut_lands_past_an_intro_too_quiet_to_hear_alone(level: float, one: float) -> None:
+    """Eight bars of B 30 dB under the rest, never silent, are near silence once A stops."""
+    planner, plan = _plan(_analysis(120.0), _soft_intro(8, level), "cut", exit_at=224.0)
+
+    assert (planner.outcome, planner.reason) == ("applied", None)
+    assert plan.fadein_trim_start == pytest.approx(one - CUT_SECONDS)
+
+
+@pytest.mark.parametrize(
+    ("bars", "outcome", "reason"),
+    [(4, "applied", None), (8, "fallback", "no_room")],
+    ids=["ends-under-the-fade", "plays-on-after-the-fade"],
+)
+def test_a_quick_fade_never_leaves_a_quiet_intro_playing_alone(
+    bars: int, outcome: str, reason: str | None
+) -> None:
+    """B's quiet intro may play under A's four-bar fade, not on after it: the default plan ships."""
+    planner, _ = _plan(_analysis(120.0), _soft_intro(bars), "quick_fade", exit_at=224.0)
+
+    assert (planner.outcome, planner.reason) == (outcome, reason)
 
 
 def test_a_cut_reads_the_silence_before_the_one_as_before_it() -> None:

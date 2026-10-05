@@ -12,7 +12,10 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass, replace
 from typing import TYPE_CHECKING
 
-from music_assistant.controllers.streams.smart_fades.helpers import SMART_CROSSFADE_DURATION
+from music_assistant.controllers.streams.smart_fades.helpers import (
+    SMART_CROSSFADE_DURATION,
+    sustained_energy_floor,
+)
 from music_assistant.controllers.streams.smart_fades.models import (
     FadeOutTrim,
     TempoPlan,
@@ -70,6 +73,9 @@ _MAX_EXIT_DELAY_BARS = 4
 # a bin of the stored, peak-normalized energy (~0.1-0.2s) at or under this is silent, as
 # Smart Fades' sustained energy floor counts it (-40 dB)
 _SILENT_RMS = 0.01
+# a bar whose stored energy sits this far under the track's sustained level (-24 dB) for
+# most of it is a soft intro or the start of a fade-in: heard alone after A, near silence
+_QUIET_BAR_FRACTION = 0.063
 
 
 @dataclass(frozen=True, slots=True)
@@ -367,8 +373,9 @@ class RequestedTransitionPlanner(TransitionPlanner):
         b_one = float(ctx.incoming.downbeats[0]) if len(ctx.incoming.downbeats) else 0.0
         if cut:
             # B's one lands where A ends; when B falls silent in the bar after it (a pickup
-            # dying away before the song starts), the room would hear that silence once A
-            # stops, so the cut lands on B's first later downbeat whose bar carries level
+            # dying away before the song starts) or stays quiet through it (a soft intro, a
+            # fade-in), the room would hear near silence once A stops, so the cut lands on
+            # B's first later downbeat whose bar carries level
             overlap = CUT_SECONDS
             for one in [float(d) for d in ctx.incoming.downbeats] or [0.0]:
                 entry = max(0.0, one - CUT_SECONDS)
@@ -378,7 +385,7 @@ class RequestedTransitionPlanner(TransitionPlanner):
                     return []
                 if entry + overlap > window:
                     return []
-                if not _falls_silent(ctx.incoming, one):
+                if not _falls_quiet(ctx.incoming, one):
                     break
             else:
                 return []
@@ -403,7 +410,9 @@ class RequestedTransitionPlanner(TransitionPlanner):
                 or entry + overlap > window
             ):
                 entry = 0.0
-            if overlap > window:
+            if overlap > window or _falls_quiet(ctx.incoming, entry + overlap):
+                # past the head of B the mix receives; or B's bar once A has faded out is
+                # near silence (a soft intro, a fade-in): the default plan ships
                 return []
         spec = CandidateSpec(TransitionTier.QUICK_FADE, 1, exit_s, None, source="requested")
         plan = TransitionPlan(
@@ -432,13 +441,22 @@ class RequestedTransitionPlanner(TransitionPlanner):
         self.outcome, self.reason = "fallback", reason
 
 
-def _falls_silent(deck: Deck, start: float) -> bool:
-    """Whether the deck's stored energy has a silent bin centred in the bar from ``start``."""
+def _falls_quiet(deck: Deck, start: float) -> bool:
+    """Whether the deck's bar from ``start`` has a silent bin, or is quiet for most of it."""
+    import numpy as np  # noqa: PLC0415
+
     rms = deck.analysis.rms_energy
     duration = deck.analysis.duration
     if rms is None or len(rms) == 0 or not duration:
         return False
-    bin_seconds = duration / len(rms)
+    bins = np.asarray(rms, dtype=np.float32)
+    bin_seconds = duration / len(bins)
     low = int(start / bin_seconds + 0.5)
     high = int((start + deck.beats_per_bar * 60.0 / deck.bpm) / bin_seconds + 0.5)
-    return min(rms[low:high], default=1.0) <= _SILENT_RMS
+    bar = bins[low:high]
+    # the bins centred in the bar; their median is deaf to a loud bin at its edge (the next
+    # bar's onset, as the bins round it)
+    return len(bar) > 0 and (
+        float(bar.min()) <= _SILENT_RMS
+        or float(np.median(bar)) < _QUIET_BAR_FRACTION * sustained_energy_floor(bins)
+    )
