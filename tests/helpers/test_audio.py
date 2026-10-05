@@ -214,3 +214,21 @@ def test_fade_out_pcm_ramps_every_sample_type_to_silence(
     assert [_sample(whole, 2 * index + 1) for index in range(80, 100)] == pytest.approx(
         [level * (100 - index) / 20 for index in range(80, 100)], abs=1e-6 if floating else 1
     )
+
+
+def test_fade_out_pcm_fades_the_whole_frames_of_a_chunk_that_splits_frames() -> None:
+    """24-bit audio from ffmpeg comes in chunks that start and stop inside a frame."""
+    pcm_format = AudioFormat(
+        content_type=ContentType.PCM_S24LE, bit_depth=24, sample_rate=1000, channels=2
+    )
+    frame = 6
+    audio = (1000).to_bytes(3, "little", signed=True) * 200  # 100 frames
+    fade = 20 * frame
+    whole = fade_out_pcm(audio, pcm_format, len(audio), fade)
+    # from 2 bytes into frame 85 to 4 bytes into frame 95
+    start, stop = 85 * frame + 2, 95 * frame + 4
+    chunk = fade_out_pcm(audio[start:stop], pcm_format, len(audio) - start, fade)
+    # the frames it holds only part of are left as they are, every whole one is faded
+    assert chunk[: frame - 2] == audio[start : 86 * frame]
+    assert chunk[frame - 2 : -4] == whole[86 * frame : 95 * frame]
+    assert chunk[-4:] == audio[95 * frame : stop]

@@ -11,8 +11,9 @@ from typing import Any, cast
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
-from music_assistant_models.enums import CrossfadeMode, MediaType
+from music_assistant_models.enums import ContentType, CrossfadeMode, MediaType
 from music_assistant_models.errors import ActionUnavailable, QueueEmpty
+from music_assistant_models.media_items import AudioFormat
 
 from music_assistant.controllers.player_queues import PlayerQueuesController
 from music_assistant.controllers.streams.audio import (
@@ -465,6 +466,49 @@ async def test_reader_follows_an_end_set_while_it_reads(monkeypatch: pytest.Monk
     assert len(out) == int(33.25 * SR) * FRAME
     _assert_ends_at(out, 33.25)
     assert audio.read_positions["a"] == float("inf")
+
+
+async def test_an_end_fades_out_24_bit_audio_read_in_chunks_that_split_frames(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """24-bit audio comes from ffmpeg in 64000-byte reads: the fade still ramps every frame."""
+    s24 = AudioFormat(
+        content_type=ContentType.PCM_S24LE, sample_rate=48000, bit_depth=24, channels=2
+    )
+    level, frame, fade = 1 << 20, 6, int(END_POSITION_FADE * 48000)
+
+    async def _source() -> AsyncGenerator[bytes]:
+        for _ in range(5):
+            yield level.to_bytes(3, "little", signed=True) * 2 * 48000
+            await asyncio.sleep(0)
+
+    item = _item("a", 1, 5, BufferSize.BALANCED, end=1.125)
+    item.streamdetails.buffer = AudioBuffer(s24, BufferSize.BALANCED, mode=BufferMode.SEEKABLE)
+    item.streamdetails.buffer.fill(_source(), source_name="a")
+    await _filled(item)
+    get_stream = item.streamdetails.buffer.get_stream
+
+    async def _ffmpeg_reads(**kwargs: Any) -> AsyncGenerator[bytes]:
+        pending = b""
+        async for chunk in get_stream(**kwargs):
+            pending += chunk
+            while len(pending) >= 64000:
+                yield pending[:64000]
+                pending = pending[64000:]
+        yield pending
+
+    monkeypatch.setattr(item.streamdetails.buffer, "get_stream", _ffmpeg_reads)
+    audio, _mass = _single_audio(monkeypatch, None)
+    out = bytearray()
+    # the fade's last 20 ms, frames 53040-54000, cross the read that ends at byte 320000
+    async for chunk in audio.get_queue_item_stream(cast("Any", item), s24):
+        out.extend(chunk)
+    assert len(out) == 54000 * frame
+    ramp = [
+        int.from_bytes(out[index * frame : index * frame + 3], "little", signed=True)
+        for index in range(54000 - fade, 54000)
+    ]
+    assert ramp == pytest.approx([level * (fade - k) / fade for k in range(fade)], abs=1)
 
 
 async def test_an_abandoned_read_keeps_its_position(monkeypatch: pytest.MonkeyPatch) -> None:

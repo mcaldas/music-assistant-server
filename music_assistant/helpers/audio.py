@@ -161,19 +161,25 @@ def fade_out_pcm(audio: bytes, pcm_format: AudioFormat, end: int, length: int) -
 
     The fade covers the ``length`` bytes before ``end``, which may reach outside ``audio``,
     so a fade that spans several chunks is applied chunk by chunk with each chunk's own
-    ``end``. Audio outside the fade is returned unchanged.
+    ``end``. Audio outside the fade is returned unchanged, and so is a frame that ``audio``
+    holds only part of: its start or its end is in another chunk.
 
-    :param audio: Frame-aligned interleaved little-endian PCM (integer or float samples).
+    :param audio: Interleaved little-endian PCM (integer or float samples).
     :param pcm_format: Format of the audio.
-    :param end: Offset in bytes from the start of ``audio`` where the fade reaches silence.
+    :param end: Offset in bytes from the start of ``audio`` where the fade reaches silence,
+        on the frame grid of the stream ``audio`` is part of.
     :param length: Length of the fade in bytes, a whole number of frames.
     """
+    width = pcm_format.bit_depth // 8
+    frame_size = width * pcm_format.channels
     start, stop = max(0, end - length), min(len(audio), end)
+    # whole frames only: a chunk can start or stop inside one (ffmpeg's reads of 24-bit audio)
+    start += (end - start) % frame_size
+    stop -= (stop - end) % frame_size
     if start >= stop:
         return audio
     import numpy as np  # noqa: PLC0415
 
-    width = pcm_format.bit_depth // 8
     samples = np.frombuffer(audio[start:stop], dtype=np.uint8).reshape(-1, width)
     if width == 3:
         # no numpy type holds packed 24-bit samples: widen them to the top of an int32
@@ -181,7 +187,7 @@ def fade_out_pcm(audio: bytes, pcm_format: AudioFormat, end: int, length: int) -
     floating = pcm_format.content_type in (ContentType.PCM_F32LE, ContentType.PCM_F64LE)
     dtype = np.dtype(f"<{'f' if floating else 'i'}{samples.shape[1]}")
     frames = samples.view(dtype).reshape(-1, pcm_format.channels)
-    gain = (end - start - width * pcm_format.channels * np.arange(len(frames))) / length
+    gain = (end - start - frame_size * np.arange(len(frames))) / length
     faded = (frames * gain[:, None]).astype(dtype).view(np.uint8).reshape(samples.shape)
     return audio[:start] + faded[:, -width:].tobytes() + audio[stop:]
 

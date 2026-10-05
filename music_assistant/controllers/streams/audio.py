@@ -1764,10 +1764,12 @@ class StreamsAudio:
         frame_size = pcm_format.bit_depth // 8 * pcm_format.channels
         end_fade_bytes = int(END_POSITION_FADE * pcm_format.sample_rate) * frame_size
         cut = False
+        # the start of a frame the source split between two chunks, held for the next one
+        split_frame = b""
         self._mark_read(queue_item.queue_item_id, read_from)
         try:
             async for source_chunk in media_stream_gen:
-                chunk = source_chunk
+                chunk, split_frame = split_frame + source_chunk, b""
                 # a client's end for the item (set_end_position), read live: stop exactly
                 # there, faded out over its last moments whatever follows it
                 if (end := get_end_position(queue_item)) is not None:
@@ -1775,6 +1777,10 @@ class StreamsAudio:
                     left = end_bytes // frame_size * frame_size - bytes_received
                     if left <= len(chunk):
                         chunk, cut = chunk[: max(0, left)], True
+                    else:
+                        # whole frames only, so the fade-out never meets a split one
+                        whole = max(0, len(chunk) - (bytes_received + len(chunk)) % frame_size)
+                        chunk, split_frame = chunk[:whole], chunk[whole:]
                     chunk = fade_out_pcm(chunk, pcm_format, left, end_fade_bytes)
                 bytes_received += len(chunk)
                 self._mark_read(
