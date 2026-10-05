@@ -1201,3 +1201,35 @@ async def test_an_echo_out_rings_the_last_beat_on_under_the_incoming_track(
     ]
     for louder, quieter in itertools.pairwise(levels):
         assert 20 * np.log10(louder / quieter) == pytest.approx(6.02, abs=0.5)
+
+
+@pytest.mark.asyncio
+async def test_an_echo_out_after_a_pre_roll_rings_from_the_exit() -> None:
+    """B sung before its one pre-rolls under A as for the cut; A's last beat echoes from A's exit."""
+    fade_out = _bursts(440.0, 45.0)
+    fade_in = np.zeros(int(45.0 * SR) * 2, dtype=np.float32)
+    # B: silent, its voice (1760 Hz) from 0.4 s, its one and first beat 1.1 s in at 130 bpm
+    fade_in[int(0.4 * SR) * 2 :] = _tone(1760.0, 45.0)[int(0.4 * SR) * 2 :]
+    inc = _analysis(130.0, 240.0, 1.1)
+    assert inc.rms_energy is not None
+    inc.rms_energy[0] = 0.0
+    inc.extra_data = {"vocal_activity": [0.9 if i >= 2 else 0.05 for i in range(1800)]}
+    echoed, echo = await _render_request(
+        TransitionRequest("echo_out", "n", 0, 224.0), fade_out, fade_in, inc
+    )
+    cut, cut_fade = await _render_request(
+        TransitionRequest("cut", "n", 0, 224.0), fade_out, fade_in, inc
+    )
+    crossfade = echo.filters[-1]
+    assert isinstance(crossfade, StreamingCrossfadeFilter)
+    end = crossfade.pre_crossfade_samples + crossfade.crossfade_samples
+
+    # the cut's pre-roll: B from its pickup, its one on A's exit downbeat
+    assert echo.timing_info == cut_fade.timing_info
+    assert crossfade.crossfade_samples > 0.7 * SR
+    assert end == pytest.approx(29.0 * SR, abs=2)
+    # nothing rings over the pickup: identical to the cut up to A's exit
+    assert np.array_equal(echoed[: end * 2], cut[: end * 2])
+    # the first repeat starts on the exit, B's one (its 80 ms burst rises over a few ms)
+    wet = np.abs((echoed - cut)[end * 2 : (end + int(0.4 * SR)) * 2 : 2])
+    assert np.argmax(wet > 0.1 * wet.max()) < 0.005 * SR

@@ -1033,6 +1033,17 @@ def test_echo_out_rings_from_the_one_its_cut_lands_on() -> None:
     assert plan.echo_out == EchoOut(beat=0.5, period=0.5, repeats=4)
 
 
+def test_echo_out_into_a_sung_pickup_rings_from_its_one_on_the_exit() -> None:
+    """The cut pre-rolls B's lead-in under A's last beats; the echo starts on B's one, A's exit."""
+    planner, plan = _plan(_analysis(120.0), _sung_pickup(), "echo_out", exit_at=224.0)
+
+    assert (planner.outcome, planner.reason) == ("applied", None)
+    assert plan.crossfade_duration > CUT_SECONDS
+    assert plan.fadein_trim_start + plan.crossfade_duration == pytest.approx(1.1)
+    assert plan.fade_seconds == CUT_SECONDS
+    assert plan.echo_out == EchoOut(beat=0.5, period=0.5, repeats=8)
+
+
 def test_without_an_exit_an_echo_never_rings_the_phrase_end_over_the_incoming_vocal() -> None:
     """A's last beat before the phrase-end exit is sung and B sings from its one: a bar later."""
     out = _with_vocal_activity(_analysis(120.0, rms_energy=_outro_from(228.0)), [(215.0, 231.9)])
