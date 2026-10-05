@@ -586,7 +586,9 @@ class PlayerQueuesController(QueueLoaderMixin, PlaybackTrackerMixin, StreamFeede
                 self.signal_update(queue_id)
             return
         if exit_at and queue_item.duration:
-            # an item that ends early (set_end_position) ends its transition there
+            # an item that ends early (set_end_position) ends its transition there; the end is
+            # stored to the millisecond, so an exit sent as the same number must compare equal
+            exit_at = round(exit_at, 3)
             stop = get_end_position(queue_item) or queue_item.duration
             window = min(float(SMART_CROSSFADE_DURATION), stop / 2)
             if not stop - window < exit_at <= stop:

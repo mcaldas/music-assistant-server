@@ -124,6 +124,19 @@ async def test_a_transition_exit_lies_in_the_last_seconds_before_the_end() -> No
         await ctrl.set_transition("q1", item.queue_item_id, "cut", exit_at=50.0)
 
 
+async def test_an_exit_sent_as_the_end_is_accepted_at_the_end() -> None:
+    """The end is stored to the millisecond; the same number sent as exit_at is still at it."""
+    ctrl = _ctrl()
+    item = _item(ctrl, 1)
+    await ctrl.set_end_position("q1", item.queue_item_id, 40.0004)
+
+    await ctrl.set_transition("q1", item.queue_item_id, "cut", exit_at=40.0004)
+
+    assert TransitionRequest.read(item.extra_attributes) == TransitionRequest(
+        "cut", ctrl.get_next_item("q1", item.queue_item_id).queue_item_id, exit_at=40.0
+    )
+
+
 async def test_an_end_drops_the_transition_request_made_for_the_old_end() -> None:
     """Setting, moving or clearing the end drops a pending request; a clear of nothing keeps it."""
     ctrl = _ctrl()
