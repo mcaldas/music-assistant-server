@@ -72,12 +72,15 @@ _VOCAL_ONSET_SLACK_S = 0.25
 # how many bars past Smart Fades' own exit a phrase may move the exit when no exit is named;
 # further on, A would play its outro alone to keep a late ad-lib
 _MAX_EXIT_DELAY_BARS = 4
-# a bin of the stored, peak-normalized energy (~0.1-0.2s) at or under this is silent, as
-# Smart Fades' sustained energy floor counts it (-40 dB)
-_SILENT_RMS = 0.01
-# a bar whose stored energy sits this far under the track's sustained level (-24 dB) for
+# a bin of the stored energy (~0.1-0.2s) this far under the track's sustained level
+# (-33.5 dB) is near silence once A stops
+_SILENT_FRACTION = 0.021
+# how far into a landing bar such a bin is a gap at the switch; later on it is B's own
+# stop, heard after B has started (48 analysed songs: gaps began by 1.41 beats, stops at 1.96+)
+_LANDING_BEATS = 1.75
+# a bar whose stored energy sits this far under the track's sustained level (-22 dB) for
 # most of it is a soft intro or the start of a fade-in: heard alone after A, near silence
-_QUIET_BAR_FRACTION = 0.063
+_QUIET_BAR_FRACTION = 0.079
 
 
 @dataclass(frozen=True, slots=True)
@@ -476,7 +479,8 @@ class RequestedTransitionPlanner(TransitionPlanner):
         duration = ctx.incoming.analysis.duration
         audible = sung
         if rms is not None and len(rms) and duration:
-            loud = np.flatnonzero(np.asarray(rms, dtype=np.float32) > _SILENT_RMS)
+            bins = np.asarray(rms, dtype=np.float32)
+            loud = np.flatnonzero(bins > _SILENT_FRACTION * sustained_energy_floor(bins))
             if len(loud):
                 audible = min(sung, float(loud[0]) * duration / len(rms))
         return max(0.0, sung - VOCAL_LEFT_PADDING, audible)
@@ -499,7 +503,14 @@ def _at_full(metrics: PlanMetrics) -> PlanMetrics:
 
 
 def _falls_quiet(deck: Deck, start: float, seconds: float = 0.0) -> bool:
-    """Whether the deck's bar, or ``seconds``, from ``start`` has a silent bin or is mostly quiet."""
+    """
+    Whether the deck falls silent from ``start`` before it has started, or stays quiet.
+
+    :param deck: The incoming deck.
+    :param start: Where its bar starts, in its own seconds.
+    :param seconds: A span to judge instead of the bar, silent anywhere in it (one B fades
+        in over).
+    """
     import numpy as np  # noqa: PLC0415
 
     rms = deck.analysis.rms_energy
@@ -508,12 +519,17 @@ def _falls_quiet(deck: Deck, start: float, seconds: float = 0.0) -> bool:
         return False
     bins = np.asarray(rms, dtype=np.float32)
     bin_seconds = duration / len(bins)
+    beat = 60.0 / deck.bpm
     low = int(start / bin_seconds + 0.5)
-    high = int((start + (seconds or deck.beats_per_bar * 60.0 / deck.bpm)) / bin_seconds + 0.5)
+    high = int((start + (seconds or deck.beats_per_bar * beat)) / bin_seconds + 0.5)
+    landing = (
+        high if seconds else max(low + 1, int((start + _LANDING_BEATS * beat) / bin_seconds + 0.5))
+    )
     bar = bins[low:high]
+    floor = sustained_energy_floor(bins)
     # the bins centred in the bar; their median is deaf to a loud bin at its edge (the next
     # bar's onset, as the bins round it)
     return len(bar) > 0 and (
-        float(bar.min()) <= _SILENT_RMS
-        or float(np.median(bar)) < _QUIET_BAR_FRACTION * sustained_energy_floor(bins)
+        float(bins[low:landing].min()) <= _SILENT_FRACTION * floor
+        or float(np.median(bar)) < _QUIET_BAR_FRACTION * floor
     )

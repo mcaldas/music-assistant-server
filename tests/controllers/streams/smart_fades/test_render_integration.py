@@ -471,3 +471,38 @@ async def test_a_sung_pickup_pre_rolls_under_the_outgoing_track(style: str) -> N
     around = window(cut - 2.0, cut + 2.0)[0::2]
     rms = np.sqrt(np.mean(around[: len(around) // 441 * 441].reshape(-1, 441) ** 2, axis=1))
     assert rms.min() > 0.2 / np.sqrt(2) * 10 ** (-30 / 20)
+
+
+@pytest.mark.asyncio
+async def test_a_requested_cut_keeps_the_one_when_the_incoming_track_stops_later() -> None:
+    """B's own stop 2.5 beats into its bar plays after B has started: B enters on its one, the stop where B has it."""
+    fade_out, fade_in = _tone(440.0, 45.0), _tone(1760.0, 45.0)
+    # B's one 1 s in (120 bpm), its own stop from 2.25 s to 2.5 s: beats 2.5 to 3 of the bar
+    fade_in[int(2.25 * SR) * 2 : int(2.5 * SR) * 2] = 0.0
+    inc = _analysis(120.0, 240.0)
+    assert inc.beats is not None
+    assert inc.downbeats is not None
+    assert inc.rms_energy is not None
+    inc.beats = [beat + 1.0 for beat in inc.beats]
+    inc.downbeats = [downbeat + 1.0 for downbeat in inc.downbeats]
+    inc.rms_energy[int(2.25 / 240.0 * 1800) : int(2.5 / 240.0 * 1800)] = [0.001] * 2
+    planner = RequestedTransitionPlanner(
+        logging.getLogger(), TransitionRequest("cut", "n", 0, 224.0)
+    )
+    fade = SmartCrossFade(logging.getLogger(), _analysis(120.0, 240.0), inc, planner)
+    fade.build(fade_out.nbytes, fade_in.nbytes, PCM)
+    chunks = [chunk async for chunk in fade.apply(fade_out.tobytes(), fade_in.tobytes(), PCM)]
+    mix = np.frombuffer(b"".join(chunks), dtype=np.float32)
+    timing = fade.timing_info
+    cut = timing.pre_crossfade_duration + timing.crossfade_duration
+
+    def levels(start_s: float, end_s: float) -> np.ndarray:
+        part = mix[int(start_s * SR) * 2 : int(end_s * SR) * 2][0::2]
+        part = part[: len(part) // 441 * 441].reshape(-1, 441)
+        return 20 * np.log10(np.sqrt(np.mean(part**2, axis=1)) + 1e-12)
+
+    assert planner.outcome == "applied"
+    assert cut == pytest.approx(29.0, abs=0.01)
+    # B sounds from the switch on; its stop comes 1.25 s after it, as B has it after its one
+    assert levels(cut + 0.03, cut + 1.2).min() > -50.0
+    assert levels(cut + 1.3, cut + 1.45).max() < -60.0

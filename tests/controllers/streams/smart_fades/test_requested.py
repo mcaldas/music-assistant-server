@@ -254,6 +254,20 @@ def test_a_quick_fade_under_a_bar_never_fades_a_out_over_silence_of_b() -> None:
     assert plan.fadein_trim_start == pytest.approx(0.1 + 2 * 60.0 / 128.0 - CUT_SECONDS)
 
 
+def test_a_quick_fade_under_a_bar_hears_a_gap_anywhere_in_the_pickup_it_fades_over() -> None:
+    """A gap late in a pickup longer than a landing's beats is still under A's fade: a cut's switch."""
+    # 100 vs 103 BPM: the fade lasts 1.37 s, 2.4 of B's beats; B falls silent 0.3 s before its one
+    one = 0.1 + 3 * 60.0 / 103.0
+    rms = np.full(1800, 0.5, dtype=np.float32)
+    rms[int((one - 0.3) / 240.0 * 1800) : int((one - 0.1) / 240.0 * 1800)] = 0.001
+    inc = _with_pickup(_shifted(_analysis(103.0, rms_energy=rms), 0.1), 3)
+    planner, plan = _plan(_analysis(100.0), inc, "quick_fade", exit_at=224.0)
+
+    assert (planner.outcome, planner.reason) == ("applied", "shortened")
+    assert plan.crossfade_duration == CUT_SECONDS
+    assert plan.fadein_trim_start == pytest.approx(one - CUT_SECONDS)
+
+
 def test_a_quick_fade_under_a_bar_onto_a_later_one_fades_in_the_bar_before_it() -> None:
     """B's first bar falls silent: the fade lands on its next one, over the end of that bar."""
     _, plan = _plan(_analysis(150.0), _silent_after_its_one(), "quick_fade", exit_at=224.0)
@@ -416,7 +430,11 @@ def test_a_cut_lands_on_the_first_downbeat_whose_bar_sounds(level: float, one: f
     assert plan.fadein_trim_start == pytest.approx(one - CUT_SECONDS)
 
 
-@pytest.mark.parametrize(("level", "one"), [(0.015, 17.0), (0.05, 1.0)], ids=["quiet", "soft"])
+@pytest.mark.parametrize(
+    ("level", "one"),
+    [(0.015, 17.0), (0.035, 17.0), (0.05, 1.0)],
+    ids=["quiet", "23-db-under", "soft"],
+)
 def test_a_cut_lands_past_an_intro_too_quiet_to_hear_alone(level: float, one: float) -> None:
     """Eight bars of B 30 dB under the rest, never silent, are near silence once A stops."""
     planner, plan = _plan(_analysis(120.0), _soft_intro(8, level), "cut", exit_at=224.0)
@@ -437,6 +455,41 @@ def test_a_quick_fade_never_leaves_a_quiet_intro_playing_alone(
     planner, _ = _plan(_analysis(120.0), _soft_intro(bars), "quick_fade", exit_at=224.0)
 
     assert (planner.outcome, planner.reason) == (outcome, reason)
+
+
+def _stops_late_in_a_bar(bar: float = 1.0) -> AudioAnalysisData:
+    """Return a track whose one is 1 s in, silent for beats 2.5 to 3 of its bar from ``bar``."""
+    rms = np.full(1800, 0.5, dtype=np.float32)
+    rms[int((bar + 1.25) / 240.0 * 1800) : int((bar + 1.5) / 240.0 * 1800)] = 0.001
+    return _shifted(_analysis(120.0, rms_energy=rms), 1.0)
+
+
+def test_a_cut_keeps_the_one_when_b_stops_later_in_the_bar() -> None:
+    """B's own stop two and a half beats in is heard after B has started: the cut stays on the one."""
+    planner, plan = _plan(_analysis(120.0), _stops_late_in_a_bar(), "cut", exit_at=224.0)
+
+    assert (planner.outcome, planner.reason) == ("applied", None)
+    assert plan.fadein_trim_start == pytest.approx(1.0 - CUT_SECONDS)
+
+
+def test_a_quick_fade_plays_on_into_b_s_own_stop() -> None:
+    """B's own stop late in the bar it plays alone once A has faded out: the quick fade ships."""
+    planner, plan = _plan(_analysis(120.0), _stops_late_in_a_bar(9.0), "quick_fade", exit_at=224.0)
+
+    assert (planner.outcome, planner.reason) == ("applied", None)
+    assert (plan.fadein_trim_start or 0.0) + plan.crossfade_duration == pytest.approx(9.0)
+
+
+def test_a_cut_reads_silence_against_b_s_own_level() -> None:
+    """A loud master's dip in B's first beat, 35.6 dB under its level but 36.5 dB under its peak bin, is a gap."""
+    rms = np.full(1800, 0.9, dtype=np.float32)
+    rms[0] = 1.0
+    rms[int(1.2 / 240.0 * 1800) : int(1.4 / 240.0 * 1800)] = 0.015
+    inc = _shifted(_analysis(120.0, rms_energy=rms), 1.0)
+    planner, plan = _plan(_analysis(120.0), inc, "cut", exit_at=224.0)
+
+    assert (planner.outcome, planner.reason) == ("applied", None)
+    assert plan.fadein_trim_start == pytest.approx(3.0 - CUT_SECONDS)
 
 
 def test_a_cut_reads_the_silence_before_the_one_as_before_it() -> None:
