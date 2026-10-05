@@ -286,6 +286,16 @@ def test_without_an_exit_a_phrase_sung_to_the_end_still_falls_back() -> None:
     assert (planner.outcome, planner.reason) == ("fallback", "vocal")
 
 
+def test_without_an_exit_a_blend_never_walks_back_from_smart_fades_exit() -> None:
+    """Past the end of A's beat grid (226 s) no blend fits; an exit at 224 s would leave A early."""
+    out, inc = _grid_ending_at(_analysis(120.0), 226.0), _analysis(124.0)
+
+    planner, plan = _plan(out, inc, "blend", bars=4)
+
+    assert (planner.outcome, planner.reason) == ("fallback", "no_room")
+    assert plan == SmartCrossFadePlanner(LOGGER).plan(out, inc, 45.0)
+
+
 @pytest.mark.parametrize(("style", "bars"), [("cut", 0), ("blend", 4)])
 def test_a_named_exit_between_phrases_leaves_the_later_phrase_out(style: str, bars: int) -> None:
     """An exit the client names in a gap is applied; A's phrase after it is not played."""

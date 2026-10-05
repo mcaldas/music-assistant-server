@@ -244,6 +244,10 @@ class RequestedTransitionPlanner(TransitionPlanner):
                 (d for d in exits if d >= sung_end - VocalTruncationPolicy.max_truncated_vocal),
                 key=lambda downbeat: (abs(downbeat - ctx.default_anchor), -downbeat),
             ) or [min(exits, key=lambda downbeat: abs(downbeat - ctx.default_anchor))]
+            # when that one does not plan only later ones are tried: an earlier exit keeps no
+            # phrase whole that it does not, it would only leave A sooner (a blend past the end
+            # of A's beat grid fails on every later downbeat)
+            tries = [downbeat for downbeat in tries if downbeat >= tries[0]]
         first_reason = None
         for exit_s in tries:
             self.outcome, self.reason = "applied", None
