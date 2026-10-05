@@ -831,7 +831,7 @@ def _outro_from(seconds: float) -> np.ndarray:
     return rms
 
 
-@pytest.mark.parametrize(("style", "bars"), [("cut", 0), ("blend", 4)])
+@pytest.mark.parametrize(("style", "bars"), [("cut", 0), ("blend", 4), ("echo_out", 0)])
 def test_without_an_exit_a_sung_phrase_moves_the_exit_past_it(style: str, bars: int) -> None:
     """Smart Fades' exit (228 s) is inside A's last phrase: the first downbeat after it is used."""
     out = _with_vocal_activity(_analysis(120.0, rms_energy=_outro_from(228.0)), [(215.0, 231.5)])
@@ -1065,6 +1065,19 @@ def test_echo_out_repeats_the_outgoing_tracks_real_last_beat(grid: float, bpm: f
     assert plan.echo_out is not None
     assert plan.echo_out.beat == pytest.approx(grid, abs=1e-3)
     assert (plan.echo_out.period, plan.echo_out.repeats) == (0.5, 8)
+
+
+def test_echo_out_repeats_on_the_incoming_tracks_real_beat() -> None:
+    """B's grid running slower than its bpm says: the repeats keep to the grid's beat."""
+    inc = _analysis(120.0)
+    assert inc.beats is not None
+    inc.beats = [index * 0.52 for index in range(len(inc.beats))]
+    inc.downbeats = inc.beats[::4]
+    planner, plan = _plan(_analysis(120.0), inc, "echo_out", exit_at=224.0)
+
+    assert planner.outcome == "applied"
+    assert plan.echo_out is not None
+    assert plan.echo_out.period == pytest.approx(0.52, abs=1e-3)
 
 
 @pytest.mark.parametrize("bpm", [95.0, 128.0, 174.0])

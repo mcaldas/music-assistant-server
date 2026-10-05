@@ -784,12 +784,12 @@ def _grid_beat(times: list[float], nominal: float) -> float:
     """
     Return the beat a run of consecutive grid times plays at, or ``nominal`` (the bpm's).
 
-    One beat of the grid is a whole number of the analysis' 20 ms frames, so the run's mean
-    beat stands in for the bpm only where it departs from it by more than that error.
+    The run's mean beat is returned only where it departs from ``nominal`` by more than
+    ``_GRID_TEMPO_SLACK``: nearer, it can be the rounding of the analysis' 20 ms frames.
 
     :param times: Consecutive beat times of one track's grid, in order.
-    :param nominal: The beat its bpm gives; also the answer where the run has a gap or an
-        extra beat, or is too short to measure.
+    :param nominal: The beat its bpm gives; also the answer for a run of fewer than two
+        times, or with a step more than half a beat off ``nominal`` (a gap or an extra beat).
     """
     gaps = [later - earlier for earlier, later in itertools.pairwise(times)]
     if not gaps or any(abs(gap / nominal - 1.0) > 0.5 for gap in gaps):
