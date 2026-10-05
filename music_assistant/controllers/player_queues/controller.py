@@ -545,8 +545,9 @@ class PlayerQueuesController(QueueLoaderMixin, PlaybackTrackerMixin, StreamFeede
         :param style: "blend", "quick_fade" or "cut"; "auto" drops the request.
         :param bars: Blend length in bars of the outgoing track: 1, 2, 4, 8 or 16. Blend only.
         :param exit_at: Second of the outgoing track where its audio should end, moved to the
-            nearest downbeat; within its last 45 s (half the track when shorter). 0 lets Smart
-            Fades choose.
+            nearest downbeat; within its last 45 s (half the track when shorter). A sung phrase
+            after it is left out; one it cuts into falls back ("vocal"). 0 lets Smart Fades
+            choose, moved to the nearest downbeat no sung phrase runs past.
         """
         self._check_player_permission(queue_id)
         if (

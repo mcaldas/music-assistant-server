@@ -32,7 +32,13 @@ from .candidates import (
 )
 from .context import TIME_STRETCH_BPM_PERCENTAGE_THRESHOLD, build_transition_context, choose_tier
 from .planner import SmartCrossFadePlanner, TransitionPlanner
-from .policies import AudibleTrimPolicy, OverlapPreferencePolicy, default_policies
+from .policies import (
+    AudibleTrimPolicy,
+    OverlapPreferencePolicy,
+    Verdict,
+    VocalTruncationPolicy,
+    default_policies,
+)
 from .selection import CandidateSelector
 
 if TYPE_CHECKING:
@@ -124,13 +130,32 @@ class TransitionRequest:
         return request
 
 
+class _PhraseCutPolicy(VocalTruncationPolicy):
+    """Reject an exit inside an outgoing vocal phrase; later phrases are left out, not cut."""
+
+    def evaluate(self, candidate: Candidate, ctx: TransitionContext) -> Verdict:
+        """Judge one candidate against the shared per-transition context."""
+        if ctx.vocal_out_scoring is None:
+            return Verdict.ok()
+        exit_s = candidate.plan.fade_out_window
+        if any(
+            left < exit_s and min(right, ctx.audio_end) - exit_s > self.max_truncated_vocal
+            for left, right in ctx.vocal_out_scoring.windows
+        ):
+            return Verdict.reject("cuts into an audible outgoing vocal phrase")
+        return Verdict.ok()
+
+
 class RequestedTransitionPlanner(TransitionPlanner):
     """
     Plans the transition an API client asked for, from Smart Fades' own pieces.
 
     Unlike the default planner it may leave the outgoing track early, at the requested
-    downbeat inside the held tail. It adds no effects. A request it cannot honour ships the
-    default planner's plan; ``outcome`` and ``reason`` say what happened.
+    downbeat inside the held tail; a sung phrase after that exit is left out, one the exit
+    cuts into is refused. Without a requested exit it leaves at the default planner's, moved
+    to the nearest downbeat no sung phrase runs past. It adds no effects. A request it
+    cannot honour ships the default planner's plan; ``outcome`` and ``reason`` say what
+    happened.
     """
 
     def __init__(
@@ -192,26 +217,54 @@ class RequestedTransitionPlanner(TransitionPlanner):
         return plan
 
     def _plan_request(self, ctx: TransitionContext) -> TransitionPlan | None:
-        """Build the requested plan, or None (outcome fallback) to ship the default one."""
+        """Build the requested plan on the first exit that takes it, or None (fallback)."""
         bar_out = ctx.outgoing.beats_per_bar * 60.0 / ctx.outgoing.bpm
         exits = [
             downbeat
             for downbeat in ctx.protective_downbeats
             if CUT_SECONDS < downbeat <= ctx.audio_end
         ]
-        # buffer-local; without exit_at, the downbeat nearest the default planner's exit
-        target = (
-            self.request.exit_at - ctx.buffer_offset if self.request.exit_at else ctx.default_anchor
-        )
-        exit_s = min(exits, key=lambda downbeat: abs(downbeat - target)) if exits else None
-        if exit_s is None or (self.request.exit_at and abs(exit_s - target) > bar_out / 2):
-            # no downbeat of A near the asked exit in the tail it holds
+        if not exits:
             self._fallback("no_room")
             return None
-        # the request sets the exit and the length: the policies judging those stand down
+        if self.request.exit_at:
+            # buffer-local; the client's exit is kept: only the downbeat nearest it is tried
+            target = self.request.exit_at - ctx.buffer_offset
+            exit_s = min(exits, key=lambda downbeat: abs(downbeat - target))
+            if abs(exit_s - target) > bar_out / 2:
+                # no downbeat of A near the asked exit in the tail it holds
+                self._fallback("no_room")
+                return None
+            tries = [exit_s]
+        else:
+            # A's phrases are kept whole: the exit moves from Smart Fades' own to the nearest
+            # downbeat no sung phrase of A runs past (the later one on a tie)
+            sung_end = ctx.vocal_out_scoring.last_end() if ctx.vocal_out_scoring else 0.0
+            tries = sorted(
+                (d for d in exits if d >= sung_end - VocalTruncationPolicy.max_truncated_vocal),
+                key=lambda downbeat: (abs(downbeat - ctx.default_anchor), -downbeat),
+            ) or [min(exits, key=lambda downbeat: abs(downbeat - ctx.default_anchor))]
+        first_reason = None
+        for exit_s in tries:
+            self.outcome, self.reason = "applied", None
+            if (plan := self._plan_exit(ctx, exits, exit_s, bar_out)) is not None:
+                return plan
+            # the nearest exit's reason is the one reported when none works
+            first_reason = first_reason or self.reason
+        self._fallback(first_reason or "no_room")
+        return None
+
+    def _plan_exit(
+        self, ctx: TransitionContext, exits: list[float], exit_s: float, bar_out: float
+    ) -> TransitionPlan | None:
+        """Build the requested plan ending on ``exit_s``, or None with the reason recorded."""
+        # the request sets the exit and the length: the policies judging those stand down;
+        # an exit the client named leaves A's later phrases out, so only a cut into one counts
         selector = CandidateSelector(
             [
-                policy
+                _PhraseCutPolicy()
+                if self.request.exit_at and isinstance(policy, VocalTruncationPolicy)
+                else policy
                 for policy in default_policies()
                 if not isinstance(policy, (AudibleTrimPolicy, OverlapPreferencePolicy))
             ],

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 
+import numpy as np
 import pytest
 
 from music_assistant.controllers.streams.smart_fades.models import TransitionPlan, TransitionTier
@@ -253,6 +254,49 @@ def test_a_request_that_cuts_the_outgoing_vocal_ships_the_default_plan() -> None
     planner, plan = _plan(out, inc, "cut", exit_at=231.0)
     assert planner.outcome == "applied"
     assert TAIL_START + plan.fade_out_window == pytest.approx(230.0)
+
+
+def _outro_from(seconds: float) -> np.ndarray:
+    """Return a 240 s track's energy, dropping at ``seconds``: Smart Fades' own exit is there."""
+    rms = np.full(1800, 0.5, dtype=np.float32)
+    rms[0] = 1.0
+    rms[int(seconds / 240.0 * 1800) :] = 0.1
+    return rms
+
+
+@pytest.mark.parametrize(("style", "bars"), [("cut", 0), ("blend", 4)])
+def test_without_an_exit_a_sung_phrase_moves_the_exit_past_it(style: str, bars: int) -> None:
+    """Smart Fades' exit (228 s) is inside A's last phrase: the first downbeat after it is used."""
+    out = _with_vocal_activity(_analysis(120.0, rms_energy=_outro_from(228.0)), [(215.0, 231.5)])
+
+    planner, plan = _plan(out, _analysis(120.0), style, bars=bars)
+
+    assert (planner.outcome, planner.reason) == ("applied", None)
+    assert TAIL_START + plan.fade_out_window == pytest.approx(232.0)
+
+
+def test_without_an_exit_a_phrase_sung_to_the_end_still_falls_back() -> None:
+    """Sung past its last downbeat (239 s), A has no exit that keeps the phrase whole."""
+    out = _with_vocal_activity(
+        _shifted(_analysis(120.0, rms_energy=_outro_from(228.0)), 1.0), [(215.0, 239.9)]
+    )
+
+    planner, _ = _plan(out, _analysis(120.0), "cut")
+
+    assert (planner.outcome, planner.reason) == ("fallback", "vocal")
+
+
+@pytest.mark.parametrize(("style", "bars"), [("cut", 0), ("blend", 4)])
+def test_a_named_exit_between_phrases_leaves_the_later_phrase_out(style: str, bars: int) -> None:
+    """An exit the client names in a gap is applied; A's phrase after it is not played."""
+    out = _with_vocal_activity(_analysis(120.0), [(200.0, 213.5), (222.0, 230.0)])
+
+    planner, plan = _plan(out, _analysis(120.0), style, bars=bars, exit_at=216.0)
+
+    assert (planner.outcome, planner.reason) == ("applied", None)
+    assert TAIL_START + plan.fade_out_window == pytest.approx(216.0)
+    if style == "blend":
+        assert plan.tier is not TransitionTier.QUICK_FADE
 
 
 @pytest.mark.parametrize(
