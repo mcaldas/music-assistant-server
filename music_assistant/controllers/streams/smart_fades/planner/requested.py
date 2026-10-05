@@ -48,10 +48,11 @@ REQUEST_PREFIX = "requested_transition_"
 REQUEST_STYLES = ("blend", "quick_fade", "cut")
 # a cut's overlap: just long enough to keep the switch click-free
 CUT_SECONDS = 0.02
-# the shortest tempo ramp a requested blend ships; the factory fits one into the
-# (up to) 10s before the overlap
-_MIN_RAMP_SECONDS = 8.0
-# how far apart two unramped decks' beats may drift over a requested quick fade
+# the shortest tempo ramp a requested blend ships; the factory fits one into the (up to)
+# 10s before the overlap, and clips it at the tail's start (a 16-bar blend's spans ~7.7s)
+_MIN_RAMP_SECONDS = 6.0
+# how far apart two unramped decks' beats may drift over a requested quick fade; it never
+# gets shorter than a bar, so far-apart tempos drift more, as in the default quick fade
 _QUICK_FADE_DRIFT_S = 0.04
 # a vocal window starting this little before B's one is the 1800-bin timeline's
 # rounding, not a pickup

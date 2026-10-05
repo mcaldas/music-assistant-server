@@ -114,7 +114,7 @@ def test_a_blend_always_keeps_room_for_its_tempo_ramp(exit_at: float, bars: int)
 
     assert (planner.outcome, planner.reason) == ("applied", None if bars == 8 else "shortened")
     steps = plan.tempo_plan.steps
-    assert steps[-1][0] - steps[0][0] >= 8.0
+    assert steps[-1][0] - steps[0][0] >= 6.0
     assert _bars_of_outgoing(plan, 92.0) == pytest.approx(bars, abs=0.01)
 
 
@@ -129,7 +129,7 @@ def test_a_blend_past_the_end_of_the_beat_grid_never_ships_short(bars: int, exit
         assert plan.crossfade_duration > 0.0
         assert _bars_of_outgoing(plan, 120.0) >= bars - 0.5
         steps = plan.tempo_plan.steps
-        assert steps[-1][0] - steps[0][0] >= 8.0
+        assert steps[-1][0] - steps[0][0] >= 6.0
     else:
         assert planner.reason == "no_room"
 
