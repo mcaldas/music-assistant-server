@@ -1021,6 +1021,18 @@ def test_echo_out_needs_a_bar_of_the_incoming_head_for_its_tail(
         assert plan == SmartCrossFadePlanner(LOGGER).plan(out, inc, 45.0)
 
 
+def test_echo_out_rings_from_the_one_its_cut_lands_on() -> None:
+    """B falls silent after its first one: the echo starts on the next, and fits from there."""
+    planner, plan = _plan(
+        _analysis(120.0), _silent_after_its_one(), "echo_out", exit_at=224.0, fade_in_seconds=5.0
+    )
+
+    assert (planner.outcome, planner.reason) == ("applied", None)
+    assert plan.fadein_trim_start == pytest.approx(3.0 - CUT_SECONDS)
+    # four repeats from 3 s fill the 5 s of B the mix receives
+    assert plan.echo_out == EchoOut(beat=0.5, period=0.5, repeats=4)
+
+
 def test_without_an_exit_an_echo_never_rings_the_phrase_end_over_the_incoming_vocal() -> None:
     """A's last beat before the phrase-end exit is sung and B sings from its one: a bar later."""
     out = _with_vocal_activity(_analysis(120.0, rms_energy=_outro_from(228.0)), [(215.0, 231.9)])

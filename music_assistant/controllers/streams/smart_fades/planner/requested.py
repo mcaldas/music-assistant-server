@@ -630,7 +630,8 @@ class RequestedTransitionPlanner(TransitionPlanner):
     def _with_echo(self, ctx: TransitionContext, plan: TransitionPlan) -> TransitionPlan | None:
         """Ring the cut's last outgoing beat on under the incoming track, or None to fall back."""
         exit_s, entry = plan.fade_out_window, plan.fadein_trim_start or 0.0
-        b_one = float(ctx.incoming.downbeats[0]) if len(ctx.incoming.downbeats) else 0.0
+        # the one the cut lands on: B's first, or a later one when B falls silent after it
+        b_one = next((float(d) for d in ctx.incoming.downbeats if d >= entry), 0.0)
         bar = ctx.incoming.beats_per_bar
         out_beat, in_beat = 60.0 / ctx.outgoing.bpm, 60.0 / ctx.incoming.bpm
         # A's last beat before the exit, from the bars of its grid before it (its tempo can
