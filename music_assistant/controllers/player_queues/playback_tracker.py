@@ -48,6 +48,7 @@ from music_assistant.controllers.player_queues.helpers import (
     find_dynamic_source,
     get_current_playback_speed,
 )
+from music_assistant.controllers.streams.audio import get_end_position
 from music_assistant.controllers.streams.smart_fades.planner.requested import REQUEST_PREFIX
 from music_assistant.controllers.webserver.helpers.auth_middleware import (
     set_current_user,
@@ -286,7 +287,7 @@ class PlaybackTrackerMixin(_PlayerQueuesBase):
             self._handle_end_of_queue(queue, prev_state, new_state)
 
         # an item that stops being current has passed its boundary: a transition request
-        # still on it was never used and must not apply on a later pass, and its transition
+        # or an end position still on it must not apply on a later pass, and its transition
         # report describes this pass only
         if (
             "current_item_id" in changed_keys
@@ -294,7 +295,12 @@ class PlaybackTrackerMixin(_PlayerQueuesBase):
             and (prev_item := self.get_item(queue_id, prev_item_id)) is not None
         ):
             attrs = prev_item.extra_attributes
-            stale = [key for key in attrs if key.startswith(("transition_", REQUEST_PREFIX))]
+            self.mass.streams.audio.read_positions.pop(prev_item_id, None)
+            stale = [
+                key
+                for key in attrs
+                if key == "end_position" or key.startswith(("transition_", REQUEST_PREFIX))
+            ]
             for key in stale:
                 del attrs[key]
             if stale:
@@ -578,6 +584,8 @@ class PlaybackTrackerMixin(_PlayerQueuesBase):
         # For non-flow mode, use prev_state values since queue state may have been updated/reset
         if prev_item and (streamdetails := prev_item.streamdetails):
             duration = streamdetails.duration or prev_item.duration or 24 * 3600
+            # an item that ends early (set_end_position) has played out at its end
+            duration = int(get_end_position(prev_item) or duration)
         elif prev_item:
             duration = prev_item.duration or 24 * 3600
         else:

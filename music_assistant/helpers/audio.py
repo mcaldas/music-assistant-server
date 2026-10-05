@@ -155,6 +155,37 @@ def align_audio_to_frame_boundary(audio_data: bytes, pcm_format: AudioFormat) ->
     return audio_data
 
 
+def fade_out_pcm(audio: bytes, pcm_format: AudioFormat, end: int, length: int) -> bytes:
+    """
+    Return PCM audio with a linear fade to silence that reaches it at byte ``end``.
+
+    The fade covers the ``length`` bytes before ``end``, which may reach outside ``audio``,
+    so a fade that spans several chunks is applied chunk by chunk with each chunk's own
+    ``end``. Audio outside the fade is returned unchanged.
+
+    :param audio: Frame-aligned interleaved little-endian PCM (integer or float samples).
+    :param pcm_format: Format of the audio.
+    :param end: Offset in bytes from the start of ``audio`` where the fade reaches silence.
+    :param length: Length of the fade in bytes, a whole number of frames.
+    """
+    start, stop = max(0, end - length), min(len(audio), end)
+    if start >= stop:
+        return audio
+    import numpy as np  # noqa: PLC0415
+
+    width = pcm_format.bit_depth // 8
+    samples = np.frombuffer(audio[start:stop], dtype=np.uint8).reshape(-1, width)
+    if width == 3:
+        # no numpy type holds packed 24-bit samples: widen them to the top of an int32
+        samples = np.pad(samples, ((0, 0), (1, 0)))
+    floating = pcm_format.content_type in (ContentType.PCM_F32LE, ContentType.PCM_F64LE)
+    dtype = np.dtype(f"<{'f' if floating else 'i'}{samples.shape[1]}")
+    frames = samples.view(dtype).reshape(-1, pcm_format.channels)
+    gain = (end - start - width * pcm_format.channels * np.arange(len(frames))) / length
+    faded = (frames * gain[:, None]).astype(dtype).view(np.uint8).reshape(samples.shape)
+    return audio[:start] + faded[:, -width:].tobytes() + audio[stop:]
+
+
 async def strip_silence(
     audio_data: bytes,
     pcm_format: AudioFormat,

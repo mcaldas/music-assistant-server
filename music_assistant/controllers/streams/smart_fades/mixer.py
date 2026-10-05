@@ -18,6 +18,7 @@ from music_assistant.controllers.streams.smart_fades.fades import (
     StandardCrossFade,
 )
 from music_assistant.controllers.streams.smart_fades.helpers import (
+    analysis_until,
     audible_start,
     audible_windows,
     detect_effective_audio_end,
@@ -70,6 +71,7 @@ class SmartFadesMixer:
         fade_out_data: bytes,
         fade_in_bytes_len: int,
         request: TransitionRequest | None = None,
+        fade_out_end: float | None = None,
     ) -> SmartFade:
         """
         Pick the SmartFade implementation, prime its filters, and return it.
@@ -88,6 +90,8 @@ class SmartFadesMixer:
         :param fade_in_bytes_len: Expected length in bytes of the fade-in input.
         :param request: A client's request for this transition, planned instead of the
             default smart fade in SMART_CROSSFADE mode.
+        :param fade_out_end: Media second where the outgoing tail ends, when the outgoing
+            item ends early (``set_end_position``); its analysis is cut there.
         """
         # degradation chain: smart-crossfade → standard; richer modes prepend their builder
         smart_fade: SmartFade | None = None
@@ -100,6 +104,7 @@ class SmartFadesMixer:
                 fade_in_bytes_len=fade_in_bytes_len,
                 pcm_format=pcm_format,
                 request=request,
+                fade_out_end=fade_out_end,
             )
         if smart_fade is None:
             smart_fade = await self._build_standard_crossfade(
@@ -227,6 +232,7 @@ class SmartFadesMixer:
         fade_in_bytes_len: int,
         pcm_format: AudioFormat,
         request: TransitionRequest | None = None,
+        fade_out_end: float | None = None,
     ) -> tuple[SmartFade | None, AudioAnalysisData | None]:
         """
         Attempt to build a SmartCrossFade and retain outgoing analysis for fallback.
@@ -237,6 +243,9 @@ class SmartFadesMixer:
         """
         analyses = await self._load_analyses(fade_out_streamdetails, fade_in_streamdetails)
         fade_out_analysis, fade_in_analysis = analyses
+        if fade_out_analysis is not None and fade_out_end is not None:
+            # the item plays only until fade_out_end: its held tail ends there
+            fade_out_analysis = analysis_until(fade_out_analysis, fade_out_end)
         if not (
             fade_out_analysis
             and fade_in_analysis

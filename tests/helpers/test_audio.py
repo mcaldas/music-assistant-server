@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import struct
 from collections.abc import AsyncGenerator
 from types import SimpleNamespace
 from unittest.mock import MagicMock
@@ -15,6 +16,7 @@ from music_assistant.helpers import audio as audio_helper
 from music_assistant.helpers.audio import (
     build_concat_filelist,
     calculate_content_length,
+    fade_out_pcm,
     get_output_format_key,
     parse_loudnorm,
     realtime_pcm_pacer,
@@ -167,3 +169,48 @@ def test_the_content_length_key_moves_with_the_encoder_settings(
     monkeypatch.setattr(audio_helper, "OUTPUT_ENCODING_REVISION", 99)
 
     assert get_output_format_key(fmt) != before
+
+
+@pytest.mark.parametrize(
+    ("content_type", "bit_depth", "level"),
+    [
+        (ContentType.PCM_S16LE, 16, -16384),
+        (ContentType.PCM_S24LE, 24, -(1 << 22)),
+        (ContentType.PCM_S32LE, 32, -(1 << 30)),
+        (ContentType.PCM_F32LE, 32, -0.5),
+        (ContentType.PCM_F64LE, 64, -0.5),
+    ],
+)
+def test_fade_out_pcm_ramps_every_sample_type_to_silence(
+    content_type: ContentType, bit_depth: int, level: float
+) -> None:
+    """A fade spread over two chunks is the same straight ramp to silence as over one."""
+    pcm_format = AudioFormat(
+        content_type=content_type, bit_depth=bit_depth, sample_rate=1000, channels=2
+    )
+    width = bit_depth // 8
+    frame = 2 * width
+    floating = isinstance(level, float)
+    float_code = "<f" if width == 4 else "<d"
+
+    def _sample(data: bytes, index: int) -> float:
+        raw = data[index * width : (index + 1) * width]
+        if floating:
+            return float(struct.unpack(float_code, raw)[0])
+        return int.from_bytes(raw, "little", signed=True)
+
+    one = (
+        struct.pack(float_code, level)
+        if floating
+        else int(level).to_bytes(width, "little", signed=True)
+    )
+    audio = one * 200  # 100 frames
+    fade = 20 * frame
+    whole = fade_out_pcm(audio, pcm_format, len(audio), fade)
+    head, tail = audio[: 90 * frame], audio[90 * frame :]
+    split = fade_out_pcm(head, pcm_format, len(audio), fade)
+    assert split + fade_out_pcm(tail, pcm_format, len(tail), fade) == whole
+    assert whole[: 80 * frame] == audio[: 80 * frame]
+    assert [_sample(whole, 2 * index + 1) for index in range(80, 100)] == pytest.approx(
+        [level * (100 - index) / 20 for index in range(80, 100)], abs=1e-6 if floating else 1
+    )

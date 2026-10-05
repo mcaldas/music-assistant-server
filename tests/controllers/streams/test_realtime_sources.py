@@ -350,7 +350,8 @@ def test_nothing_is_held_back_until_the_source_has_delivered_it_all() -> None:
         return cast(
             "Any",
             SimpleNamespace(
-                streamdetails=SimpleNamespace(buffer=buffer, duration=300, seek_position=0)
+                streamdetails=SimpleNamespace(buffer=buffer, duration=300, seek_position=0),
+                extra_attributes={},
             ),
         )
 

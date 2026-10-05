@@ -112,3 +112,10 @@ def test_same_album_is_crossfaded_when_the_user_allows_it() -> None:
         _queue_item("track-2", PROVIDER_ALBUM),
         allow_same_album=True,
     )
+
+
+def test_an_item_ended_early_is_crossfaded_into_its_album() -> None:
+    """An item cut short by its end position is no gapless seam, so it gets its fade."""
+    current = _queue_item("track-1", PROVIDER_ALBUM)
+    current.extra_attributes["end_position"] = 120.0
+    assert _crossfade_allowed(current, _queue_item("track-2", PROVIDER_ALBUM))

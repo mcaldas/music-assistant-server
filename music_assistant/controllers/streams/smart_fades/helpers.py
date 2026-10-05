@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from dataclasses import replace
+from typing import TYPE_CHECKING, Any
 
 from music_assistant_models.enums import ContentType
 
@@ -10,6 +11,8 @@ if TYPE_CHECKING:
     import numpy as np
     import numpy.typing as npt
     from music_assistant_models.media_items import AudioFormat
+
+    from music_assistant.models.audio_analysis import AudioAnalysisData
 
 # Buffer size in seconds for crossfade analysis
 SMART_CROSSFADE_DURATION = 45
@@ -68,6 +71,49 @@ def detect_effective_audio_end(
         float((start_bin + audible[-1] + 1) * bin_duration)
         - max(0.0, track_duration - buffer_duration),
         buffer_duration,
+    )
+
+
+def analysis_until(analysis: AudioAnalysisData, end: float) -> AudioAnalysisData:
+    """
+    Return a track's analysis as if the track ended at ``end`` (media seconds).
+
+    For a queue item played only up to ``end``: the planner then holds the tail that
+    really ends there. Grids are cut at ``end``; the per-bin envelopes keep their bin
+    count (``band_rms`` and ``vocal_activity`` must stay 1800 bins) and are re-binned
+    over ``[0, end]``, each new bin taking the source bin under its centre.
+    The analysis is returned unchanged when ``end`` is not before its end.
+
+    :param analysis: The track's stored analysis; never modified.
+    :param end: Media second where the track's audio ends.
+    """
+    duration = analysis.duration
+    if not duration or end >= duration:
+        return analysis
+
+    def rebin(envelope: Any) -> Any:
+        if not isinstance(envelope, list) or not envelope:
+            return envelope
+        bins = len(envelope)
+        return [envelope[min(bins - 1, int((i + 0.5) * end / duration))] for i in range(bins)]
+
+    extra_data = dict(analysis.extra_data or {})
+    if isinstance(extra_data.get("band_rms"), dict):
+        extra_data["band_rms"] = {
+            band: rebin(envelope) for band, envelope in extra_data["band_rms"].items()
+        }
+    if "vocal_activity" in extra_data:
+        extra_data["vocal_activity"] = rebin(extra_data["vocal_activity"])
+    return replace(
+        analysis,
+        duration=end,
+        beats=None if analysis.beats is None else [b for b in analysis.beats if b <= end],
+        downbeats=(
+            None if analysis.downbeats is None else [d for d in analysis.downbeats if d <= end]
+        ),
+        rms_energy=rebin(analysis.rms_energy),
+        spectral_centroid=rebin(analysis.spectral_centroid),
+        extra_data=extra_data if analysis.extra_data is not None else None,
     )
 
 

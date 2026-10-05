@@ -87,6 +87,7 @@ from music_assistant.controllers.player_queues.queue_loader import QueueLoaderMi
 from music_assistant.controllers.player_queues.smart_shuffle import SmartShuffle
 from music_assistant.controllers.player_queues.state import PlayerQueueData
 from music_assistant.controllers.player_queues.stream_feeder import StreamFeederMixin
+from music_assistant.controllers.streams.audio import get_end_position
 from music_assistant.controllers.streams.smart_fades.helpers import SMART_CROSSFADE_DURATION
 from music_assistant.controllers.streams.smart_fades.planner.candidates import RUNG_LADDER
 from music_assistant.controllers.streams.smart_fades.planner.requested import (
@@ -551,9 +552,10 @@ class PlayerQueuesController(QueueLoaderMixin, PlaybackTrackerMixin, StreamFeede
         :param bars: Overlap in bars of the outgoing track: 1, 2, 4, 8 or 16. Blend and
             filter_sweep only.
         :param exit_at: Second of the outgoing track where its audio should end, moved to the
-            nearest downbeat; within its last 45 s (half the track when shorter). A sung phrase
-            after it is left out; one it cuts into falls back ("vocal"). 0 lets Smart Fades
-            choose, moved to the nearest downbeat no sung phrase runs past.
+            nearest downbeat; within its last 45 s, before its end position when one is set
+            (half of what plays when shorter). A sung phrase after it is left out; one it cuts
+            into falls back ("vocal"). 0 lets Smart Fades choose, moved to the nearest downbeat
+            no sung phrase runs past.
         """
         self._check_player_permission(queue_id)
         if (
@@ -584,8 +586,10 @@ class PlayerQueuesController(QueueLoaderMixin, PlaybackTrackerMixin, StreamFeede
                 self.signal_update(queue_id)
             return
         if exit_at and queue_item.duration:
-            window = min(float(SMART_CROSSFADE_DURATION), queue_item.duration / 2)
-            if not queue_item.duration - window < exit_at <= queue_item.duration:
+            # an item that ends early (set_end_position) ends its transition there
+            stop = get_end_position(queue_item) or queue_item.duration
+            window = min(float(SMART_CROSSFADE_DURATION), stop / 2)
+            if not stop - window < exit_at <= stop:
                 raise InvalidDataError(f"exit_at must be in the last {window:.0f}s of the item")
         if next_item is None:
             raise QueueEmpty(f"No item after {queue_item_id} to transition into")
@@ -602,6 +606,54 @@ class PlayerQueuesController(QueueLoaderMixin, PlaybackTrackerMixin, StreamFeede
             TransitionRequest(style, next_item.queue_item_id, bars, exit_at).to_attributes()
         )
         self.signal_update(queue_id)
+
+    @api_command("player_queues/set_end_position", required_scope=Scope.QUEUES_CONTROL)
+    async def set_end_position(
+        self, queue_id: str, queue_item_id: str, position: float = 0.0
+    ) -> None:
+        """
+        Make a queue item's audio end at a chosen second, before its natural end.
+
+        The item's stream stops at ``position`` with a short fade-out, and its transition
+        into the next item plays there: Smart Fades plans it in the item's last 45 s before
+        ``position``, and a ``set_transition`` exit_at must lie in that stretch. Setting,
+        moving or clearing the end drops a transition request pending on the item, as it was
+        made for the old end: send it again afterwards. The end is stored on the item as the
+        ``end_position`` extra attribute and lapses when the item stops playing; a seek past
+        it plays the rest of the item.
+
+        The audio is read well ahead of the player, so an end it has already been read past
+        is refused, and so is one inside the start of an item that a planned fade already
+        blends in. A boundary, and with it the item after it and that item's end, is fixed
+        about 105 s before the item's end is heard (on Sonos with Smart Fades). For parts
+        shorter than that, keep two items queued ahead with their ends set, and treat the
+        next item as fixed once the queue's ``index_in_buffer`` reaches it.
+
+        :param queue_id: Queue the item is in.
+        :param queue_item_id: Item whose audio should end early.
+        :param position: Second of the item where its audio should end; 0 clears the end.
+        """
+        self._check_player_permission(queue_id)
+        if position < 0:
+            raise InvalidDataError(f"Invalid end position: {position}")
+        if self.get(queue_id) is None:
+            raise PlayerUnavailableError(f"Queue {queue_id} is not available")
+        if (queue_item := self.get_item(queue_id, queue_item_id)) is None:
+            raise InvalidDataError(f"Queue item {queue_item_id} not found in queue")
+        if queue_item.media_type != MediaType.TRACK or not queue_item.duration:
+            raise InvalidCommand("An end can be set only on a track with a known duration")
+        if position >= queue_item.duration:
+            raise InvalidDataError(f"The end must be before the item's {queue_item.duration}s")
+        read = self.mass.streams.audio.read_positions.get(queue_item_id)
+        if read is not None and (position or float("inf")) <= read:
+            raise ActionUnavailable("The item's audio has already been read past that point")
+        attributes = queue_item.extra_attributes
+        if position:
+            attributes["end_position"] = round(position, 3)
+        elif attributes.pop("end_position", None) is None:
+            return
+        TransitionRequest.drop(attributes)
+        self.signal_update(queue_id, items_changed=True)
 
     @api_command(
         "player_queues/play_media", required_scope=Scope.QUEUES_CONTROL, allow_impersonation=True
@@ -1819,6 +1871,10 @@ class PlayerQueuesController(QueueLoaderMixin, PlaybackTrackerMixin, StreamFeede
                 stream_duration = remaining if remaining > 0 else None
         else:
             duration = queue_item.duration
+        if duration and (end := get_end_position(queue_item)) is not None and end < duration:
+            # an item that ends early (set_end_position) hands the player only that much
+            seek = queue_item.streamdetails.seek_position if queue_item.streamdetails else 0
+            stream_duration = int(end - seek)
         if queue_data.session_id is None:
             raise InvalidDataError("Queue session_id is None")
         media = PlayerMedia(

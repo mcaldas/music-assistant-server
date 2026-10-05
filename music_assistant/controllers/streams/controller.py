@@ -76,7 +76,11 @@ from music_assistant.controllers.streams.announcements import (
     DEFAULT_RENDER_TIMEOUT,
     AnnouncementRenderer,
 )
-from music_assistant.controllers.streams.audio import StreamsAudio, overlay_active
+from music_assistant.controllers.streams.audio import (
+    StreamsAudio,
+    get_end_position,
+    overlay_active,
+)
 from music_assistant.controllers.streams.audio_analysis import AudioAnalysisController
 from music_assistant.controllers.streams.audio_processing import (
     AudioProcessingManager,
@@ -908,7 +912,8 @@ class StreamsController(CoreController):
                 # estimate content length based on effective duration
                 # account for seek position (e.g., crossfade from previous track)
                 seek_pos = queue_item.streamdetails.seek_position if queue_item.streamdetails else 0
-                effective_duration = max(queue_item.duration - seek_pos, 1)
+                stop = get_end_position(queue_item) or queue_item.duration
+                effective_duration = max(stop - seek_pos, 1)
                 # use cached actual bytes-per-second if available (from a previous stream)
                 resp.content_length = await get_content_length(
                     self.mass, queue_item.uri, output_format, effective_duration
