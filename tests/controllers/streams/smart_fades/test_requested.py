@@ -424,6 +424,22 @@ def test_a_quick_fade_under_a_bar_fades_over_a_sung_pickup_onto_the_one() -> Non
     assert not plan.tempo_plan
 
 
+def test_a_quick_fade_under_a_bar_holds_a_over_a_break_in_a_sung_pickup() -> None:
+    """B sings to 1.44 s and breaks from 1.47 s to near its one at 1.94 s: A plays on at full."""
+    rms = np.full(1800, 0.5, dtype=np.float32)
+    rms[int(1.47 / 240.0 * 1800) : int(1.9 / 240.0 * 1800)] = 0.001
+    inc = _with_vocal_activity(
+        _shifted(_analysis(95.0, rms_energy=rms), 1.94), [(0.0, 1.44), (1.94, 30.0)]
+    )
+    planner, plan = _plan(_analysis(100.0), inc, "quick_fade", exit_at=224.0)
+
+    assert (planner.outcome, planner.reason) == ("applied", "shortened")
+    assert plan.fadein_trim_start is None
+    assert plan.crossfade_duration == pytest.approx(1.94)
+    # both decks at full between 20 ms fades, as a cut's pre-roll
+    assert plan.fade_seconds == CUT_SECONDS
+
+
 @pytest.mark.parametrize(
     ("level", "one"),
     [(0.001, 3.0), (0.02, 1.0), (0.5, 1.0)],

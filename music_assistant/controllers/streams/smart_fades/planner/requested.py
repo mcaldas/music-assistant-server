@@ -409,6 +409,7 @@ class RequestedTransitionPlanner(TransitionPlanner):
                 if overlap > CUT_SECONDS and _falls_quiet(ctx.incoming, one - overlap, overlap):
                     overlap = CUT_SECONDS
                 entry = max(0.0, one - overlap)
+                hold = False
                 if self._sung_before(ctx, entry):
                     # B sings a lead-in before its one: it comes in under A's last beats, so
                     # B's one still lands on A's exit (a pre-roll). Longer than a bar of A it
@@ -418,6 +419,9 @@ class RequestedTransitionPlanner(TransitionPlanner):
                     if overlap > min(bar_out, exit_s):
                         self._fallback("vocal")
                         return []
+                    # a lead-in that breaks or turns quiet where A has mostly faded out would
+                    # leave the room a dip: a quick fade then holds both decks as the cut does
+                    hold = _falls_quiet(ctx.incoming, one - overlap / 2, overlap / 2)
                 if entry + overlap > window:
                     return []
                 if not _falls_quiet(ctx.incoming, one):
@@ -425,7 +429,7 @@ class RequestedTransitionPlanner(TransitionPlanner):
             else:
                 return []
         else:
-            overlap = exit_s - exits[exits.index(exit_s) - bars]
+            overlap, hold = exit_s - exits[exits.index(exit_s) - bars], False
             # both decks on the one; a lead-in B sings before it fades in ahead of the bars
             # (a pre-roll of at most a bar of A), so the one stays on A's downbeat. B from its
             # head, as today's quick fade, when that would skip more than the fade plays, or
@@ -448,8 +452,8 @@ class RequestedTransitionPlanner(TransitionPlanner):
                 return []
         spec = CandidateSpec(TransitionTier.QUICK_FADE, bars, exit_s, None, source="requested")
         # a cut's pre-roll holds both decks at full between its fades; a quick fade's stays
-        # one equal-power fade over the whole overlap
-        held = self.request.style != "quick_fade" and overlap > CUT_SECONDS
+        # one equal-power fade over the whole overlap unless B's lead-in would leave a dip
+        held = overlap > CUT_SECONDS and (self.request.style != "quick_fade" or hold)
         plan = TransitionPlan(
             tier=TransitionTier.QUICK_FADE,
             fade_out_window=exit_s,

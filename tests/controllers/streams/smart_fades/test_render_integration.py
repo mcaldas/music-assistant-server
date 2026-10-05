@@ -474,6 +474,45 @@ async def test_a_sung_pickup_pre_rolls_under_the_outgoing_track(style: str) -> N
 
 
 @pytest.mark.asyncio
+async def test_a_quick_fade_never_fades_out_over_a_break_in_a_sung_pickup() -> None:
+    """B sings from 0.4 s to 0.75 s, then holds its breath to its one at 1.1 s: A plays over it."""
+    fade_out, fade_in = _tone(440.0, 45.0), np.zeros(int(45.0 * SR) * 2, dtype=np.float32)
+    voice = _tone(1760.0, 45.0)
+    for start, end in ((0.4, 0.75), (1.1, 45.0)):
+        fade_in[int(start * SR) * 2 : int(end * SR) * 2] = voice[
+            int(start * SR) * 2 : int(end * SR) * 2
+        ]
+    out, inc = _analysis(120.0, 240.0), _analysis(130.0, 240.0)
+    assert inc.beats is not None
+    assert inc.rms_energy is not None
+    inc.beats = [beat + 1.1 for beat in inc.beats]
+    inc.downbeats = inc.beats[::4]
+    # the analysis' 133 ms bins hear what the audio holds
+    for silent in (0, 1, 2, 6, 7):
+        inc.rms_energy[silent] = 0.0
+    inc.extra_data = {
+        "vocal_activity": [0.9 if 3 <= i <= 5 or i >= 8 else 0.05 for i in range(1800)]
+    }
+    planner = RequestedTransitionPlanner(
+        logging.getLogger(), TransitionRequest("quick_fade", "n", 0, 224.0)
+    )
+    fade = SmartCrossFade(logging.getLogger(), out, inc, planner)
+    fade.build(fade_out.nbytes, fade_in.nbytes, PCM)
+    chunks = [chunk async for chunk in fade.apply(fade_out.tobytes(), fade_in.tobytes(), PCM)]
+    mix = np.frombuffer(b"".join(chunks), dtype=np.float32)
+    timing = fade.timing_info
+    cut = timing.pre_crossfade_duration + timing.crossfade_duration
+
+    assert (planner.outcome, planner.reason) == ("applied", "shortened")
+    assert cut == pytest.approx(29.0, abs=0.001)
+    assert timing.crossfade_duration == pytest.approx(0.7, abs=0.001)
+    # no 10 ms stretch from before the pickup to B's first bar drops 30 dB under a tone
+    around = mix[int((cut - 1.0) * SR) * 2 : int((cut + 0.5) * SR) * 2][0::2]
+    rms = np.sqrt(np.mean(around[: len(around) // 441 * 441].reshape(-1, 441) ** 2, axis=1))
+    assert rms.min() > 0.2 / np.sqrt(2) * 10 ** (-30 / 20)
+
+
+@pytest.mark.asyncio
 async def test_a_requested_cut_keeps_the_one_when_the_incoming_track_stops_later() -> None:
     """B's own stop 2.5 beats into its bar plays after B has started: B enters on its one, the stop where B has it."""
     fade_out, fade_in = _tone(440.0, 45.0), _tone(1760.0, 45.0)
