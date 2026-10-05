@@ -113,6 +113,7 @@ class SmartFadesMixer:
                 pcm_format=pcm_format,
                 standard_crossfade_duration=standard_crossfade_duration,
                 fade_out_analysis=fade_out_analysis,
+                cut_at_end=fade_out_end is not None,
             )
         return smart_fade
 
@@ -173,6 +174,7 @@ class SmartFadesMixer:
         pcm_format: AudioFormat,
         standard_crossfade_duration: int,
         fade_out_analysis: AudioAnalysisData | None = None,
+        cut_at_end: bool = False,
     ) -> StandardCrossFade:
         """
         Build a StandardCrossFade — the tail of the degradation chain, never fails.
@@ -186,11 +188,18 @@ class SmartFadesMixer:
         :param standard_crossfade_duration: Duration in seconds for standard crossfade.
         :param fade_out_analysis: Outgoing analysis retained from a failed smart
             build, or ``None`` for the regular standard path.
+        :param cut_at_end: The tail ends at the outgoing item's end position, where its
+            audio was cut on purpose: only silence before that end is stripped.
         """
         trailing_silence_bytes = 0
         try:
             stripped = align_audio_to_frame_boundary(
-                await strip_silence(fade_out_data, pcm_format=pcm_format, reverse=True),
+                await strip_silence(
+                    fade_out_data,
+                    pcm_format=pcm_format,
+                    reverse=True,
+                    skip=0.0 if cut_at_end else 0.2,
+                ),
                 pcm_format,
             )
             retained_bytes = max(

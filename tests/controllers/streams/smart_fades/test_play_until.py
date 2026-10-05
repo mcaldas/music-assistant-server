@@ -243,3 +243,73 @@ async def test_the_mixer_tells_a_request_that_its_tail_is_cut_at_the_end() -> No
     assert isinstance(fade, SmartCrossFade)
     assert isinstance(fade.planner, RequestedTransitionPlanner)
     assert (fade.planner.outcome, fade.planner.reason) == ("applied", None)
+
+
+@pytest.mark.parametrize("mode", ["standard_crossfade", "smart_crossfade"])
+@pytest.mark.parametrize("end", [None, 150.0])
+async def test_a_standard_fade_plays_a_tail_cut_at_its_end_to_that_end(
+    mode: str, end: float | None
+) -> None:
+    """
+    Rendered: a tail cut at its end position is heard up to it, faded into the next track.
+
+    Without an end the fade still drops the tail's last 0.2 s as it always has (a smart
+    fade without analysis falls back to the standard one).
+    """
+    import numpy as np  # noqa: PLC0415
+    from music_assistant_models.enums import ContentType, CrossfadeMode  # noqa: PLC0415
+    from music_assistant_models.media_items import AudioFormat  # noqa: PLC0415
+
+    from music_assistant.controllers.streams.audio import END_POSITION_FADE  # noqa: PLC0415
+    from music_assistant.controllers.streams.smart_fades.fades import (  # noqa: PLC0415
+        StandardCrossFade,
+    )
+    from music_assistant.helpers.audio import fade_out_pcm  # noqa: PLC0415
+    from tests.controllers.streams.test_smartfade_transition_timings import (  # noqa: PLC0415
+        _make_mixer,
+        _streamdetails,
+    )
+
+    pcm = AudioFormat(
+        content_type=ContentType.PCM_F32LE, sample_rate=44100, bit_depth=32, channels=2
+    )
+    sr, frame = 44100, 8
+
+    def tone(freq: float) -> bytes:
+        # 6 s at full level, two channels; A and B are orthogonal over 20 ms windows
+        mono = (0.5 * np.sin(2 * np.pi * freq * np.arange(6 * sr) / sr)).astype(np.float32)
+        return np.repeat(mono, 2).tobytes()
+
+    # A's tail as the reader hands it over at an end: full level up to a 20 ms fade-out
+    tail = fade_out_pcm(tone(200.0), pcm, 6 * sr * frame, int(END_POSITION_FADE * sr) * frame)
+    mixer = _make_mixer()
+    fade = await mixer.build(
+        fade_in_streamdetails=_streamdetails("in"),
+        fade_out_streamdetails=_streamdetails("out"),
+        pcm_format=pcm,
+        standard_crossfade_duration=4,
+        mode=CrossfadeMode(mode),
+        fade_out_data=tail,
+        fade_in_bytes_len=6 * sr * frame,
+        fade_out_end=end,
+    )
+    assert isinstance(fade, StandardCrossFade)
+    heard = 6.0 if end else 5.8  # where A's audio ends in the render
+    timing = fade.timing_info
+    assert timing.pre_crossfade_duration + timing.crossfade_duration == pytest.approx(
+        heard, abs=0.001
+    )
+    mix = b"".join([chunk async for chunk in mixer.mix(fade, tone(400.0), tail, pcm)])
+    out = np.frombuffer(mix, dtype=np.float32)[0::2]
+    # A runs untouched up to the overlap, then fades out under B; B then plays whole
+    assert len(out) == pytest.approx((heard + 2.0) * sr, abs=sr / 1000)
+    assert mix[: int((heard - 4.0) * sr) * frame] == tail[: int((heard - 4.0) * sr) * frame]
+
+    def a_level(at: float) -> float:
+        window = out[int(at * sr) : int(at * sr) + 882]
+        phase = np.exp(-2j * np.pi * 200.0 * np.arange(len(window)) / sr)
+        return float(2 * abs(np.dot(window, phase)) / len(window))
+
+    # the room hears A until its end: 100 ms before it still sounds, and nothing after it
+    assert a_level(heard - 0.1) > 0.005
+    assert a_level(heard + 0.01) < 0.001

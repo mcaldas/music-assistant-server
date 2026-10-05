@@ -196,6 +196,7 @@ async def strip_silence(
     audio_data: bytes,
     pcm_format: AudioFormat,
     reverse: bool = False,
+    skip: float = 0.2,
 ) -> bytes:
     """
     Strip silence from begin or end of pcm audio using ffmpeg.
@@ -203,6 +204,7 @@ async def strip_silence(
     :param audio_data: Raw PCM audio data.
     :param pcm_format: AudioFormat of the audio data.
     :param reverse: If True, strip from end instead of beginning.
+    :param skip: Seconds cut from that side first, silent or not.
     """
     args = ["ffmpeg", "-hide_banner", "-loglevel", "quiet"]
     args += [
@@ -220,13 +222,14 @@ async def strip_silence(
     if reverse:
         args += [
             "-af",
-            "areverse,atrim=start=0.2,silenceremove=start_periods=1"
+            f"areverse,atrim=start={skip},silenceremove=start_periods=1"
             ":start_silence=0.1:start_threshold=0.02,areverse",
         ]
     else:
         args += [
             "-af",
-            "atrim=start=0.2,silenceremove=start_periods=1:start_silence=0.1:start_threshold=0.02",
+            f"atrim=start={skip},silenceremove=start_periods=1:start_silence=0.1"
+            ":start_threshold=0.02",
         ]
     args += ["-f", pcm_format.content_type.value, "-"]
     _returncode, stripped_data, _stderr = await communicate(args, audio_data)
