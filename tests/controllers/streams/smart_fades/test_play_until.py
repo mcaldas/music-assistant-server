@@ -34,6 +34,11 @@ LOGGER = logging.getLogger(__name__)
 STYLES = [(style, 8 if style in BLEND_STYLES else 0) for style in REQUEST_STYLES]
 # an end three quarters into a bar of a 120 BPM track (2 s bars, a downbeat at 120 s)
 MID_BAR_END = 121.5
+# a downbeat of a 128 BPM grid on the beat tracker's 20 ms frames: float32 reads it as
+# 103.1200027, and its bar from 101.24 s runs a frame longer than the bpm's 1.875 s
+FRAMED_DOWNBEAT = 103.12
+# 128 vs 122 BPM drift apart within a bar: a quick fade between them is shorter than one
+_REASON_128 = {"quick_fade": "shortened"}
 
 
 def test_analysis_until_keeps_the_envelopes_usable() -> None:
@@ -136,6 +141,36 @@ def test_an_exit_at_an_end_past_the_last_downbeat_takes_it(style: str, bars: int
 
     assert (planner.outcome, planner.reason) == ("applied", None)
     assert exit_s == pytest.approx(120.0)
+
+
+def _framed(bpm: float) -> AudioAnalysisData:
+    """Return a 240 s track whose beats sit on the beat tracker's 20 ms frames."""
+    analysis = _analysis(bpm)
+    assert analysis.beats is not None
+    analysis.beats = [round(beat * 50) / 50 for beat in analysis.beats]
+    analysis.downbeats = analysis.beats[::4]
+    return analysis
+
+
+@pytest.mark.parametrize(("style", "bars"), STYLES)
+@pytest.mark.parametrize("exit_at", [FRAMED_DOWNBEAT, 0.0], ids=["exit_at=end", "no-exit_at"])
+def test_an_end_on_a_downbeat_leaves_on_it(style: str, bars: int, exit_at: float) -> None:
+    """An end on a downbeat, as audio_analysis/bar_grid reports it, is where A leaves."""
+    out = analysis_until(_framed(128.0), FRAMED_DOWNBEAT)
+    planner, exit_s = _requested(out, style, bars, exit_at)
+
+    assert (planner.outcome, planner.reason) == ("applied", _REASON_128.get(style))
+    assert exit_s == pytest.approx(FRAMED_DOWNBEAT)
+
+
+@pytest.mark.parametrize(("style", "bars"), STYLES)
+def test_an_end_just_before_a_downbeat_takes_the_one_before(style: str, bars: int) -> None:
+    """3 ms before a downbeat closing a bar a frame longer than the bpm's: A leaves at 101.24 s."""
+    end = FRAMED_DOWNBEAT - 0.003
+    planner, exit_s = _requested(analysis_until(_framed(128.0), end), style, bars, end)
+
+    assert (planner.outcome, planner.reason) == ("applied", _REASON_128.get(style))
+    assert exit_s == pytest.approx(101.24)
 
 
 @pytest.mark.parametrize(("style", "bars"), STYLES)

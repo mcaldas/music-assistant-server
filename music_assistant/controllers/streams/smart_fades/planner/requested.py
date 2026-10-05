@@ -109,6 +109,10 @@ _FADED_FRACTION = 0.1
 # a gap in the incoming PCM head: this long under its audible line, as a room hears one; the
 # head shows gaps the analysis' ~0.1-0.2 s bins blur
 _GAP_S = 0.03
+# a beat grid sits on the analysis' 20 ms frames and is read as float32: a downbeat on an end
+# position can read just past it, and a bar of the grid can run up to a frame longer than the
+# bpm's
+_GRID_FRAME_S = 0.02
 # filter_sweep: the outgoing high-pass rises from 10 Hz over the whole overlap; the incoming
 # low-pass opens over its first 3/4 and fades to dry by 9/10 of it, ahead of asendcmd's frame
 # granularity (~0.1s), so the incoming track plays on untouched
@@ -291,10 +295,11 @@ class RequestedTransitionPlanner(TransitionPlanner):
     def _plan_request(self, ctx: TransitionContext) -> TransitionPlan | None:
         """Build the requested plan on the first exit that takes it, or None (fallback)."""
         bar_out = ctx.outgoing.beats_per_bar * 60.0 / ctx.outgoing.bpm
+        # a downbeat less than a frame past A's end is on it (an end position on a bar line)
         exits = [
-            downbeat
+            min(downbeat, ctx.audio_end)
             for downbeat in ctx.protective_downbeats
-            if CUT_SECONDS < downbeat <= ctx.audio_end
+            if CUT_SECONDS < downbeat <= ctx.audio_end + _GRID_FRAME_S
         ]
         if not exits:
             self._fallback("no_room")
@@ -305,7 +310,7 @@ class RequestedTransitionPlanner(TransitionPlanner):
             exit_s = min(exits, key=lambda downbeat: abs(downbeat - target))
             # an exit asked past A's last downbeat, with no bar left after it before A's audio
             # ends (an end position mid-bar): the next downbeat is past the end, so take that one
-            past_last = target > exits[-1] and exits[-1] + bar_out > ctx.audio_end
+            past_last = target > exits[-1] and exits[-1] + bar_out + _GRID_FRAME_S > ctx.audio_end
             if not past_last and abs(exit_s - target) > bar_out / 2:
                 # no downbeat of A near the asked exit in the tail it holds
                 self._fallback("no_room")
