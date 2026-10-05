@@ -22,6 +22,11 @@ from music_assistant.controllers.streams.smart_fades.fades import (
     SmartCrossFade,
     StandardCrossFade,
 )
+from music_assistant.controllers.streams.smart_fades.planner.requested import (
+    REQUEST_PREFIX,
+    RequestedTransitionPlanner,
+    TransitionRequest,
+)
 from music_assistant.models.audio_analysis import AudioAnalysisData
 
 TEST_PCM_FORMAT = AudioFormat(
@@ -247,6 +252,29 @@ def _smart_fade() -> SmartCrossFade:
     window_size = TEST_PCM_FORMAT.pcm_sample_size * 45
     fade.build(window_size, window_size, TEST_PCM_FORMAT)
     return fade
+
+
+def _requested_fade(request: TransitionRequest, incoming_bpm: float = 123.0) -> SmartCrossFade:
+    """Build a real smart fade planned from a client's request."""
+    logger = logging.getLogger(__name__)
+    fade = SmartCrossFade(
+        logger=logger,
+        fade_out_analysis=_grid_analysis(120.0),
+        fade_in_analysis=_grid_analysis(incoming_bpm),
+        planner=RequestedTransitionPlanner(logger, request),
+    )
+    window_size = TEST_PCM_FORMAT.pcm_sample_size * 45
+    fade.build(window_size, window_size, TEST_PCM_FORMAT)
+    return fade
+
+
+def _request_keys(queue_item: SimpleNamespace) -> dict[str, Any]:
+    """Return the transition request stored on a queue item."""
+    return {
+        key: value
+        for key, value in queue_item.extra_attributes.items()
+        if key.startswith(REQUEST_PREFIX)
+    }
 
 
 def _transition_keys(queue_item: SimpleNamespace) -> dict[str, Any]:
@@ -917,6 +945,8 @@ async def test_a_new_stream_of_an_item_drops_its_old_report(
     item.extra_attributes["playback_speed"] = 1.0
     audio, _queue, mass = _flow_audio(monkeypatch, next_item=None, load_next=[QueueEmpty])
     audio._report_transition("queue-1", cast("Any", item), "item-2", CrossfadeMode.DISABLED)
+    # a request for the item's coming boundary is set before it streams, so it must survive
+    item.extra_attributes.update(TransitionRequest("cut", "item-2").to_attributes())
 
     async def _no_audio(**_kwargs: object) -> AsyncGenerator[bytes]:
         return
@@ -927,6 +957,7 @@ async def test_a_new_stream_of_an_item_drops_its_old_report(
 
     assert not _transition_keys(item)
     assert item.extra_attributes["playback_speed"] == 1.0
+    assert TransitionRequest.read(item.extra_attributes) == TransitionRequest("cut", "item-2")
     assert mass.player_queues.signal_update.call_count == 2
 
 
@@ -957,3 +988,140 @@ async def test_flow_places_a_mixed_in_track_on_its_own_audio(
     assert report["transition_next_item_id"] == "item-3"
     # the stand-in fade was planned on a 45 s tail; this tail is a few ms shorter
     assert report["transition_mix_end"] == pytest.approx(236.0, abs=0.01)
+
+
+@pytest.mark.parametrize(
+    ("request_", "incoming_bpm", "outcome", "reason"),
+    [
+        (TransitionRequest("cut", "item-2"), 123.0, "applied", None),
+        (TransitionRequest("blend", "item-2", 8), 150.0, "fallback", "not_blendable"),
+    ],
+    ids=["applied", "fallback"],
+)
+def test_report_transition_says_what_came_of_the_request(
+    monkeypatch: pytest.MonkeyPatch,
+    request_: TransitionRequest,
+    incoming_bpm: float,
+    outcome: str,
+    reason: str | None,
+) -> None:
+    """The report uses the request up and publishes its planner's outcome."""
+    outgoing = _queue_item("item-1", "First", duration=240)
+    outgoing.extra_attributes.update(request_.to_attributes())
+    audio, _queue, _mass = _flow_audio(monkeypatch, next_item=None, load_next=[QueueEmpty])
+
+    audio._report_transition(
+        "queue-1",
+        cast("Any", outgoing),
+        "item-2",
+        CrossfadeMode.SMART_CROSSFADE,
+        _requested_fade(request_, incoming_bpm),
+        45.0,
+    )
+
+    report = _transition_keys(outgoing)
+    assert report["transition_request"] == outcome
+    assert report.get("transition_request_reason") == reason
+    assert not _request_keys(outgoing)
+
+
+def test_report_transition_marks_a_request_no_planner_saw_as_ignored(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A request with no smart fade to shape is ignored; one for another item just lapses."""
+    audio, _queue, _mass = _flow_audio(monkeypatch, next_item=None, load_next=[QueueEmpty])
+    for request_, outcome in (
+        (TransitionRequest("cut", "item-2"), "ignored"),
+        (TransitionRequest("cut", "item-9"), None),
+    ):
+        outgoing = _queue_item("item-1", "First")
+        outgoing.extra_attributes.update(request_.to_attributes())
+
+        audio._report_transition("queue-1", cast("Any", outgoing), "item-2", CrossfadeMode.DISABLED)
+
+        assert _transition_keys(outgoing).get("transition_request") == outcome
+        assert not _request_keys(outgoing)
+    # without a request the report carries nothing about one
+    outgoing = _queue_item("item-1", "First", duration=240)
+    audio._report_transition(
+        "queue-1",
+        cast("Any", outgoing),
+        "item-2",
+        CrossfadeMode.SMART_CROSSFADE,
+        _smart_fade(),
+        45.0,
+    )
+    assert (
+        not {"transition_request", "transition_request_reason"} & _transition_keys(outgoing).keys()
+    )
+
+
+@pytest.mark.parametrize("bound_to", ["item-2", "item-9"])
+async def test_flow_hands_a_request_for_the_coming_boundary_to_the_mixer(
+    monkeypatch: pytest.MonkeyPatch, bound_to: str
+) -> None:
+    """The flow passes the outgoing item's request to the mixer only for its real next item."""
+    first_item = _queue_item("item-1", "First", duration=240)
+    second_item = _queue_item("item-2", "Second", duration=240)
+    request_ = TransitionRequest("cut", bound_to)
+    first_item.extra_attributes.update(request_.to_attributes())
+    audio, queue, _mass = _flow_audio(
+        monkeypatch,
+        next_item=second_item,
+        load_next=[second_item, QueueEmpty],
+        crossfade_mode=CrossfadeMode.SMART_CROSSFADE,
+        build_result=_requested_fade(TransitionRequest("cut", "item-2")),
+    )
+    _install_item_streams(monkeypatch, audio, {"item-1": 240, "item-2": 60})
+    build = cast("AsyncMock", audio.smart_fades_mixer.build)
+    planned = build.return_value
+    named_during_build: list[Any] = []
+
+    async def _build(**_kwargs: Any) -> Any:
+        # while the mixer plans, the item already names its next one: set_transition refuses
+        named_during_build.append(first_item.extra_attributes.get("transition_next_item_id"))
+        return planned
+
+    build.side_effect = _build
+
+    await _drain(
+        audio.get_queue_flow_stream(
+            cast("Any", queue), cast("Any", first_item), TEST_PCM_FORMAT, session_id="session-1"
+        )
+    )
+
+    build.assert_awaited_once()
+    assert named_during_build == ["item-2"]
+    expected = request_ if bound_to == "item-2" else None
+    assert build.await_args is not None
+    assert build.await_args.kwargs["request"] == expected
+    # used up at the boundary either way
+    assert not _request_keys(first_item)
+
+
+def test_a_requested_fade_that_fails_before_playing_is_reported_ignored(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The rewrite of a boundary whose planned mix failed keeps a word on the request: ignored."""
+    outgoing = _queue_item("item-1", "First", duration=240)
+    request_ = TransitionRequest("cut", "item-2")
+    outgoing.extra_attributes.update(request_.to_attributes())
+    audio, _queue, _mass = _flow_audio(monkeypatch, next_item=None, load_next=[QueueEmpty])
+    audio._report_transition(
+        "queue-1",
+        cast("Any", outgoing),
+        "item-2",
+        CrossfadeMode.SMART_CROSSFADE,
+        _requested_fade(request_),
+        195.0,
+    )
+    assert _transition_keys(outgoing)["transition_request"] == "applied"
+
+    audio._report_transition("queue-1", cast("Any", outgoing), "item-2", CrossfadeMode.DISABLED)
+
+    report = _transition_keys(outgoing)
+    assert report["transition_mode"] == "disabled"
+    assert report["transition_request"] == "ignored"
+    # a later boundary into another item has no word on it
+    audio._report_transition("queue-1", cast("Any", outgoing), "item-3", CrossfadeMode.DISABLED)
+    assert "transition_request" not in _transition_keys(outgoing)

@@ -36,12 +36,15 @@ from .selection import CandidateSelector
 if TYPE_CHECKING:
     import logging
 
-    from music_assistant.controllers.streams.smart_fades.models import TransitionPlan
+    from music_assistant.controllers.streams.smart_fades.models import Deck, TransitionPlan
     from music_assistant.models.audio_analysis import AudioAnalysisData
 
 
 class TransitionPlanner(ABC):
     """Abstract base class for transition planners."""
+
+    # set by plan(): the outgoing grid masked to the plan's exit
+    outgoing: Deck
 
     def __init__(self, logger: logging.Logger) -> None:
         """Initialize the planner."""

@@ -22,6 +22,7 @@ from music_assistant.controllers.streams.audio import (
 from music_assistant.controllers.streams.audio_buffer import AudioBuffer
 from music_assistant.controllers.streams.smart_fades.fades import StandardCrossFade
 from music_assistant.controllers.streams.smart_fades.helpers import SMART_CROSSFADE_DURATION
+from music_assistant.controllers.streams.smart_fades.planner.requested import TransitionRequest
 
 
 def _audio(pcm_format: AudioFormat, seconds: float) -> bytes:
@@ -301,11 +302,10 @@ async def test_crossfade_reads_its_window_past_the_resident_buffer(
             fadein_trimmed_duration=0,
         )
     )
-    monkeypatch.setattr(
-        audio.smart_fades_mixer,
-        "build",
-        AsyncMock(return_value=smart_fade),
-    )
+    build = AsyncMock(return_value=smart_fade)
+    monkeypatch.setattr(audio.smart_fades_mixer, "build", build)
+    # a client asked for a cut into the next item before the boundary was planned
+    current_item.extra_attributes.update(TransitionRequest("cut", "next").to_attributes())
 
     async def _mix(
         _smart_fade: object,
@@ -354,6 +354,12 @@ async def test_crossfade_reads_its_window_past_the_resident_buffer(
     # the next track resumes at the media time the blend already played
     assert crossfade_data.fade_in_media_duration == pytest.approx(expected_window * playback_speed)
     assert crossfade_data.fade_in_media_duration <= next_details.duration / 2
+    # the request reached the mixer and was used up by the boundary's report; the fade
+    # built here is no smart one, so nothing planned it
+    assert build.await_args is not None
+    assert build.await_args.kwargs["request"] == TransitionRequest("cut", "next")
+    assert TransitionRequest.read(current_item.extra_attributes) is None
+    assert current_item.extra_attributes["transition_request"] == "ignored"
     # the boundary was published with the mode that was built
     assert current_item.extra_attributes["transition_mode"] == "standard_crossfade"
     assert current_item.extra_attributes["transition_next_item_id"] == "next"

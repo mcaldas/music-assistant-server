@@ -21,6 +21,7 @@ from typing import TYPE_CHECKING, Any, Final, cast
 import shortuuid
 from music_assistant_models.auth import Scope
 from music_assistant_models.enums import (
+    CrossfadeMode,
     EventType,
     MediaType,
     PlaybackState,
@@ -29,6 +30,7 @@ from music_assistant_models.enums import (
     RepeatMode,
 )
 from music_assistant_models.errors import (
+    ActionUnavailable,
     AudioError,
     InsufficientPermissions,
     InvalidCommand,
@@ -85,6 +87,12 @@ from music_assistant.controllers.player_queues.queue_loader import QueueLoaderMi
 from music_assistant.controllers.player_queues.smart_shuffle import SmartShuffle
 from music_assistant.controllers.player_queues.state import PlayerQueueData
 from music_assistant.controllers.player_queues.stream_feeder import StreamFeederMixin
+from music_assistant.controllers.streams.smart_fades.helpers import SMART_CROSSFADE_DURATION
+from music_assistant.controllers.streams.smart_fades.planner.candidates import RUNG_LADDER
+from music_assistant.controllers.streams.smart_fades.planner.requested import (
+    REQUEST_STYLES,
+    TransitionRequest,
+)
 from music_assistant.controllers.webserver.helpers.auth_middleware import (
     get_current_user,
     has_player_access,
@@ -509,6 +517,84 @@ class PlayerQueuesController(QueueLoaderMixin, PlaybackTrackerMixin, StreamFeede
         self.signal_update(queue_id)
         if queue.state == PlaybackState.PLAYING:
             await self.resume(queue_id)
+
+    @api_command("player_queues/set_transition", required_scope=Scope.QUEUES_CONTROL)
+    async def set_transition(
+        self,
+        queue_id: str,
+        queue_item_id: str,
+        style: str,
+        bars: int = 0,
+        exit_at: float = 0.0,
+    ) -> None:
+        """
+        Request how the transition from a queue item into the item after it should play.
+
+        Needs Smart Fades and two tracks. The request applies once, to the boundary after
+        ``queue_item_id``, and only while the item after it is still the one it was made for;
+        it lapses when the item stops playing. It is stored on the item as
+        ``requested_transition_*`` extra attributes. When the boundary is planned, the item's
+        ``transition_request`` extra attribute says what came of it: "applied" (with
+        ``transition_request_reason`` "shortened" for a blend shorter than asked), "fallback"
+        (Smart Fades' own transition plays; the reason is "not_blendable", "no_room" or
+        "vocal") or "ignored" (no smart fade plays). The transition is fixed well before the
+        item ends (on Sonos about two minutes before); after that a request fails.
+
+        :param queue_id: Queue the item is in.
+        :param queue_item_id: Item whose ending the request shapes.
+        :param style: "blend", "quick_fade" or "cut"; "auto" drops the request.
+        :param bars: Blend length in bars of the outgoing track: 1, 2, 4, 8 or 16. Blend only.
+        :param exit_at: Second of the outgoing track where its audio should end, moved to the
+            nearest downbeat; within its last 45 s (half the track when shorter). 0 lets Smart
+            Fades choose.
+        """
+        self._check_player_permission(queue_id)
+        if (
+            style not in ("auto", *REQUEST_STYLES)
+            or ((bars not in RUNG_LADDER) if style == "blend" else bars != 0)
+            or exit_at < 0
+            or (style == "auto" and exit_at)
+        ):
+            raise InvalidDataError(
+                f"Invalid transition request: {style} bars={bars} exit_at={exit_at}"
+            )
+        if (queue := self.get(queue_id)) is None:
+            raise PlayerUnavailableError(f"Queue {queue_id} is not available")
+        if (queue_item := self.get_item(queue_id, queue_item_id)) is None:
+            raise InvalidDataError(f"Queue item {queue_item_id} not found in queue")
+        attributes = queue_item.extra_attributes
+        next_item = self.get_next_item(queue_id, queue_item_id)
+        if next_item is not None and (
+            attributes.get("transition_next_item_id") == next_item.queue_item_id
+            or (
+                queue.current_index == self.index_by_id(queue_id, queue_item_id)
+                and queue.index_in_buffer == self.index_by_id(queue_id, next_item.queue_item_id)
+            )
+        ):
+            raise ActionUnavailable("The transition into the next item is already fixed")
+        if style == "auto":
+            if TransitionRequest.drop(attributes) is not None:
+                self.signal_update(queue_id)
+            return
+        if exit_at and queue_item.duration:
+            window = min(float(SMART_CROSSFADE_DURATION), queue_item.duration / 2)
+            if not queue_item.duration - window < exit_at <= queue_item.duration:
+                raise InvalidDataError(f"exit_at must be in the last {window:.0f}s of the item")
+        if next_item is None:
+            raise QueueEmpty(f"No item after {queue_item_id} to transition into")
+        if (
+            next_item.queue_item_id == queue_item_id
+            or queue_item.media_type != MediaType.TRACK
+            or next_item.media_type != MediaType.TRACK
+            or self.mass.streams.get_crossfade_mode(queue) != CrossfadeMode.SMART_CROSSFADE
+        ):
+            raise InvalidCommand(
+                "A transition can be requested only between two tracks, with Smart Fades"
+            )
+        attributes.update(
+            TransitionRequest(style, next_item.queue_item_id, bars, exit_at).to_attributes()
+        )
+        self.signal_update(queue_id)
 
     @api_command(
         "player_queues/play_media", required_scope=Scope.QUEUES_CONTROL, allow_impersonation=True

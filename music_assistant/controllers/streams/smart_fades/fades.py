@@ -22,7 +22,10 @@ from music_assistant.controllers.streams.smart_fades.models import (
     SmartFadeNotApplicable,
     TransitionPlan,
 )
-from music_assistant.controllers.streams.smart_fades.planner import SmartCrossFadePlanner
+from music_assistant.controllers.streams.smart_fades.planner import (
+    SmartCrossFadePlanner,
+    TransitionPlanner,
+)
 from music_assistant.controllers.streams.smart_fades.renderer import TransitionRenderer
 from music_assistant.helpers.audio import iter_pcm_slices
 from music_assistant.helpers.ffmpeg import get_ffmpeg_channel_args
@@ -310,6 +313,7 @@ class SmartCrossFade(SmartFade):
         logger: logging.Logger,
         fade_out_analysis: AudioAnalysisData,
         fade_in_analysis: AudioAnalysisData,
+        planner: TransitionPlanner | None = None,
     ) -> None:
         """
         Initialize SmartCrossFade with analysis data.
@@ -317,11 +321,12 @@ class SmartCrossFade(SmartFade):
         :param logger: Logger for debug output.
         :param fade_out_analysis: Analysis data for the outgoing track.
         :param fade_in_analysis: Analysis data for the incoming track.
+        :param planner: Planner to use instead of the default ``SmartCrossFadePlanner``.
         """
         super().__init__(logger)
         self.fade_out_analysis = fade_out_analysis
         self.fade_in_analysis = fade_in_analysis
-        self.planner = SmartCrossFadePlanner(logger)
+        self.planner: TransitionPlanner = planner or SmartCrossFadePlanner(logger)
         self.renderer = TransitionRenderer(logger)
         self.plan: TransitionPlan | None = None
         # populated by build(); read by the timing/lyrics-sync tests

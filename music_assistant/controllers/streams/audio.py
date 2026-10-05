@@ -119,6 +119,10 @@ from music_assistant.controllers.streams.smart_fades.fades import (
     StandardCrossFade,
 )
 from music_assistant.controllers.streams.smart_fades.helpers import SMART_CROSSFADE_DURATION
+from music_assistant.controllers.streams.smart_fades.planner.requested import (
+    RequestedTransitionPlanner,
+    TransitionRequest,
+)
 from music_assistant.helpers import ssl as ssl_util
 from music_assistant.helpers.aiohttp_client import encoded_request_url
 from music_assistant.helpers.audio import (
@@ -2096,6 +2100,9 @@ class StreamsAudio:
                         mode=transition_mode,
                         fade_out_data=fade_out_data,
                         fade_in_bytes_len=fade_in_buffer_size,
+                        request=TransitionRequest.take(
+                            queue_item.extra_attributes, next_queue_item.queue_item_id
+                        ),
                     )
                     # the mixer degrades to a standard fade when the smart one cannot be planned
                     applied_mode = (
@@ -2597,6 +2604,14 @@ class StreamsAudio:
                             mode=transition_mode,
                             fade_out_data=last_fadeout_part,
                             fade_in_bytes_len=incoming_crossfade_size,
+                            request=(
+                                TransitionRequest.take(
+                                    outgoing_queue_track.extra_attributes,
+                                    queue_track.queue_item_id,
+                                )
+                                if outgoing_queue_track is not None
+                                else None
+                            ),
                         )
                         build_seconds = asyncio.get_event_loop().time() - build_started
                         timing_info = crossfade_smart_fade.timing_info
@@ -4336,7 +4351,10 @@ class StreamsAudio:
         The ``transition_*`` extra attributes describe the planned transition: its mode,
         the smart fade's tier and strategy, where the mix starts and ends in outgoing-song
         seconds, the overlap, where the incoming item enters and the outgoing deck's final
-        tempo ratio. A later call replaces them; a new stream of the item drops them.
+        tempo ratio. A client's request for the boundary is used up here, and
+        ``transition_request`` says what came of it: applied, fallback (with
+        ``transition_request_reason``) or ignored. A later call replaces them; a new stream
+        of the item drops them.
 
         :param queue_id: Queue the item is streamed from.
         :param outgoing: Queue item that is ending.
@@ -4346,11 +4364,26 @@ class StreamsAudio:
         :param tail_start: Song second where the outgoing tail the fade was built on starts.
         """
         attrs = outgoing.extra_attributes
+        # what an earlier report of this boundary said came of a request (a failed mix rewrites it)
+        taken = (
+            attrs.get("transition_request")
+            if attrs.get("transition_next_item_id") == next_item_id
+            else None
+        )
         for key in [key for key in attrs if key.startswith("transition_")]:
             del attrs[key]
         attrs["transition_next_item_id"] = next_item_id
         attrs["transition_locked_at"] = utc_timestamp()
         attrs["transition_mode"] = applied_mode.value
+        request = TransitionRequest.drop(attrs)
+        planner = smart_fade.planner if isinstance(smart_fade, SmartCrossFade) else None
+        if isinstance(planner, RequestedTransitionPlanner):
+            attrs["transition_request"] = planner.outcome
+            if planner.reason is not None:
+                attrs["transition_request_reason"] = planner.reason
+        elif taken is not None or (request is not None and request.next_item_id == next_item_id):
+            # no smart fade plays here: none was possible, or the planned one failed before playing
+            attrs["transition_request"] = "ignored"
         if smart_fade is not None:
             timing = smart_fade.timing_info
             ratio = 1.0

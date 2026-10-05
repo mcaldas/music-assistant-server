@@ -17,6 +17,11 @@ from music_assistant.controllers.streams.smart_fades.fades import (
     StandardCrossFade,
     _feed_ffmpeg_stdin,
 )
+from music_assistant.controllers.streams.smart_fades.planner.requested import (
+    CUT_SECONDS,
+    RequestedTransitionPlanner,
+    TransitionRequest,
+)
 from music_assistant.helpers.process import AsyncProcess
 from music_assistant.models.audio_analysis import AudioAnalysisData
 
@@ -257,3 +262,37 @@ async def test_source_cancelled_feed_still_ends_the_input() -> None:
         assert await proc.wait_with_timeout(2) == 0
     finally:
         await proc.close()
+
+
+@pytest.mark.asyncio
+async def test_a_requested_cut_switches_tracks_at_the_exit_without_a_gap() -> None:
+    """A cut plays A up to its exit downbeat and B right after, with no silence between."""
+    fade_out, fade_in = _tone(440.0, 45.0), _tone(1760.0, 45.0)
+    planner = RequestedTransitionPlanner(
+        logging.getLogger(), TransitionRequest("cut", "n", 0, 224.0)
+    )
+    fade = SmartCrossFade(
+        logging.getLogger(), _analysis(120.0, 240.0), _analysis(120.0, 240.0), planner
+    )
+    fade.build(fade_out.nbytes, fade_in.nbytes, PCM)
+    chunks = [chunk async for chunk in fade.apply(fade_out.tobytes(), fade_in.tobytes(), PCM)]
+    mix = np.frombuffer(b"".join(chunks), dtype=np.float32)
+    timing = fade.timing_info
+    cut = timing.pre_crossfade_duration + timing.crossfade_duration
+
+    assert planner.outcome == "applied"
+    assert timing.crossfade_duration == pytest.approx(CUT_SECONDS, abs=1e-4)
+    # A's audio ends at its exit downbeat, 224 s into the song (29 s into the tail)
+    assert cut == pytest.approx(29.0, abs=0.01)
+    assert len(mix) // 2 == pytest.approx(int((cut + timing.post_crossfade_duration) * SR), abs=2)
+
+    def window(start: float, end: float) -> np.ndarray:
+        return mix[int(start * SR) * 2 : int(end * SR) * 2]
+
+    before, after = window(cut - 1.0, cut - 0.05), window(cut + 0.05, cut + 1.0)
+    assert _band_rms(before, 430, 450) > 10 * _band_rms(before, 1750, 1770)
+    assert _band_rms(after, 1750, 1770) > 10 * _band_rms(after, 430, 450)
+    # no 10 ms stretch around the cut drops more than 30 dB below the tones' level
+    around = window(cut - 0.5, cut + 0.5)[0::2]
+    rms = np.sqrt(np.mean(around[: len(around) // 441 * 441].reshape(-1, 441) ** 2, axis=1))
+    assert rms.min() > 0.2 / np.sqrt(2) * 10 ** (-30 / 20)

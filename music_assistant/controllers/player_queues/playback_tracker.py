@@ -48,6 +48,7 @@ from music_assistant.controllers.player_queues.helpers import (
     find_dynamic_source,
     get_current_playback_speed,
 )
+from music_assistant.controllers.streams.smart_fades.planner.requested import TransitionRequest
 from music_assistant.controllers.webserver.helpers.auth_middleware import (
     set_current_user,
 )
@@ -283,6 +284,19 @@ class PlaybackTrackerMixin(_PlayerQueuesBase):
         # check if we need to clear the queue if we reached the end
         if "state" in changed_keys and queue.state == PlaybackState.IDLE:
             self._handle_end_of_queue(queue, prev_state, new_state)
+
+        # an item that stops being current has passed its boundary: a transition request
+        # still on it was never used and must not apply on a later pass, and its transition
+        # report describes this pass only
+        if (
+            "current_item_id" in changed_keys
+            and prev_item_id is not None
+            and (prev_item := self.get_item(queue_id, prev_item_id)) is not None
+        ):
+            attrs = prev_item.extra_attributes
+            TransitionRequest.drop(attrs)
+            for key in [key for key in attrs if key.startswith("transition_")]:
+                del attrs[key]
 
         # refill the queue (dynamic mode or autoplay) when running low on tracks
         if "current_item_id" in changed_keys:

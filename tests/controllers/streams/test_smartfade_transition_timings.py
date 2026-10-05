@@ -42,6 +42,12 @@ from music_assistant.controllers.streams.smart_fades.filters import (
 )
 from music_assistant.controllers.streams.smart_fades.helpers import SMART_CROSSFADE_DURATION
 from music_assistant.controllers.streams.smart_fades.mixer import SmartFadesMixer
+from music_assistant.controllers.streams.smart_fades.planner import SmartCrossFadePlanner
+from music_assistant.controllers.streams.smart_fades.planner.requested import (
+    CUT_SECONDS,
+    RequestedTransitionPlanner,
+    TransitionRequest,
+)
 from music_assistant.models.audio_analysis import AudioAnalysisData
 
 PCM = AudioFormat(
@@ -881,6 +887,88 @@ class TestMixerBuild:
         pre_crossfade_bytes = sum(len(chunk) for chunk in chunks[:marker_idx])
         assert pre_crossfade_bytes == _seconds(32)
         assert len(captured["fade_out"]) == _seconds(10)
+
+    @pytest.mark.asyncio
+    async def test_build_without_a_request_matches_todays_smart_fade(self) -> None:
+        """Without a request the mixer plans and renders exactly the default smart fade."""
+        analysis_out, analysis_in = _analysis(120.0), _analysis(124.0, beats_start=0.4)
+        built = []
+        for kwargs in ({}, {"request": None}):
+            mixer = _make_mixer({"out": analysis_out, "in": analysis_in})
+            built.append(
+                await mixer.build(
+                    fade_in_streamdetails=_streamdetails("in"),
+                    fade_out_streamdetails=_streamdetails("out"),
+                    pcm_format=PCM,
+                    standard_crossfade_duration=10,
+                    mode=CrossfadeMode.SMART_CROSSFADE,
+                    fade_out_data=b"\x00" * _seconds(SMART_CROSSFADE_DURATION),
+                    fade_in_bytes_len=_seconds(SMART_CROSSFADE_DURATION),
+                    **kwargs,
+                )
+            )
+        direct = SmartCrossFade(logging.getLogger("direct"), analysis_out, analysis_in)
+        direct.build(_seconds(SMART_CROSSFADE_DURATION), _seconds(SMART_CROSSFADE_DURATION), PCM)
+        for fade in built:
+            assert isinstance(fade, SmartCrossFade)
+            assert type(fade.planner) is SmartCrossFadePlanner
+            assert fade._get_ffmpeg_filters() == direct._get_ffmpeg_filters()
+            assert fade.timing_info == direct.timing_info
+
+    @pytest.mark.asyncio
+    async def test_build_with_a_request_plans_it(self) -> None:
+        """A request is planned by the requested planner, which sees the received head."""
+        mixer = _make_mixer({"out": _analysis(120.0), "in": _analysis(124.0, beats_start=0.4)})
+        fade = await mixer.build(
+            fade_in_streamdetails=_streamdetails("in"),
+            fade_out_streamdetails=_streamdetails("out"),
+            pcm_format=PCM,
+            standard_crossfade_duration=10,
+            mode=CrossfadeMode.SMART_CROSSFADE,
+            fade_out_data=b"\x00" * _seconds(SMART_CROSSFADE_DURATION),
+            fade_in_bytes_len=_seconds(30),
+            request=TransitionRequest("cut", "in"),
+        )
+        assert isinstance(fade, SmartCrossFade)
+        assert isinstance(fade.planner, RequestedTransitionPlanner)
+        assert fade.planner.fade_in_seconds == pytest.approx(30.0)
+        assert fade.planner.outcome == "applied"
+        assert fade.timing_info.crossfade_duration == pytest.approx(CUT_SECONDS, abs=1e-4)
+        rendered_fade_out_seconds = fade.effective_end - _savings_until(fade, fade.effective_end)
+        assert (
+            fade.timing_info.pre_crossfade_duration + fade.timing_info.crossfade_duration
+            == pytest.approx(rendered_fade_out_seconds, abs=0.05)
+        )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("mode", "with_analysis"),
+        [(CrossfadeMode.STANDARD_CROSSFADE, True), (CrossfadeMode.SMART_CROSSFADE, False)],
+        ids=["standard-mode", "no-analysis"],
+    )
+    async def test_a_request_without_a_smart_fade_builds_a_standard_one(
+        self, monkeypatch: pytest.MonkeyPatch, mode: CrossfadeMode, with_analysis: bool
+    ) -> None:
+        """A request changes nothing where no smart fade can be planned."""
+
+        async def identity_strip(audio_data: bytes, **_kwargs: object) -> bytes:
+            return audio_data
+
+        monkeypatch.setattr(mixer_module, "strip_silence", identity_strip)
+        mixer = _make_mixer(
+            {"out": _analysis(120.0), "in": _analysis(124.0)} if with_analysis else None
+        )
+        fade = await mixer.build(
+            fade_in_streamdetails=_streamdetails("in"),
+            fade_out_streamdetails=_streamdetails("out"),
+            pcm_format=PCM,
+            standard_crossfade_duration=10,
+            mode=mode,
+            fade_out_data=b"\x00" * _seconds(45),
+            fade_in_bytes_len=_seconds(45),
+            request=TransitionRequest("cut", "in"),
+        )
+        assert isinstance(fade, StandardCrossFade)
 
 
 # ---------------------------------------------------------------------------

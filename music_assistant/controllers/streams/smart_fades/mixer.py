@@ -18,6 +18,9 @@ from music_assistant.controllers.streams.smart_fades.fades import (
     StandardCrossFade,
 )
 from music_assistant.controllers.streams.smart_fades.helpers import detect_effective_audio_end
+from music_assistant.controllers.streams.smart_fades.planner.requested import (
+    RequestedTransitionPlanner,
+)
 from music_assistant.controllers.streams.smart_fades.vocal import (
     PROTECTIVE_VOCAL_CONFIG,
     VocalMask,
@@ -32,6 +35,9 @@ if TYPE_CHECKING:
     from music_assistant_models.streamdetails import StreamDetails
 
     from music_assistant.controllers.streams.controller import StreamsController
+    from music_assistant.controllers.streams.smart_fades.planner.requested import (
+        TransitionRequest,
+    )
 
 # marks the end of the mix stream on the pump queue (a chunk is always bytes)
 _MIX_DONE = object()
@@ -54,6 +60,7 @@ class SmartFadesMixer:
         mode: CrossfadeMode,
         fade_out_data: bytes,
         fade_in_bytes_len: int,
+        request: TransitionRequest | None = None,
     ) -> SmartFade:
         """
         Pick the SmartFade implementation, prime its filters, and return it.
@@ -70,6 +77,8 @@ class SmartFadesMixer:
         :param mode: Smart fades mode (SMART_CROSSFADE or STANDARD_CROSSFADE).
         :param fade_out_data: PCM buffer of the outgoing track's tail.
         :param fade_in_bytes_len: Expected length in bytes of the fade-in input.
+        :param request: A client's request for this transition, planned instead of the
+            default smart fade in SMART_CROSSFADE mode.
         """
         # degradation chain: smart-crossfade → standard; richer modes prepend their builder
         smart_fade: SmartFade | None = None
@@ -81,6 +90,7 @@ class SmartFadesMixer:
                 fade_out_bytes_len=len(fade_out_data),
                 fade_in_bytes_len=fade_in_bytes_len,
                 pcm_format=pcm_format,
+                request=request,
             )
         if smart_fade is None:
             smart_fade = await self._build_standard_crossfade(
@@ -207,12 +217,14 @@ class SmartFadesMixer:
         fade_out_bytes_len: int,
         fade_in_bytes_len: int,
         pcm_format: AudioFormat,
+        request: TransitionRequest | None = None,
     ) -> tuple[SmartFade | None, AudioAnalysisData | None]:
         """
         Attempt to build a SmartCrossFade and retain outgoing analysis for fallback.
 
         Returns the built fade (or ``None`` when fallback is needed) together
-        with the outgoing analysis row, when available.
+        with the outgoing analysis row, when available. A client's request is
+        planned by a ``RequestedTransitionPlanner``.
         """
         analyses = await self._load_analyses(fade_out_streamdetails, fade_in_streamdetails)
         fade_out_analysis, fade_in_analysis = analyses
@@ -240,6 +252,13 @@ class SmartFadesMixer:
                 logger=self.logger,
                 fade_out_analysis=fade_out_analysis,
                 fade_in_analysis=fade_in_analysis,
+                planner=(
+                    RequestedTransitionPlanner(
+                        self.logger, request, fade_in_bytes_len / pcm_format.pcm_sample_size
+                    )
+                    if request is not None
+                    else None
+                ),
             )
             smart_fade.build(fade_out_bytes_len, fade_in_bytes_len, pcm_format)
         except SmartFadeNotApplicable as e:
