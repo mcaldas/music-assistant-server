@@ -1333,6 +1333,8 @@ class _FakeAudioBuffer:
     """AudioBuffer test double that streams a fixed run of 1-second chunks."""
 
     has_error = False
+    eof = True
+    cancelled = False
     pcm_format = TEST_PCM_FORMAT
 
     @classmethod

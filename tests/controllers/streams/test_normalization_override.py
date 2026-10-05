@@ -53,6 +53,8 @@ def audio(monkeypatch: pytest.MonkeyPatch) -> tuple[StreamsAudio, dict[str, list
         """AudioBuffer test double: records the filter_params, yields no audio."""
 
         has_error = False
+        eof = True
+        cancelled = False
         pcm_format = PCM_FORMAT
 
         @classmethod

@@ -609,7 +609,8 @@ class StreamsAudio:
         self._crossfade_pending: dict[str, tuple[str, asyncio.Event]] = {}
         # queue_item_id -> media second its audio is committed up to in this pass (read, or
         # held for a fade into it already planned), inf once read to its end; it only grows
-        # until the item stops being current, and set_end_position refuses an end at or before it
+        # within a pass (a new queue session, or a read after inf, starts the next one) until
+        # the item stops being current, and set_end_position refuses an end at or before it
         self.read_positions: dict[str, float] = {}
         self._smart_fades_mixer: SmartFadesMixer | None = None
         # serializes buffer preparation per queue item, so concurrent callers share
@@ -1766,7 +1767,19 @@ class StreamsAudio:
         cut = False
         # the start of a frame the source split between two chunks, held for the next one
         split_frame = b""
-        self._mark_read(queue_item.queue_item_id, read_from)
+        # the queue session this read streams for: once it has ended (a stop, a seek, a
+        # replay) its audio reaches no player, so it no longer holds an end of the item back
+        queue_data = (
+            self.mass.player_queues.queue_data_or_none(streamdetails.queue_id)
+            if session_id and streamdetails.queue_id
+            else None
+        )
+
+        def mark_read(position: float) -> None:
+            if queue_data is None or queue_data.session_id == session_id:
+                self._mark_read(queue_item.queue_item_id, position)
+
+        mark_read(read_from)
         try:
             async for source_chunk in media_stream_gen:
                 chunk, split_frame = split_frame + source_chunk, b""
@@ -1784,11 +1797,10 @@ class StreamsAudio:
                     chunk = fade_out_pcm(chunk, pcm_format, left, end_fade_bytes)
                 bytes_received += len(chunk)
                 # once cut, the pass is read to its end: that end can no longer move
-                self._mark_read(
-                    queue_item.queue_item_id,
+                mark_read(
                     float("inf")
                     if cut
-                    else read_from + bytes_received / pcm_format.pcm_sample_size * playback_speed,
+                    else read_from + bytes_received / pcm_format.pcm_sample_size * playback_speed
                 )
                 if not first_chunk_received:
                     first_chunk_received = True
@@ -1864,9 +1876,9 @@ class StreamsAudio:
                 streamdetails.uri,
             )
         finally:
-            if finished:
-                # this pass is read to its end: its end can no longer move
-                self.read_positions[queue_item.queue_item_id] = float("inf")
+            if finished and audio_buffer.eof and not audio_buffer.cancelled:
+                # this pass is read to its end (a buffer cleared under it ends early, cleanly)
+                mark_read(float("inf"))
             seconds_streamed = bytes_received / pcm_format.pcm_sample_size
             streamdetails.seconds_streamed = seconds_streamed
             logger.log(
@@ -4524,11 +4536,15 @@ class StreamsAudio:
         """
         Record that an item's audio is committed up to ``position`` in this pass.
 
+        A pass read to its end is over, so a read after it is the item's next pass (repeat
+        one) and counts from its own position.
+
         :param queue_item_id: Queue item whose audio is read, or held for a planned fade.
         :param position: Media second up to which the audio can no longer change.
         """
-        self.read_positions[queue_item_id] = max(
-            self.read_positions.get(queue_item_id, position), position
+        read = self.read_positions.get(queue_item_id, position)
+        self.read_positions[queue_item_id] = (
+            position if read == float("inf") else max(read, position)
         )
 
     async def _await_pending_crossfade(

@@ -487,6 +487,74 @@ async def test_a_cut_is_final_from_its_last_chunk(monkeypatch: pytest.MonkeyPatc
     assert item.extra_attributes["end_position"] == 33.25
 
 
+async def test_a_buffer_cleared_under_the_reader_is_not_read_to_its_end(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A stop clears the buffer under a reader: it ends cleanly, but only 30 s were read."""
+    item = _item("a", 1, 240, BufferSize.BALANCED)
+    await _filled(item)
+    audio, _mass = _single_audio(monkeypatch, None)
+    audio_buffer = item.streamdetails.buffer
+    read = 0
+    async for chunk in audio.get_queue_item_stream(cast("Any", item), TEST_PCM_FORMAT):
+        read += len(chunk)
+        if read == 30 * SECOND:
+            # what the stop's cleanup does
+            item.streamdetails.buffer = None
+            await audio_buffer.clear()
+    assert read == 30 * SECOND
+    assert audio.read_positions["a"] == pytest.approx(30.0)
+
+
+async def test_a_stream_of_an_ended_session_holds_no_end_back(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A seek back starts a new session: the old stream reads on a moment, but only the new counts."""
+    item = _item("a", 1, 120, BufferSize.BALANCED)
+    item.streamdetails.queue_id = "queue-1"
+    await _filled(item)
+    audio, mass = _single_audio(monkeypatch, None)
+    queue_data = SimpleNamespace(session_id="s1")
+    mass.player_queues.queue_data_or_none.return_value = queue_data
+    old = audio.get_queue_item_stream(cast("Any", item), TEST_PCM_FORMAT, session_id="s1")
+    for _ in range(30):
+        await anext(old)
+    assert audio.read_positions["a"] == pytest.approx(30.0)
+    # what play_index does for the seek to 10 s
+    queue_data.session_id = "s2"
+    audio.read_positions.clear()
+    await anext(old)
+    new = audio.get_queue_item_stream(
+        cast("Any", item), TEST_PCM_FORMAT, seek_position=10, session_id="s2"
+    )
+    await anext(new)
+    assert audio.read_positions["a"] == pytest.approx(11.0)
+    await old.aclose()
+    await new.aclose()
+
+
+async def test_the_next_pass_of_an_item_read_to_its_end_can_move_its_end(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Repeat one: once a pass is cut, the item's next pass counts from its own start."""
+    item = _item("a", 1, 120, BufferSize.BALANCED, end=33.25)
+    await _filled(item)
+    audio, _mass = _single_audio(monkeypatch, None)
+    queues = MagicMock()
+    queues.get_item.return_value = item
+    queues.mass.streams.audio = audio
+    async for _chunk in audio.get_queue_item_stream(cast("Any", item), TEST_PCM_FORMAT):
+        pass
+    assert audio.read_positions["a"] == float("inf")
+    out = bytearray()
+    async for chunk in audio.get_queue_item_stream(cast("Any", item), TEST_PCM_FORMAT):
+        out.extend(chunk)
+        if len(out) == 5 * SECOND:
+            await PlayerQueuesController.set_end_position(queues, "queue-1", "a", 20.0)
+    _assert_ends_at(out, 20.0)
+    assert len(out) == 20 * SECOND
+
+
 async def test_an_end_fades_out_24_bit_audio_read_in_chunks_that_split_frames(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

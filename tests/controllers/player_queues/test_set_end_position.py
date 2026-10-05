@@ -23,6 +23,10 @@ from music_assistant.controllers.player_queues.playback_tracker import PlaybackT
 from music_assistant.controllers.player_queues.state import PlayerQueueData
 from music_assistant.controllers.streams.smart_fades.planner.requested import TransitionRequest
 from music_assistant.helpers.api import APICommandHandler, parse_arguments
+from tests.controllers.player_queues.test_play_index_elapsed import (
+    QUEUE_ID,
+    _controller_with_stale_queue,
+)
 from tests.controllers.player_queues.test_set_transition import _controller, _item
 
 if TYPE_CHECKING:
@@ -210,3 +214,12 @@ def test_a_last_item_that_ended_at_its_end_settles_the_queue() -> None:
     PlaybackTrackerMixin._handle_end_of_queue(tracker, queue, prev_state, new_state)
     tracker.mass.create_task.assert_called_once()
     tracker.mass.create_task.call_args.args[0].close()
+
+
+async def test_a_new_session_starts_the_read_marks_over() -> None:
+    """A seek, a restart or a resume (play_index) streams afresh: no older read holds an end back."""
+    ctrl, _queue, _signals = _controller_with_stale_queue()
+    read_positions = {"old": float("inf"), "new": 12.0, "other-queue": 5.0}
+    ctrl.mass.streams.audio.read_positions = read_positions
+    await ctrl.play_index(QUEUE_ID, 0, seek_position=30)
+    assert read_positions == {"other-queue": 5.0}

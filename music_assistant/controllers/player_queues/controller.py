@@ -1166,6 +1166,9 @@ class PlayerQueuesController(QueueLoaderMixin, PlaybackTrackerMixin, StreamFeede
             queue_data.next_item_id_enqueued = None
             # always update session id when we start a new playback session
             queue_data.session_id = shortuuid.random(length=8)
+            # the new session streams every item afresh: what older ones read holds no end back
+            for item in queue_data.items:
+                self.mass.streams.audio.read_positions.pop(item.queue_item_id, None)
             self.mass.streams.audio_processing.start_session(
                 queue_id,
                 queue_data.session_id,
