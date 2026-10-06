@@ -217,8 +217,9 @@ class RequestedTransitionPlanner(TransitionPlanner):
     cuts into is refused. Without a requested exit it leaves at the default planner's, moved
     to the nearest downbeat no sung phrase runs past. A filter sweep is a blend handed over
     by filters instead of EQ; an echo out is a cut whose last outgoing beat rings on. A
-    request it cannot honour ships the default planner's plan; ``outcome`` and ``reason``
-    say what happened.
+    request it cannot honour ships the default planner's plan, except that an exit asked on
+    an outgoing track with an end position is kept: A is cut on that exit's downbeat.
+    ``outcome`` and ``reason`` say what happened.
     """
 
     def __init__(
@@ -273,6 +274,10 @@ class RequestedTransitionPlanner(TransitionPlanner):
             fade_out_analysis, fade_in_analysis, buffer_duration, self.logger
         )
         plan = self._plan_request(ctx)
+        if plan is None and self.cut_at_end and self.request.exit_at:
+            # the client fixed where A ends: a cut there, never Smart Fades' own exit, which can
+            # land anywhere in the held tail (half of what the item plays)
+            plan = self._cut_at_exit(ctx)
         self.logger.debug(
             "transition request %s bars=%s exit_at=%s: %s %s",
             self.request.style,
@@ -297,23 +302,13 @@ class RequestedTransitionPlanner(TransitionPlanner):
     def _plan_request(self, ctx: TransitionContext) -> TransitionPlan | None:
         """Build the requested plan on the first exit that takes it, or None (fallback)."""
         bar_out = ctx.outgoing.beats_per_bar * 60.0 / ctx.outgoing.bpm
-        # a downbeat less than a frame past A's end is on it (an end position on a bar line)
-        exits = [
-            min(downbeat, ctx.audio_end)
-            for downbeat in ctx.protective_downbeats
-            if CUT_SECONDS < downbeat <= ctx.audio_end + _GRID_FRAME_S
-        ]
+        exits = _exits(ctx)
         if not exits:
             self._fallback("no_room")
             return None
         if self.request.exit_at:
-            # buffer-local; the client's exit is kept: only the downbeat nearest it is tried
-            target = self.request.exit_at - ctx.buffer_offset
-            exit_s = min(exits, key=lambda downbeat: abs(downbeat - target))
-            # an exit asked past A's last downbeat, with no bar left after it before A's audio
-            # ends (an end position mid-bar): the next downbeat is past the end, so take that one
-            past_last = target > exits[-1] and exits[-1] + bar_out + _GRID_FRAME_S > ctx.audio_end
-            if not past_last and abs(exit_s - target) > bar_out / 2:
+            # the client's exit is kept: only the downbeat nearest it is tried
+            if (exit_s := self._requested_exit(ctx, exits, bar_out)) is None:
                 # no downbeat of A near the asked exit in the tail it holds
                 self._fallback("no_room")
                 return None
@@ -343,6 +338,45 @@ class RequestedTransitionPlanner(TransitionPlanner):
         self._fallback(first_reason or "no_room")
         return None
 
+    def _requested_exit(
+        self, ctx: TransitionContext, exits: list[float], bar_out: float
+    ) -> float | None:
+        """Return the downbeat (buffer-local) nearest the client's exit, None when none is near."""
+        target = self.request.exit_at - ctx.buffer_offset
+        exit_s = min(exits, key=lambda downbeat: abs(downbeat - target))
+        # an exit asked past A's last downbeat, with no bar left after it before A's audio
+        # ends (an end position mid-bar): the next downbeat is past the end, so take that one
+        past_last = target > exits[-1] and exits[-1] + bar_out + _GRID_FRAME_S > ctx.audio_end
+        if not past_last and abs(exit_s - target) > bar_out / 2:
+            return None
+        return exit_s
+
+    def _cut_at_exit(self, ctx: TransitionContext) -> TransitionPlan | None:
+        """
+        Cut A on the downbeat at the client's exit, the request having failed, or None.
+
+        The client fixed both ends (A's end position and exit, B's entry), so the vocal
+        policies stand down: what the client cut, it cut. The outcome stays "fallback" with
+        the request's own reason. None, for the default plan, when no downbeat lies near the
+        exit or the cut itself cannot be built.
+        """
+        bar_out = ctx.outgoing.beats_per_bar * 60.0 / ctx.outgoing.bpm
+        exits = _exits(ctx)
+        exit_s = self._requested_exit(ctx, exits, bar_out) if exits else None
+        if exit_s is None:
+            return None
+        reason = self.reason
+        candidates = self._short_candidates(
+            ctx, CandidateFactory(ctx, self.logger), exits, exit_s, bar_out, quick=False
+        )
+        self.outcome, self.reason = "fallback", reason
+        if not candidates:
+            return None
+        # one candidate, and none of the policies left would reject it
+        plan = PlanAssembler(ctx, self.logger).finalize(candidates[0][0])
+        # inside a mastered fade the assembler picks "nofade", which would stop A dead
+        return replace(plan, fadeout_curve="qsin")
+
     def _plan_exit(
         self, ctx: TransitionContext, exits: list[float], exit_s: float, bar_out: float
     ) -> TransitionPlan | None:
@@ -371,7 +405,9 @@ class RequestedTransitionPlanner(TransitionPlanner):
                 return None
             candidates = self._blend_candidates(ctx, factory, exit_s, bar_out)
         else:
-            candidates = self._short_candidates(ctx, factory, exits, exit_s, bar_out)
+            candidates = self._short_candidates(
+                ctx, factory, exits, exit_s, bar_out, quick=self.request.style == "quick_fade"
+            )
         if not candidates:
             if self.outcome != "fallback":
                 self._fallback("no_room")
@@ -448,13 +484,14 @@ class RequestedTransitionPlanner(TransitionPlanner):
         exits: list[float],
         exit_s: float,
         bar_out: float,
+        quick: bool,
     ) -> list[list[Candidate]]:
-        """Build the unramped quick fade or cut ending on ``exit_s``, B's one on A's downbeat."""
+        """Build the unramped quick fade (or cut) ending on ``exit_s``, B's one on A's downbeat."""
         window = min(float(SMART_CROSSFADE_DURATION), self.fade_in_seconds)
         b_one = float(ctx.incoming.downbeats[0]) if len(ctx.incoming.downbeats) else 0.0
         # a cut's overlap, or a quick fade's whole bars
         bars, fade = 0, CUT_SECONDS
-        if self.request.style == "quick_fade":
+        if quick:
             # Smart Fades' quick-fade length, cut to the whole bars before the exit and to
             # what keeps the two unramped grids from audibly drifting apart
             bars = min(bars_ladder(ctx, TransitionTier.QUICK_FADE)[0], exits.index(exit_s))
@@ -553,7 +590,7 @@ class RequestedTransitionPlanner(TransitionPlanner):
         spec = CandidateSpec(TransitionTier.QUICK_FADE, bars, exit_s, None, source="requested")
         # a cut's pre-roll holds both decks at full between its fades; a quick fade's stays
         # one equal-power fade over the whole overlap unless B's lead-in would leave a dip
-        held = overlap > CUT_SECONDS and (self.request.style != "quick_fade" or hold)
+        held = overlap > CUT_SECONDS and (not quick or hold)
         plan = TransitionPlan(
             tier=TransitionTier.QUICK_FADE,
             fade_out_window=exit_s,
@@ -688,6 +725,16 @@ class RequestedTransitionPlanner(TransitionPlanner):
     def _fallback(self, reason: str) -> None:
         """Record why the default plan ships instead of the requested one."""
         self.outcome, self.reason = "fallback", reason
+
+
+def _exits(ctx: TransitionContext) -> list[float]:
+    """Return A's downbeats in the held tail where it can leave, buffer-local."""
+    # a downbeat less than a frame past A's end is on it (an end position on a bar line)
+    return [
+        min(downbeat, ctx.audio_end)
+        for downbeat in ctx.protective_downbeats
+        if CUT_SECONDS < downbeat <= ctx.audio_end + _GRID_FRAME_S
+    ]
 
 
 def _at_full(metrics: PlanMetrics) -> PlanMetrics:

@@ -539,9 +539,10 @@ class PlayerQueuesController(QueueLoaderMixin, PlaybackTrackerMixin, StreamFeede
         ``transition_request`` extra attribute says what came of it: "applied" (with
         ``transition_request_reason`` "shortened" for a blend shorter than asked, or a quick
         fade under a bar, between tempos that drift apart within one), "fallback" (Smart
-        Fades' own transition plays; the reason is "not_blendable", "no_room" or "vocal") or
-        "ignored" (no smart fade plays). The transition is fixed well before the
-        item ends (on Sonos about two minutes before); after that a request fails.
+        Fades' own transition plays, or a cut on the downbeat at exit_at when the item has an
+        end position; the reason is "not_blendable", "no_room" or "vocal") or "ignored" (no
+        smart fade plays). The transition is fixed well before the item ends (on Sonos about
+        two minutes before); after that a request fails.
 
         :param queue_id: Queue the item is in.
         :param queue_item_id: Item whose ending the request shapes.

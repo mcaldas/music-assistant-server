@@ -14,15 +14,23 @@ from music_assistant.controllers.streams.audio_buffer import AudioBuffer
 from music_assistant.controllers.streams.smart_fades.fades import SmartCrossFade
 from music_assistant.controllers.streams.smart_fades.helpers import (
     analysis_from,
+    analysis_until,
     audible_start,
 )
+from music_assistant.controllers.streams.smart_fades.planner import SmartCrossFadePlanner
 from music_assistant.controllers.streams.smart_fades.planner.requested import (
+    CUT_SECONDS,
     RequestedTransitionPlanner,
     TransitionRequest,
 )
 from music_assistant.controllers.streams.smart_fades.vocal import parse_vocal_probabilities
+from music_assistant.models.audio_analysis import AudioAnalysisData
 from tests.controllers.streams.smart_fades.conftest import _analysis_with_bands
-from tests.controllers.streams.smart_fades.test_planner import _analysis, _vocal_probabilities
+from tests.controllers.streams.smart_fades.test_planner import (
+    _analysis,
+    _vocal_probabilities,
+    _with_vocal_activity,
+)
 from tests.controllers.streams.test_smartfade_transition_timings import (
     PCM,
     _make_mixer,
@@ -181,3 +189,49 @@ async def test_the_incoming_head_is_read_from_the_start() -> None:
     # 3 s from the start's second, less the quarter before the start
     assert len(from_part) == 275
     await audio_buffer.clear()
+
+
+# ---- a requested exit on an end position that cannot be planned ----
+
+# a 120 BPM part ending on its 120 s downbeat, sung up to it
+END = 120.0
+
+
+def _part_sung_to_its_end() -> AudioAnalysisData:
+    """Return a 120 BPM track cut at a 120 s end position, sung up to it."""
+    return analysis_until(_with_vocal_activity(_analysis(120.0), [(80.0, 119.5)]), END)
+
+
+@pytest.mark.parametrize(("bpm", "reason"), [(122.0, "vocal"), (160.0, "not_blendable")])
+def test_a_blend_that_cannot_play_at_an_end_position_is_a_cut_there(
+    bpm: float, reason: str
+) -> None:
+    """A blend into B's sung head (or a tempo too far off) cuts A at its end, not elsewhere."""
+    out = _part_sung_to_its_end()
+    inc = _with_vocal_activity(_analysis(bpm), [(0.0, 40.0)])
+    request = TransitionRequest("blend", "n", 8, END)
+    planner = RequestedTransitionPlanner(LOGGER, request, 45.0, cut_at_end=True)
+    plan = planner.plan(out, inc, 45.0)
+
+    assert (planner.outcome, planner.reason) == ("fallback", reason)
+    assert END - 45.0 + plan.fade_out_window == pytest.approx(END, abs=1e-6)
+    assert plan.crossfade_duration == CUT_SECONDS
+    assert plan.fadeout_curve == "qsin"
+    # an item that is not cut at an end position keeps Smart Fades' own plan
+    uncut = RequestedTransitionPlanner(LOGGER, request, 45.0)
+    assert uncut.plan(out, inc, 45.0) == SmartCrossFadePlanner(LOGGER).plan(out, inc, 45.0)
+    assert (uncut.outcome, uncut.reason) == ("fallback", reason)
+
+
+def test_with_no_downbeat_near_the_exit_the_default_plan_ships() -> None:
+    """A grid ending 4 s before the end has no downbeat to cut on there: Smart Fades' plan."""
+    out = _with_vocal_activity(_analysis(120.0), [(80.0, 119.5)])
+    out.downbeats = [d for d in out.downbeats or [] if d <= 116.0]
+    out = analysis_until(out, END)
+    inc = _with_vocal_activity(_analysis(122.0), [(0.0, 40.0)])
+    planner = RequestedTransitionPlanner(
+        LOGGER, TransitionRequest("blend", "n", 8, END), 45.0, cut_at_end=True
+    )
+    plan = planner.plan(out, inc, 45.0)
+    assert (planner.outcome, planner.reason) == ("fallback", "no_room")
+    assert plan == SmartCrossFadePlanner(LOGGER).plan(out, inc, 45.0)
