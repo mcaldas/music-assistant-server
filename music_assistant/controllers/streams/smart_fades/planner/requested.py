@@ -9,11 +9,14 @@ own pieces and ships the default plan, with a reason, when the request cannot be
 
 from __future__ import annotations
 
+import math
 from dataclasses import asdict, dataclass, replace
 from typing import TYPE_CHECKING
 
 from music_assistant.controllers.streams.smart_fades.helpers import (
+    AUDIBLE_WINDOW_S,
     SMART_CROSSFADE_DURATION,
+    audible_start,
     sustained_energy_floor,
 )
 from music_assistant.controllers.streams.smart_fades.models import (
@@ -49,6 +52,8 @@ from .selection import CandidateSelector
 if TYPE_CHECKING:
     import logging
 
+    import numpy as np
+    import numpy.typing as npt
     from music_assistant_models.constants import EXTRA_ATTRIBUTES_TYPES
 
     from music_assistant.controllers.streams.smart_fades.models import Deck
@@ -85,9 +90,18 @@ _STARTED_FRACTION = 0.5
 # most of it is a soft intro or the start of a fade-in: heard alone after A, near silence.
 # B carries level from the first bin at this line; no beat before it lands on A's exit
 _QUIET_BAR_FRACTION = 0.079
-# how far before the incoming audio's first audible 10 ms (read from its PCM head) a landing
-# may sit: under a 30 ms gap, and about a frame of the analysis' beat grid
+# how far before the incoming audio's start (read from its PCM head) a landing may sit: under
+# a 30 ms gap, and about a frame of the analysis' beat grid
 _HEARD_SLACK_S = 0.02
+# the analysis averages energy over 100 ms windows into its bins: a bin can read loud from audio
+# up to a window past its end
+_ENERGY_WINDOW_S = 0.1
+# the end of a whole-bar quick fade where A has mostly faded out (under -16 dB): B must carry
+# level there, or the room hears the fade die into B's silence
+_FADED_FRACTION = 0.1
+# a gap in the incoming PCM head: this long under its audible line, as a room hears one; the
+# head shows gaps the analysis' ~0.1-0.2 s bins blur
+_GAP_S = 0.03
 
 
 @dataclass(frozen=True, slots=True)
@@ -188,7 +202,7 @@ class RequestedTransitionPlanner(TransitionPlanner):
         logger: logging.Logger,
         request: TransitionRequest,
         fade_in_seconds: float = float(SMART_CROSSFADE_DURATION),
-        incoming_audible_from: float | None = None,
+        incoming_head: npt.NDArray[np.bool_] | None = None,
     ) -> None:
         """
         Initialize the planner for one requested transition.
@@ -196,13 +210,15 @@ class RequestedTransitionPlanner(TransitionPlanner):
         :param logger: Logger for debug output.
         :param request: The client's request for this boundary.
         :param fade_in_seconds: Length of the incoming track's head the mix will receive.
-        :param incoming_audible_from: Where the incoming track's audio first becomes audible,
-            in its seconds, read from the PCM head the mixer holds; None when unknown.
+        :param incoming_head: Which 10 ms windows of the incoming track's head are audible,
+            from its start, read from the PCM the mixer holds; None when unknown.
         """
         super().__init__(logger)
         self.request = request
         self.fade_in_seconds = fade_in_seconds
-        self.incoming_audible_from = incoming_audible_from
+        self.incoming_head = incoming_head
+        # where the incoming track's audio starts to sound, in its seconds
+        self.incoming_audible_from = None if incoming_head is None else audible_start(incoming_head)
         # "applied" | "fallback", read by the stream's transition report
         self.outcome = "applied"
         self.reason: str | None = None
@@ -422,7 +438,9 @@ class RequestedTransitionPlanner(TransitionPlanner):
             )
             for one in [float(d) for d in ctx.incoming.downbeats if d >= heard] or [heard]:
                 overlap = max(CUT_SECONDS, min(fade, one - first_beat))
-                if overlap > CUT_SECONDS and _falls_quiet(ctx.incoming, one - overlap, overlap):
+                if overlap > CUT_SECONDS and _falls_quiet(
+                    ctx.incoming, one - overlap, overlap, self.incoming_head
+                ):
                     overlap = CUT_SECONDS
                 entry = max(0.0, one - overlap)
                 hold = False
@@ -443,11 +461,17 @@ class RequestedTransitionPlanner(TransitionPlanner):
                         return []
                     overlap = max(CUT_SECONDS, land - entry)
                     # a lead-in that breaks or turns quiet where A has mostly faded out would
-                    # leave the room a dip: a quick fade then holds both decks as the cut does
-                    hold = land < one or _falls_quiet(ctx.incoming, one - overlap / 2, overlap / 2)
+                    # leave the room a dip: a quick fade then holds both decks as the cut does.
+                    # A breath shorter than an analysis bin shows only in B's head; without
+                    # it, A holds
+                    hold = (
+                        land < one
+                        or _falls_quiet(ctx.incoming, one - overlap / 2, overlap / 2)
+                        or _gap_in(self.incoming_head, one - overlap / 2, one) is not False
+                    )
                 if entry + overlap > window:
                     return []
-                if not _falls_quiet(ctx.incoming, one):
+                if not _falls_quiet(ctx.incoming, one, head=self.incoming_head):
                     break
             else:
                 return []
@@ -469,9 +493,15 @@ class RequestedTransitionPlanner(TransitionPlanner):
             if entry > overlap + _MAX_UNHEARD_INTRO_S or b_one + overlap > window:
                 entry, lead = 0.0, 0.0
             overlap += lead
-            if overlap > window or _falls_quiet(ctx.incoming, entry + overlap):
-                # past the head of B the mix receives; or B's bar once A has faded out is
-                # near silence (a soft intro, a fade-in): the default plan ships
+            faded = overlap * _FADED_FRACTION
+            if (
+                overlap > window
+                or _falls_quiet(ctx.incoming, entry + overlap, head=self.incoming_head)
+                or _falls_quiet(ctx.incoming, entry + overlap - faded, faded, self.incoming_head)
+            ):
+                # past the head of B the mix receives; or B's bar once A has faded out, or the
+                # end of the fade itself, is near silence (a soft intro, a fade-in, a stop):
+                # the default plan ships
                 return []
         spec = CandidateSpec(TransitionTier.QUICK_FADE, bars, exit_s, None, source="requested")
         # a cut's pre-roll holds both decks at full between its fades; a quick fade's stays
@@ -526,9 +556,20 @@ class RequestedTransitionPlanner(TransitionPlanner):
         duration = ctx.incoming.analysis.duration
         if rms is not None and len(rms) and duration:
             bins = np.asarray(rms, dtype=np.float32)
-            loud = np.flatnonzero(bins >= _QUIET_BAR_FRACTION * sustained_energy_floor(bins))
+            floor = sustained_energy_floor(bins)
+            loud = np.flatnonzero(bins >= _QUIET_BAR_FRACTION * floor)
             if len(loud):
-                heard = max(0.0, (float(loud[0]) - 0.5) * duration / len(bins))
+                first = int(loud[0])
+                heard = max(0.0, (first - 0.5) * duration / len(bins))
+                if (
+                    self.incoming_head is None
+                    and first
+                    and bins[first - 1] <= _SILENT_FRACTION * floor
+                ):
+                    # after a silent head B may start anywhere in that bin or the energy window
+                    # past it, and its grid sit a few frames early: without the PCM head no
+                    # landing before then
+                    heard = (first + 1) * duration / len(bins) + _ENERGY_WINDOW_S
         if self.incoming_audible_from is not None:
             heard = max(heard, self.incoming_audible_from - _HEARD_SLACK_S)
         return heard
@@ -565,7 +606,31 @@ def _at_full(metrics: PlanMetrics) -> PlanMetrics:
     return replace(metrics, weighted_collision_seconds=metrics.collision_seconds)
 
 
-def _falls_quiet(deck: Deck, start: float, seconds: float = 0.0) -> bool:
+def _gap_in(head: npt.NDArray[np.bool_] | None, start: float, end: float) -> bool | None:
+    """
+    Whether the incoming PCM head holds a gap between ``start`` and ``end``, in its seconds.
+
+    None when no head was read, or it ends before ``end``.
+
+    :param head: The incoming track's audible 10 ms windows, from its start.
+    """
+    import numpy as np  # noqa: PLC0415
+
+    last = round(end / AUDIBLE_WINDOW_S)
+    if head is None or last > len(head):
+        return None
+    quiet = ~head[max(0, round(start / AUDIBLE_WINDOW_S)) : last]
+    run = round(_GAP_S / AUDIBLE_WINDOW_S)
+    held = np.convolve(quiet.astype(np.int32), np.ones(run, dtype=np.int32), mode="valid")
+    return len(quiet) >= run and bool((held == run).any())
+
+
+def _falls_quiet(
+    deck: Deck,
+    start: float,
+    seconds: float = 0.0,
+    head: npt.NDArray[np.bool_] | None = None,
+) -> bool:
     """
     Whether the deck falls silent from ``start`` before it has started, or stays quiet.
 
@@ -573,20 +638,32 @@ def _falls_quiet(deck: Deck, start: float, seconds: float = 0.0) -> bool:
     :param start: Where its bar starts, in its own seconds.
     :param seconds: A span to judge instead of the bar, silent anywhere in it (one B fades
         in over).
+    :param head: The incoming track's audible 10 ms windows from its start: a gap in the
+        span, or in the landing's beats, is silence wherever they reach.
     """
     import numpy as np  # noqa: PLC0415
 
+    beat = 60.0 / deck.bpm
+    gap = _gap_in(head, start, start + (seconds or _LANDING_BEATS * beat))
+    if gap:
+        return True
     rms = deck.analysis.rms_energy
     duration = deck.analysis.duration
     if rms is None or len(rms) == 0 or not duration:
         return False
     bins = np.asarray(rms, dtype=np.float32)
     bin_seconds = duration / len(bins)
-    beat = 60.0 / deck.bpm
     low = int(start / bin_seconds + 0.5)
     high = int((start + (seconds or deck.beats_per_bar * beat)) / bin_seconds + 0.5)
+    # every bin that starts inside the landing's beats counts; where the head does not show
+    # them, also the next, the first a stop starting late in them silences whole
     landing = (
-        high if seconds else max(low + 1, int((start + _LANDING_BEATS * beat) / bin_seconds + 0.5))
+        high
+        if seconds
+        else max(
+            low + 1,
+            math.ceil((start + _LANDING_BEATS * beat) / bin_seconds) + (1 if gap is None else 0),
+        )
     )
     bar = bins[low:high]
     if len(bar) == 0:

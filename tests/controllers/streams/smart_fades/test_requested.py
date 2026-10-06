@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 
 import numpy as np
+import numpy.typing as npt
 import pytest
 
 from music_assistant.controllers.streams.smart_fades.models import TransitionPlan, TransitionTier
@@ -33,15 +34,27 @@ def _plan(
     fade_in_seconds: float = 45.0,
     buffer: float = 45.0,
     audible_from: float | None = None,
+    head: npt.NDArray[np.bool_] | None = None,
 ) -> tuple[RequestedTransitionPlanner, TransitionPlan]:
-    """Plan a requested transition over a held tail of ``buffer`` seconds."""
+    """
+    Plan a requested transition over a held tail of ``buffer`` seconds.
+
+    B's PCM head is ``head`` (its audible 10 ms windows), else 3 s audible from ``audible_from``.
+    """
+    if head is None and audible_from is not None:
+        head = _head(audible_from)
     planner = RequestedTransitionPlanner(
-        LOGGER,
-        TransitionRequest(style, "next", bars, exit_at),
-        fade_in_seconds,
-        incoming_audible_from=audible_from,
+        LOGGER, TransitionRequest(style, "next", bars, exit_at), fade_in_seconds, incoming_head=head
     )
     return planner, planner.plan(out, inc, buffer)
+
+
+def _head(audible_from: float, silent: tuple[float, float] | None = None) -> npt.NDArray[np.bool_]:
+    """Return 3 s of B's head as the mixer reads it: audible from ``audible_from``, except ``silent``."""
+    head = np.arange(300) >= round(audible_from * 100)
+    if silent is not None:
+        head[round(silent[0] * 100) : round(silent[1] * 100)] = False
+    return head
 
 
 def _shifted(analysis: AudioAnalysisData, seconds: float) -> AudioAnalysisData:
@@ -416,7 +429,7 @@ def test_a_quick_fade_never_plays_a_lead_in_longer_than_a_bar_from_the_head(
 def test_a_quick_fade_under_a_bar_fades_over_a_sung_pickup_onto_the_one() -> None:
     """Between far tempos B's sung lead-in fades in under A's last beats, its one on A's exit."""
     inc = _with_vocal_activity(_shifted(_analysis(128.0), 1.1), [(0.32, 30.0)])
-    planner, plan = _plan(_analysis(100.0), inc, "quick_fade", exit_at=224.0)
+    planner, plan = _plan(_analysis(100.0), inc, "quick_fade", exit_at=224.0, audible_from=0.0)
 
     assert (planner.outcome, planner.reason) == ("applied", "shortened")
     assert TAIL_START + plan.fade_out_window == pytest.approx(223.2)
@@ -426,6 +439,43 @@ def test_a_quick_fade_under_a_bar_fades_over_a_sung_pickup_onto_the_one() -> Non
     assert plan.fade_seconds is None
     assert plan.fadeout_curve == "qsin"
     assert not plan.tempo_plan
+
+
+@pytest.mark.parametrize(
+    "head",
+    [_head(0.0, (0.95, 1.1)), _head(0.0, (1.04, 1.1)), _head(0.0, (1.07, 1.1)), None],
+    ids=["150-ms-breath", "60-ms-breath", "30-ms-breath", "no-head"],
+)
+def test_a_quick_fade_under_a_bar_holds_a_over_a_breath_only_the_head_shows(
+    head: npt.NDArray[np.bool_] | None,
+) -> None:
+    """
+    B breathes before its one in less than an analysis bin: only B's PCM head shows it.
+
+    A fading out over it would leave the room near silence (-37 dB): A holds at full, as for
+    a cut. Without B's head the breath cannot be ruled out, and A holds too.
+    """
+    inc = _with_vocal_activity(_shifted(_analysis(128.0), 1.1), [(0.32, 30.0)])
+    planner, plan = _plan(_analysis(100.0), inc, "quick_fade", exit_at=224.0, head=head)
+
+    assert (planner.outcome, planner.reason) == ("applied", "shortened")
+    assert plan.fadein_trim_start + plan.crossfade_duration == pytest.approx(1.1)
+    assert plan.fade_seconds == CUT_SECONDS
+
+
+def test_a_quick_fade_under_a_bar_onto_a_breath_in_its_lead_in_becomes_a_cut() -> None:
+    """B's unsung beats before its one break for 60 ms just before it: A's fade would die there."""
+    planner, plan = _plan(
+        _analysis(100.0),
+        _with_pickup(_shifted(_analysis(128.0), 0.1), 2),
+        "quick_fade",
+        exit_at=224.0,
+        head=_head(0.1, (0.1 + 2 * 60.0 / 128.0 - 0.06, 0.1 + 2 * 60.0 / 128.0)),
+    )
+
+    assert (planner.outcome, planner.reason) == ("applied", "shortened")
+    assert plan.crossfade_duration == CUT_SECONDS
+    assert plan.fadein_trim_start == pytest.approx(0.1 + 2 * 60.0 / 128.0 - CUT_SECONDS)
 
 
 def test_a_quick_fade_under_a_bar_holds_a_over_a_break_in_a_sung_pickup() -> None:
@@ -607,16 +657,43 @@ def test_a_cut_lands_past_an_intro_too_quiet_to_hear_alone(level: float, one: fl
 
 @pytest.mark.parametrize(
     ("bars", "outcome", "reason"),
-    [(4, "applied", None), (8, "fallback", "no_room")],
-    ids=["ends-under-the-fade", "plays-on-after-the-fade"],
+    [
+        (3, "applied", None),
+        (4, "fallback", "no_room"),
+        (8, "fallback", "no_room"),
+    ],
+    ids=["ends-under-the-fade", "ends-on-the-fade-s-end", "plays-on-after-the-fade"],
 )
 def test_a_quick_fade_never_leaves_a_quiet_intro_playing_alone(
     bars: int, outcome: str, reason: str | None
 ) -> None:
-    """B's quiet intro may play under A's four-bar fade, not on after it: the default plan ships."""
+    """
+    B's quiet intro may play under A's four-bar fade, not where A has faded out, nor after it.
+
+    The room would hear A's fade die into B 30 dB under its level: the default plan ships.
+    """
     planner, _ = _plan(_analysis(120.0), _soft_intro(bars), "quick_fade", exit_at=224.0)
 
     assert (planner.outcome, planner.reason) == (outcome, reason)
+
+
+@pytest.mark.parametrize(
+    ("head", "outcome"),
+    [(None, "applied"), (_head(1.0), "applied"), (_head(1.0, (2.94, 3.0)), "fallback")],
+    ids=["no-head", "sounds-through", "breath-before-its-next-one"],
+)
+def test_a_whole_bar_quick_fade_never_dies_into_a_breath_only_the_head_shows(
+    head: npt.NDArray[np.bool_] | None, outcome: str
+) -> None:
+    """A one-bar fade ends on B's next one, 3 s in; a 60 ms breath before it is A's fade dying out."""
+    planner, plan = _plan(
+        _analysis(120.0), _shifted(_analysis(120.0), 1.0), "quick_fade", exit_at=198.0, head=head
+    )
+
+    assert planner.outcome == outcome
+    if outcome == "applied":
+        assert plan.fadein_trim_start == pytest.approx(1.0)
+        assert plan.crossfade_duration == pytest.approx(2.0)
 
 
 def _stops_late_in_a_bar(bar: float = 1.0) -> AudioAnalysisData:
@@ -632,6 +709,32 @@ def test_a_cut_keeps_the_one_when_b_stops_later_in_the_bar() -> None:
 
     assert (planner.outcome, planner.reason) == ("applied", None)
     assert plan.fadein_trim_start == pytest.approx(1.0 - CUT_SECONDS)
+
+
+@pytest.mark.parametrize(
+    ("silent", "head"),
+    [((0.85, 1.25), None), ((0.94, 1.34), None), ((0.85, 1.25), _head(0.1, (0.85, 1.25)))],
+    ids=["in-the-bins", "late-in-a-bin", "only-in-the-head"],
+)
+def test_a_cut_hears_a_stop_inside_the_landing_s_beats_as_a_gap(
+    silent: tuple[float, float], head: npt.NDArray[np.bool_] | None
+) -> None:
+    """
+    B stops for 0.4 s from 1.5 (or 1.68) beats after its one, inside the landing's 1.75: B's next one.
+
+    The 133 ms bins blur it: the first fully silent one may start past 1.75 beats, or, with
+    B's PCM head read, none at all.
+    """
+    rms = np.full(1800, 0.5, dtype=np.float32)
+    if head is None:
+        for i in range(int(silent[0] / BIN), int(silent[1] / BIN) + 1):
+            hidden = min(silent[1], (i + 1) * BIN) - max(silent[0], i * BIN)
+            rms[i] = 0.5 * np.sqrt(max(0.0, 1.0 - hidden / BIN))
+    inc = _shifted(_analysis(120.0, rms_energy=rms), 0.1)
+    planner, plan = _plan(_analysis(120.0), inc, "cut", exit_at=224.0, head=head)
+
+    assert (planner.outcome, planner.reason) == ("applied", None)
+    assert plan.fadein_trim_start == pytest.approx(2.1 - CUT_SECONDS)
 
 
 def test_a_quick_fade_plays_on_into_b_s_own_stop() -> None:
@@ -659,10 +762,31 @@ def test_a_cut_reads_the_silence_before_the_one_as_before_it() -> None:
     rms = np.full(1800, 0.5, dtype=np.float32)
     rms[: int(1.1 / 240.0 * 1800)] = 0.001
     inc = _shifted(_analysis(120.0, rms_energy=rms), 1.05)
-    planner, plan = _plan(_analysis(120.0), inc, "cut", exit_at=224.0)
+    planner, plan = _plan(_analysis(120.0), inc, "cut", exit_at=224.0, audible_from=1.06)
 
     assert (planner.outcome, planner.reason) == ("applied", None)
     assert plan.fadein_trim_start == pytest.approx(1.05 - CUT_SECONDS)
+
+
+@pytest.mark.parametrize("onset", [0.2, 0.38, 0.58, 1.0])
+def test_without_its_head_a_cut_keeps_clear_of_where_a_silent_b_may_start(onset: float) -> None:
+    """
+    B is silent to ``onset`` and its grid sits 40 ms early; its PCM head was not read.
+
+    B may start anywhere in its first loud analysis bin, or in the 100 ms energy window past it
+    (0.58 s reads loud in the bin ending 0.533 s): the cut lands no earlier, on B's next one,
+    never 40 ms of silence before B.
+    """
+    # the analysis' energy: 100 ms windows (their share of B's audio), averaged into the bins
+    windows = np.clip((np.arange(2400) + 1) * 0.1 - onset, 0.0, 0.1) / 0.1 * 0.25
+    power = np.concatenate(([0.0], np.cumsum(windows)))
+    edges = np.interp(np.linspace(0, 2400, 1801), np.arange(2401), power)
+    rms = np.sqrt(np.diff(edges) / (2400 / 1800)).astype(np.float32)
+    inc = _shifted(_analysis(120.0, rms_energy=rms), onset - 0.04)
+    planner, plan = _plan(_analysis(120.0), inc, "cut", exit_at=224.0)
+
+    assert (planner.outcome, planner.reason) == ("applied", None)
+    assert plan.fadein_trim_start + plan.crossfade_duration == pytest.approx(onset - 0.04 + 2.0)
 
 
 @pytest.mark.parametrize(

@@ -20,6 +20,7 @@ from music_assistant.controllers.streams.smart_fades.fades import (
     StandardCrossFade,
     _feed_ffmpeg_stdin,
 )
+from music_assistant.controllers.streams.smart_fades.helpers import audible_windows
 from music_assistant.controllers.streams.smart_fades.mixer import SmartFadesMixer
 from music_assistant.controllers.streams.smart_fades.planner.requested import (
     CUT_SECONDS,
@@ -434,7 +435,9 @@ async def test_a_sung_pickup_pre_rolls_under_the_outgoing_track(style: str) -> N
     inc.rms_energy[0] = 0.0
     inc.extra_data = {"vocal_activity": [0.9 if i >= 2 else 0.05 for i in range(1800)]}
     planner = RequestedTransitionPlanner(
-        logging.getLogger(), TransitionRequest(style, "n", 0, 224.0)
+        logging.getLogger(),
+        TransitionRequest(style, "n", 0, 224.0),
+        incoming_head=audible_windows(fade_in[: 3 * SR * 2].tobytes(), PCM),
     )
     fade = SmartCrossFade(logging.getLogger(), out, inc, planner)
     fade.build(fade_out.nbytes, fade_in.nbytes, PCM)
@@ -451,7 +454,8 @@ async def test_a_sung_pickup_pre_rolls_under_the_outgoing_track(style: str) -> N
         None if style == "cut" else "shortened",
     )
     assert cut == pytest.approx(29.0, abs=0.001)
-    assert timing.crossfade_duration > 0.7
+    # from where B's head starts to sound
+    assert timing.crossfade_duration == pytest.approx(0.7, abs=0.001)
     # one click within 60 ms of A's exit: B's one, on it to the millisecond; A's is cut away
     edges = np.flatnonzero(np.abs(np.diff(window(cut - 0.06, cut + 0.06)[0::2])) > 0.3)
     assert len(edges) > 0
@@ -746,4 +750,268 @@ async def test_the_mixer_reads_no_head_from_a_buffer_that_starts_later() -> None
     )
     details.buffer = buffer
 
-    assert await SmartFadesMixer(streams)._audible_from(details) is None
+    assert await SmartFadesMixer(streams)._audible_head(details) is None
+
+
+def _bins_of(fade_in: np.ndarray, duration: float = 240.0) -> list[float]:
+    """Return the analysis' 1800 energy bins of a track whose 45 s head is ``fade_in``, as it bins them."""
+    mono = fade_in[0::2].astype(np.float64)
+    width = duration / 1800 * SR
+    head = [
+        float(np.sqrt(np.mean(mono[round(i * width) : round((i + 1) * width)] ** 2)))
+        for i in range(int(len(mono) / width))
+    ]
+    # the rest of the song plays on at its last level
+    bins = np.array(head + [head[-1]] * (1800 - len(head)))
+    return (bins / bins.max()).tolist()
+
+
+async def _through_the_mixer(
+    out: AudioAnalysisData,
+    inc: AudioAnalysisData,
+    fade_out: np.ndarray,
+    fade_in: np.ndarray,
+    request: TransitionRequest,
+) -> SmartCrossFade:
+    """Build a requested fade as the stream engine does, B's head resident in its buffer."""
+    streams = MagicMock()
+    streams.logger = logging.getLogger()
+    streams.audio_analysis.get_audio_analysis = AsyncMock(
+        side_effect=lambda item_id, *_, **__: out if item_id == "a" else inc
+    )
+    details = {
+        item_id: StreamDetails(
+            provider="test",
+            item_id=item_id,
+            audio_format=PCM,
+            media_type=MediaType.TRACK,
+            stream_type=StreamType.HTTP,
+        )
+        for item_id in ("a", "b")
+    }
+    buffer = AudioBuffer(PCM)
+    for second in range(4):
+        await buffer._put(fade_in.tobytes()[second * PCM.pcm_sample_size :][: PCM.pcm_sample_size])
+    details["b"].buffer = buffer
+    fade = await SmartFadesMixer(streams).build(
+        fade_in_streamdetails=details["b"],
+        fade_out_streamdetails=details["a"],
+        pcm_format=PCM,
+        standard_crossfade_duration=10,
+        mode=CrossfadeMode.SMART_CROSSFADE,
+        fade_out_data=fade_out.tobytes(),
+        fade_in_bytes_len=fade_in.nbytes,
+        request=request,
+    )
+    assert isinstance(fade, SmartCrossFade)
+    return fade
+
+
+async def _mix_of(fade: SmartCrossFade, fade_out: np.ndarray, fade_in: np.ndarray) -> np.ndarray:
+    """Return the fade's audio, as interleaved stereo."""
+    chunks = [chunk async for chunk in fade.apply(fade_out.tobytes(), fade_in.tobytes(), PCM)]
+    return np.frombuffer(b"".join(chunks), dtype=np.float32)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("breath", [0.15, 0.1, 0.06])
+async def test_a_quick_fade_never_fades_out_over_a_breath_shorter_than_an_analysis_bin(
+    breath: float,
+) -> None:
+    """
+    B sings from 0.4 s and breathes just before its one at 1.1 s, inside one analysis bin.
+
+    Only the PCM head the mixer reads shows the breath: A holds at full over the pickup, so
+    the room never hears A fade into it (it heard -37.5 dB).
+    """
+    fade_out, fade_in = _tone(440.0, 45.0), np.zeros(int(45.0 * SR) * 2, dtype=np.float32)
+    voice = _tone(1760.0, 45.0)
+    for start, end in ((0.4, 1.1 - breath), (1.1, 45.0)):
+        fade_in[int(start * SR) * 2 : int(end * SR) * 2] = voice[
+            int(start * SR) * 2 : int(end * SR) * 2
+        ]
+    out, inc = _analysis(120.0, 240.0), _analysis(130.0, 240.0)
+    assert inc.beats is not None
+    inc.beats = [beat + 1.1 for beat in inc.beats]
+    inc.downbeats = inc.beats[::4]
+    inc.rms_energy = _bins_of(fade_in)
+    inc.extra_data = {"vocal_activity": [0.9 if i >= 3 else 0.05 for i in range(1800)]}
+    fade = await _through_the_mixer(
+        out, inc, fade_out, fade_in, TransitionRequest("quick_fade", "n", 0, 224.0)
+    )
+    mix = await _mix_of(fade, fade_out, fade_in)
+    timing = fade.timing_info
+    cut = timing.pre_crossfade_duration + timing.crossfade_duration
+
+    assert (fade.planner.outcome, fade.planner.reason) == ("applied", "shortened")
+    assert cut == pytest.approx(29.0, abs=0.001)
+    assert timing.crossfade_duration == pytest.approx(0.7, abs=0.001)
+    # no 10 ms stretch from before the pickup to B's first bar drops 30 dB under a tone
+    assert _quietest_after(mix, cut - 1.0, 1.5) > 20 * np.log10(0.2 / np.sqrt(2)) - 30.0
+
+
+@pytest.mark.asyncio
+async def test_a_requested_cut_never_lands_on_a_click_before_b_s_music() -> None:
+    """
+    B clicks for 10 ms at 0.02 s, on its grid's first downbeat, and its music starts at 0.25 s.
+
+    The click is no start: the cut lands B's next one, not 0.23 s of silence before the music.
+    """
+    fade_out, fade_in = _tone(440.0, 45.0), _tone(1760.0, 45.0)
+    fade_in[: int(0.25 * SR) * 2] = 0.0
+    click = 0.1 * np.sin(2 * np.pi * 2000.0 * np.arange(int(0.01 * SR)) / SR)
+    fade_in[int(0.02 * SR) * 2 : int(0.03 * SR) * 2] = np.repeat(click, 2)[: int(0.01 * SR) * 2]
+    out, inc = _analysis(120.0, 240.0), _analysis(120.0, 240.0)
+    assert inc.beats is not None
+    inc.beats = [beat + 0.02 for beat in inc.beats]
+    inc.downbeats = inc.beats[::4]
+    inc.rms_energy = _bins_of(fade_in)
+    fade = await _through_the_mixer(
+        out, inc, fade_out, fade_in, TransitionRequest("cut", "n", 0, 224.0)
+    )
+    mix = await _mix_of(fade, fade_out, fade_in)
+    timing = fade.timing_info
+    cut = timing.pre_crossfade_duration + timing.crossfade_duration
+
+    assert fade.planner.outcome == "applied"
+    assert fade.plan is not None
+    assert (fade.plan.fadein_trim_start or 0.0) + fade.plan.crossfade_duration == pytest.approx(
+        2.02
+    )
+    assert cut == pytest.approx(29.0, abs=0.001)
+    assert _quietest_after(mix, cut, 1.0) > -50.0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("style", ["cut", "quick_fade"])
+async def test_a_click_before_a_silent_head_never_moves_where_b_is_heard(style: str) -> None:
+    """
+    Pepas with a click: 10 ms at 0.02 s, silent to its voice at 0.38 s, its grid back to 0.18 s.
+
+    The click is no start: A's exit lands B's first beat heard, 0.64 s, not 0.18 s with
+    0.2 s of silence after A.
+    """
+    fade_out = _tone(440.0, 45.0)
+    fade_in = _tone(1760.0, 45.0)
+    fade_in[: int(0.38 * SR) * 2] = 0.0
+    click = 0.1 * np.sin(2 * np.pi * 2000.0 * np.arange(int(0.01 * SR)) / SR)
+    fade_in[int(0.02 * SR) * 2 : int(0.03 * SR) * 2] = np.repeat(click, 2)[: int(0.01 * SR) * 2]
+    out, inc = _analysis(100.0, 240.0), _analysis(130.0, 240.0)
+    assert inc.beats is not None
+    inc.beats = [beat + 0.18 for beat in inc.beats]
+    inc.downbeats = inc.beats[2::4]
+    inc.rms_energy = _bins_of(fade_in)
+    inc.extra_data = {"vocal_activity": [0.9 if i >= 2 else 0.05 for i in range(1800)]}
+    fade = await _through_the_mixer(
+        out, inc, fade_out, fade_in, TransitionRequest(style, "n", 0, 224.0)
+    )
+    mix = await _mix_of(fade, fade_out, fade_in)
+    timing = fade.timing_info
+    cut = timing.pre_crossfade_duration + timing.crossfade_duration
+
+    assert fade.planner.outcome == "applied"
+    assert fade.plan is not None
+    assert (fade.plan.fadein_trim_start or 0.0) + fade.plan.crossfade_duration == pytest.approx(
+        0.18 + 60.0 / 130.0
+    )
+    assert _quietest_after(mix, cut, 1.0) > -50.0
+
+
+@pytest.mark.asyncio
+async def test_a_whole_bar_quick_fade_never_dies_into_b_s_silence() -> None:
+    """
+    B's first bar plays 20 dB under its level and falls silent for its last 0.34 s.
+
+    A one-bar quick fade (an exit one bar into A's tail) would end A's fade on that silence:
+    the room heard the fade die out 47 ms before the switch. The default plan ships instead.
+    """
+    fade_out, fade_in = _tone(440.0, 45.0), _tone(1760.0, 45.0)
+    fade_in[: int(0.1 * SR) * 2] = 0.0
+    fade_in[int(0.1 * SR) * 2 : int(2.1 * SR) * 2] *= 0.1
+    fade_in[int(1.76 * SR) * 2 : int(2.1 * SR) * 2] = 0.0
+    out, inc = _analysis(120.0, 240.0), _analysis(120.0, 240.0)
+    assert inc.beats is not None
+    inc.beats = [beat + 0.1 for beat in inc.beats]
+    inc.downbeats = inc.beats[::4]
+    inc.rms_energy = _bins_of(fade_in)
+    fade = await _through_the_mixer(
+        out, inc, fade_out, fade_in, TransitionRequest("quick_fade", "n", 0, 198.0)
+    )
+    mix = await _mix_of(fade, fade_out, fade_in)
+    timing = fade.timing_info
+    start = timing.pre_crossfade_duration
+    cut = start + timing.crossfade_duration
+
+    assert (fade.planner.outcome, fade.planner.reason) == ("fallback", "no_room")
+    # no 10 ms stretch through the default plan's mix drops 30 dB under a tone
+    assert (
+        _quietest_after(mix, start - 0.5, cut - start + 1.5)
+        > 20 * np.log10(0.2 / np.sqrt(2)) - 30.0
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("outgoing_bpm", "bpm", "style"), [(120.0, 120.0, "cut"), (100.0, 130.0, "quick_fade")]
+)
+async def test_a_requested_switch_never_lands_on_a_stop_a_beat_and_a_half_in(
+    outgoing_bpm: float, bpm: float, style: str
+) -> None:
+    """B stops for 0.4 s from 1.5 beats after its one: a gap at the switch, so B's next one."""
+    fade_out, fade_in = _tone(440.0, 45.0), _tone(1760.0, 45.0)
+    stop = 0.1 + 1.5 * 60.0 / bpm
+    fade_in[: int(0.1 * SR) * 2] = 0.0
+    fade_in[int(stop * SR) * 2 : int((stop + 0.4) * SR) * 2] = 0.0
+    out, inc = _analysis(outgoing_bpm, 240.0), _analysis(bpm, 240.0)
+    assert inc.beats is not None
+    inc.beats = [beat + 0.1 for beat in inc.beats]
+    inc.downbeats = inc.beats[::4]
+    inc.rms_energy = _bins_of(fade_in)
+    fade = await _through_the_mixer(
+        out, inc, fade_out, fade_in, TransitionRequest(style, "n", 0, 224.0)
+    )
+    mix = await _mix_of(fade, fade_out, fade_in)
+    timing = fade.timing_info
+    cut = timing.pre_crossfade_duration + timing.crossfade_duration
+
+    assert fade.planner.outcome == "applied"
+    assert fade.plan is not None
+    assert (fade.plan.fadein_trim_start or 0.0) + fade.plan.crossfade_duration == pytest.approx(
+        0.1 + 4 * 60.0 / bpm
+    )
+    assert _quietest_after(mix, cut, 2.0) > -50.0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("onset", [0.2, 0.38, 1.0])
+async def test_without_its_head_a_cut_never_lands_in_a_silent_b_before_it_starts(
+    onset: float,
+) -> None:
+    """
+    B is silent to ``onset``, its grid 40 ms early, and its PCM head was not read (a seek).
+
+    From the analysis alone the cut keeps clear of B's first loud bin: B's next one, never
+    40 ms of digital silence after A.
+    """
+    fade_out, fade_in = _tone(440.0, 45.0), _tone(1760.0, 45.0)
+    fade_in[: int(onset * SR) * 2] = 0.0
+    out, inc = _analysis(120.0, 240.0), _analysis(120.0, 240.0)
+    assert inc.beats is not None
+    inc.beats = [beat + onset - 0.04 for beat in inc.beats]
+    inc.downbeats = inc.beats[::4]
+    inc.rms_energy = _bins_of(fade_in)
+    planner = RequestedTransitionPlanner(
+        logging.getLogger(), TransitionRequest("cut", "n", 0, 224.0)
+    )
+    fade = SmartCrossFade(logging.getLogger(), out, inc, planner)
+    fade.build(fade_out.nbytes, fade_in.nbytes, PCM)
+    mix = await _mix_of(fade, fade_out, fade_in)
+    timing = fade.timing_info
+    cut = timing.pre_crossfade_duration + timing.crossfade_duration
+
+    assert planner.outcome == "applied"
+    assert fade.plan is not None
+    assert (fade.plan.fadein_trim_start or 0.0) + fade.plan.crossfade_duration == pytest.approx(
+        onset - 0.04 + 2.0
+    )
+    assert _quietest_after(mix, cut, 1.0) > -50.0

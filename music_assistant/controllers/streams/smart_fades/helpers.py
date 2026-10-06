@@ -22,10 +22,13 @@ MIN_EFFECTIVE_FADE_BUFFER = 8.0
 # carries the groove; the crossfade should end at or before this point.
 MIX_OUT_ENERGY_FRACTION = 0.70
 
-# A track's PCM head is audible from its first 10 ms within this many dB of its loudest
-# 50 ms, and never under the floor (a source's noise before the music starts).
+# A 10 ms window of a track's PCM head is audible within this many dB of its loudest 50 ms,
+# and never under the floor (a source's noise before the music starts).
 AUDIBLE_RANGE_DB = 30.0
 AUDIBLE_FLOOR_DBFS = -60.0
+AUDIBLE_WINDOW_S = 0.01
+# the head starts where it stays audible this long: a lone click or pop before it is no start
+AUDIBLE_RUN_S = 0.05
 
 
 def detect_effective_audio_end(
@@ -242,12 +245,12 @@ def generate_synthetic_timestamps(
     return np.linspace(0, stretch_duration, n_points, dtype=np.float32)
 
 
-def audible_start(pcm: bytes, pcm_format: AudioFormat) -> float:
+def audible_windows(pcm: bytes, pcm_format: AudioFormat) -> npt.NDArray[np.bool_]:
     """
-    Return where a track's PCM head first becomes audible, in seconds from its start.
+    Return which 10 ms windows of a track's PCM head are audible.
 
-    Its first 10 ms within ``AUDIBLE_RANGE_DB`` of its loudest 50 ms and over
-    ``AUDIBLE_FLOOR_DBFS``; the head's whole length when nothing in it is.
+    A window is audible within ``AUDIBLE_RANGE_DB`` of the head's loudest 50 ms and over
+    ``AUDIBLE_FLOOR_DBFS``.
 
     :param pcm: Interleaved little-endian PCM from the track's start (integer or float).
     :param pcm_format: Format of the audio.
@@ -266,13 +269,32 @@ def audible_start(pcm: bytes, pcm_format: AudioFormat) -> float:
     if not floating:
         samples /= 2.0 ** (8 * raw.shape[1] - 1)
     frames = np.mean(samples.reshape(-1, pcm_format.channels) ** 2, axis=1)
-    step = max(1, pcm_format.sample_rate // 100)
+    step = max(1, round(pcm_format.sample_rate * AUDIBLE_WINDOW_S))
     windows = len(frames) // step
     power = frames[: windows * step].reshape(windows, step).mean(axis=1)
     loudest = float(np.convolve(power, np.ones(5) / 5, mode="valid").max()) if windows >= 5 else 0.0
     line = max(loudest * 10 ** (-AUDIBLE_RANGE_DB / 10), 10 ** (AUDIBLE_FLOOR_DBFS / 10))
-    heard = np.flatnonzero(power >= line)
-    return float(heard[0] * step if len(heard) else len(frames)) / pcm_format.sample_rate
+    audible: npt.NDArray[np.bool_] = power >= line
+    return audible
+
+
+def audible_start(audible: npt.NDArray[np.bool_]) -> float:
+    """
+    Return where a track's head starts to sound, in seconds from its start.
+
+    Its first ``AUDIBLE_RUN_S`` of audible windows on end; the head's whole length when
+    none is that long.
+
+    :param audible: The head's audible 10 ms windows, as ``audible_windows`` returns them.
+    """
+    import numpy as np  # noqa: PLC0415
+
+    run = round(AUDIBLE_RUN_S / AUDIBLE_WINDOW_S)
+    if len(audible) < run:
+        return len(audible) * AUDIBLE_WINDOW_S
+    held = np.convolve(audible.astype(np.int32), np.ones(run, dtype=np.int32), mode="valid")
+    starts = np.flatnonzero(held == run)
+    return float(starts[0] if len(starts) else len(audible)) * AUDIBLE_WINDOW_S
 
 
 def sustained_energy_floor(rms_energy: npt.NDArray[np.float32]) -> float:

@@ -19,6 +19,7 @@ from music_assistant.controllers.streams.smart_fades.fades import (
 )
 from music_assistant.controllers.streams.smart_fades.helpers import (
     audible_start,
+    audible_windows,
     detect_effective_audio_end,
 )
 from music_assistant.controllers.streams.smart_fades.planner.requested import (
@@ -34,6 +35,8 @@ from music_assistant.helpers.audio import align_audio_to_frame_boundary, strip_s
 from music_assistant.models.audio_analysis import AudioAnalysisData
 
 if TYPE_CHECKING:
+    import numpy as np
+    import numpy.typing as npt
     from music_assistant_models.media_items import AudioFormat
     from music_assistant_models.streamdetails import StreamDetails
 
@@ -253,8 +256,8 @@ class SmartFadesMixer:
                 fade_in_analysis.beats is not None if fade_in_analysis else None,
             )
             return None, fade_out_analysis
-        audible_from = (
-            await self._audible_from(fade_in_streamdetails) if request is not None else None
+        audible_head = (
+            await self._audible_head(fade_in_streamdetails) if request is not None else None
         )
         try:
             smart_fade = SmartCrossFade(
@@ -266,7 +269,7 @@ class SmartFadesMixer:
                         self.logger,
                         request,
                         fade_in_bytes_len / pcm_format.pcm_sample_size,
-                        incoming_audible_from=audible_from,
+                        incoming_head=audible_head,
                     )
                     if request is not None
                     else None
@@ -283,9 +286,9 @@ class SmartFadesMixer:
             return None, fade_out_analysis
         return smart_fade, fade_out_analysis
 
-    async def _audible_from(self, streamdetails: StreamDetails) -> float | None:
+    async def _audible_head(self, streamdetails: StreamDetails) -> npt.NDArray[np.bool_] | None:
         """
-        Return where the incoming track's audio starts, read from the head its buffer holds.
+        Return which 10 ms of the incoming track's head are audible, from the head its buffer holds.
 
         None when the buffer no longer holds the track's start, or a read fails: the planner
         then judges from its analysis alone.
@@ -301,12 +304,12 @@ class SmartFadesMixer:
             head = [await audio_buffer.read_chunk_for_analysis(n) for n in range(seconds)]
             if not head:
                 return None
-            audible_from = audible_start(b"".join(head), audio_buffer.pcm_format)
+            audible = audible_windows(b"".join(head), audio_buffer.pcm_format)
         except Exception as err:
             self.logger.debug("Reading where the incoming track starts failed: %s", err)
             return None
-        self.logger.debug("Incoming track audible from %.3fs", audible_from)
-        return audible_from
+        self.logger.debug("Incoming track audible from %.3fs", audible_start(audible))
+        return audible
 
     async def _load_analyses(
         self,

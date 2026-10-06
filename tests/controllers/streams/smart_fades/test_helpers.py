@@ -11,6 +11,7 @@ from music_assistant_models.media_items import AudioFormat
 
 from music_assistant.controllers.streams.smart_fades.helpers import (
     audible_start,
+    audible_windows,
     camelot_affinity,
     db_ramp,
     detect_effective_audio_end,
@@ -187,9 +188,9 @@ def test_audible_start_finds_the_onset_to_the_10ms_window(
     """A tone from 0.383 s over silence, or a -70 dBFS noise floor, is heard from its window."""
     fmt = AudioFormat(content_type=content_type, sample_rate=48000, bit_depth=bit_depth, channels=2)
 
-    assert audible_start(_pcm_head(content_type, bit_depth, 0.383, noise_db), fmt) == (
-        pytest.approx(0.38)
-    )
+    assert audible_start(
+        audible_windows(_pcm_head(content_type, bit_depth, 0.383, noise_db), fmt)
+    ) == (pytest.approx(0.38))
 
 
 def test_audible_start_of_a_head_that_never_sounds_is_its_length() -> None:
@@ -199,4 +200,19 @@ def test_audible_start_of_a_head_that_never_sounds_is_its_length() -> None:
     )
     head = _pcm_head(ContentType.PCM_F32LE, 32, 5.0, -75.0)
 
-    assert audible_start(head, fmt) == pytest.approx(2.0)
+    assert audible_start(audible_windows(head, fmt)) == pytest.approx(2.0)
+
+
+@pytest.mark.parametrize("click_at", [0.02, 0.3])
+def test_audible_start_is_where_the_head_sounds_on_not_a_lone_click(click_at: float) -> None:
+    """A 10 ms click before the music, as loud as it, is no start: the music from 0.5 s is."""
+    fmt = AudioFormat(
+        content_type=ContentType.PCM_F32LE, sample_rate=48000, bit_depth=32, channels=2
+    )
+    head = np.frombuffer(_pcm_head(ContentType.PCM_F32LE, 32, 0.5, -200.0), dtype="<f4").copy()
+    click = np.sin(2 * np.pi * 2000.0 * np.arange(480) / 48000)
+    head[int(click_at * 48000) * 2 : int(click_at * 48000) * 2 + 960] = np.repeat(0.1 * click, 2)
+    audible = audible_windows(head.tobytes(), fmt)
+
+    assert audible[round(click_at * 100)]
+    assert audible_start(audible) == pytest.approx(0.5)
