@@ -12,7 +12,7 @@ import time
 from collections.abc import AsyncGenerator, Iterable, Mapping
 from concurrent.futures import ThreadPoolExecutor
 from math import isfinite
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 from music_assistant_models.audio_analysis import AudioAnalysisCoverage
 from music_assistant_models.auth import Scope
@@ -31,7 +31,17 @@ from music_assistant.constants import (
     LOUDNESS_MEASUREMENT_MIN_LUFS,
     MASS_LOGGER_NAME,
 )
-from music_assistant.controllers.streams.audio_buffer import AudioBufferDiscarded, AudioBufferEOF
+from music_assistant.controllers.streams.audio_buffer import (
+    AudioBuffer,
+    AudioBufferDiscarded,
+    AudioBufferEOF,
+)
+from music_assistant.controllers.streams.constants import (
+    BUFFER_SIZE_MAP,
+    CONF_BUFFER_SIZE,
+    CONF_BUFFER_SIZE_DEFAULT,
+    BufferSize,
+)
 from music_assistant.helpers.api import api_command
 from music_assistant.helpers.datetime import local_clock_time_to_utc, utc_timestamp
 from music_assistant.helpers.json import json_dumps, json_loads
@@ -95,8 +105,8 @@ if TYPE_CHECKING:
     from music_assistant_models.media_items import AudioFormat, Track
     from music_assistant_models.streamdetails import StreamDetails
 
-    from music_assistant.controllers.streams.audio_buffer import AudioBuffer
     from music_assistant.controllers.streams.controller import StreamsController
+    from music_assistant.models.media_capabilities import AudioStreamMixin
 
 
 def _get_row_value(row: Mapping[str, Any], key: str) -> Any:
@@ -720,6 +730,64 @@ class AudioAnalysisController:
             item_id, provider_instance_id_or_domain, priority=(SMART_FADES_ANALYSIS_DOMAIN,)
         )
         return _bar_grid(analysis, include_beats) if analysis else None
+
+    @api_command("audio_analysis/analyze")
+    async def analyze(self, item_id: str, provider_instance_id_or_domain: str) -> bool:
+        """
+        Analyse a track from its start without playing it; True when its analysis started.
+
+        The track's audio is decoded into a buffer as a play from 0 would, which the analysis
+        reads, so the stored row is the one a play makes (audio_analysis/bar_grid answers once
+        it is done). Refused (False) while a player streams, since its next item may need the
+        provider's only source slot; without Smart Fades; when the track is already analysed
+        at Smart Fades' current version or being analysed; and when its length is unknown or
+        longer than a buffer holds, as its source would then hold the slot until the buffer
+        is read.
+
+        :param item_id: Provider-native item ID.
+        :param provider_instance_id_or_domain: Music provider instance ID or domain.
+        """
+        smart_fades = next(
+            (prov for prov in self.providers if prov.domain == SMART_FADES_ANALYSIS_DOMAIN), None
+        )
+        if self.playback_active() or smart_fades is None:
+            return False
+        provider = self.mass.get_provider(
+            provider_instance_id_or_domain, provider_type=MusicProvider
+        )
+        if provider is None:
+            raise ProviderUnavailableError(f"{provider_instance_id_or_domain} is not available")
+        version = await self.get_audio_analysis_version(
+            item_id, provider.instance_id, SMART_FADES_ANALYSIS_DOMAIN
+        )
+        if version is not None and version >= smart_fades.analysis_version:
+            return False
+        details = await cast("AudioStreamMixin", provider).get_stream_details(
+            item_id, MediaType.TRACK
+        )
+        # a duration makes the buffer seekable, one that holds the whole track: without one it
+        # is a short rolling buffer nothing drains
+        details.duration = details.duration or (await provider.get_track(item_id)).duration
+        size = BUFFER_SIZE_MAP[
+            BufferSize(
+                self.mass.config.get_raw_core_config_value(
+                    "streams", CONF_BUFFER_SIZE, CONF_BUFFER_SIZE_DEFAULT
+                )
+            )
+        ]
+        if (
+            not details.duration
+            or not details.allow_seek
+            or details.duration > size
+            or details.uri in self._active_sessions
+        ):
+            return False
+        # decoded at full speed, so the provider's source slot is free again in seconds; the
+        # analysis starts on the buffer as it does for a play from 0.
+        # ponytail: the buffer is freed by its 300 s inactivity monitor, not once the analysis
+        # has read it; free it on finalize if analysing many songs back to back needs the memory
+        await AudioBuffer.get_buffer(self.mass, details, reason="analyze")
+        return True
 
     async def set_track_loudness(
         self,

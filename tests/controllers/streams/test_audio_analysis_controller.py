@@ -4,17 +4,23 @@ from __future__ import annotations
 
 import asyncio
 import unittest.mock
+from collections.abc import AsyncGenerator
+from types import SimpleNamespace
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
-from music_assistant_models.enums import ContentType, MediaType
+from music_assistant_models.enums import ContentType, MediaType, StreamType
 from music_assistant_models.media_items import AudioFormat
+from music_assistant_models.streamdetails import StreamDetails
 
 from music_assistant.controllers.streams.audio_analysis import (
     REALTIME_ANALYSIS_MAX_SESSIONS,
+    SMART_FADES_ANALYSIS_DOMAIN,
     AudioAnalysisController,
 )
 from music_assistant.controllers.streams.audio_buffer import AudioBuffer, AudioBufferDiscarded
+from music_assistant.controllers.streams.constants import BufferSize
 from music_assistant.models.audio_analysis_provider import (
     AnalysisSessionData,
     AudioAnalysisProvider,
@@ -685,3 +691,138 @@ async def test_finalize_swallows_finalize_exception_and_cleans_up() -> None:
 
     assert "test_session" not in provider._sessions
     provider.logger.error.assert_called_once()
+
+
+# -- audio_analysis/analyze --
+
+
+def _streamdetails(duration: int | None) -> StreamDetails:
+    """Return what a music provider resolves for the track to analyse."""
+    return StreamDetails(
+        provider="apple_music--1",
+        item_id="t1",
+        audio_format=TEST_PCM_FORMAT,
+        media_type=MediaType.TRACK,
+        stream_type=StreamType.HTTP,
+        path="http://example.com/t1",
+        duration=duration,
+        can_seek=True,
+        allow_seek=True,
+    )
+
+
+def _analyzing(
+    controller: AudioAnalysisController,
+    mock_mass: MagicMock,
+    mock_provider: MagicMock,
+    *,
+    duration: int | None = 5,
+    track_duration: int | None = 5,
+    version: int | None = None,
+) -> MagicMock:
+    """Wire ``controller`` for analyze: Smart Fades loaded, a music provider serving the track."""
+    mock_provider.domain = SMART_FADES_ANALYSIS_DOMAIN
+    mock_provider.analysis_version = 3
+    music = MagicMock()
+    music.instance_id = "apple_music--1"
+    music.get_stream_details = AsyncMock(return_value=_streamdetails(duration))
+    music.get_track = AsyncMock(return_value=SimpleNamespace(duration=track_duration))
+    mock_mass.get_provider = MagicMock(
+        side_effect=lambda key, *_a, **_kw: (
+            mock_provider if key == mock_provider.instance_id else music
+        )
+    )
+    mock_mass.config.get_raw_core_config_value.return_value = BufferSize.BALANCED.value
+    controller.streams.output_stream_active.return_value = False
+    controller.get_audio_analysis_version = AsyncMock(return_value=version)  # type: ignore[method-assign]
+    return music
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("case", "kwargs"),
+    [
+        ("playing", {}),
+        ("no smart fades", {}),
+        ("analysed", {"version": 3}),
+        ("too long", {"duration": 301}),
+        ("no duration", {"duration": None, "track_duration": None}),
+    ],
+)
+async def test_analyze_refuses(
+    controller: AudioAnalysisController,
+    mock_mass: MagicMock,
+    mock_provider: MagicMock,
+    case: str,
+    kwargs: dict[str, Any],
+) -> None:
+    """While a player streams, without Smart Fades, analysed, or not one buffer long: False."""
+    _analyzing(controller, mock_mass, mock_provider, **kwargs)
+    if case == "playing":
+        controller.streams.output_stream_active.return_value = True
+    if case == "no smart fades":
+        mock_provider.domain = "test_domain"
+    with unittest.mock.patch.object(AudioBuffer, "get_buffer", AsyncMock()) as get_buffer:
+        assert await controller.analyze("t1", "apple_music") is False
+    get_buffer.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("duration", "version"), [(None, None), (180, 2)])
+async def test_analyze_buffers_the_track_with_its_duration(
+    controller: AudioAnalysisController,
+    mock_mass: MagicMock,
+    mock_provider: MagicMock,
+    duration: int | None,
+    version: int | None,
+) -> None:
+    """Stream details without a length take the track's, so the buffer holds the whole track."""
+    _analyzing(
+        controller, mock_mass, mock_provider, duration=duration, track_duration=180, version=version
+    )
+    with unittest.mock.patch.object(AudioBuffer, "get_buffer", AsyncMock()) as get_buffer:
+        assert await controller.analyze("t1", "apple_music") is True
+    details = get_buffer.await_args.args[1]
+    assert details.duration == 180
+    assert get_buffer.await_args.kwargs == {"reason": "analyze"}
+
+
+@pytest.mark.asyncio
+async def test_analyze_reads_the_track_once_and_releases_its_source(
+    controller: AudioAnalysisController,
+    mock_mass: MagicMock,
+    mock_provider: MagicMock,
+) -> None:
+    """One session for two calls; the analysis finalizes once and the source is let go."""
+    _analyzing(controller, mock_mass, mock_provider)
+    gate = asyncio.Event()
+    opened: list[bool] = []
+    released = asyncio.Event()
+
+    async def _source(*_args: Any, **_kwargs: Any) -> AsyncGenerator[bytes]:
+        opened.append(True)
+        try:
+            for second in range(5):
+                if second == 2:
+                    await gate.wait()
+                yield ONE_SECOND_CHUNK
+        finally:
+            released.set()
+
+    mock_mass.streams.audio.get_media_stream = _source
+    mock_mass.streams.audio_analysis = controller
+
+    assert await controller.analyze("t1", "apple_music") is True
+    session_key = _streamdetails(5).uri
+    while session_key not in controller._active_sessions:
+        await asyncio.sleep(0.01)
+    assert await controller.analyze("t1", "apple_music") is False
+    gate.set()
+    await asyncio.wait_for(released.wait(), 5)
+    while mock_provider.finalize.call_count == 0:
+        await asyncio.sleep(0.01)
+    await _await_tasks(mock_mass)
+
+    assert opened == [True]
+    mock_provider.finalize.assert_called_once_with(session_key)
+    assert session_key not in controller._active_sessions
