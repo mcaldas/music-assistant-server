@@ -854,7 +854,7 @@ async def test_a_quick_fade_never_fades_out_over_a_breath_shorter_than_an_analys
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("style", ["cut", "quick_fade"])
+@pytest.mark.parametrize("style", ["cut", "quick_fade", "echo_out"])
 @pytest.mark.parametrize("breath", [0.15, 0.06])
 async def test_a_lead_in_heard_alone_after_a_never_plays_a_breath_before_b_s_one(
     style: str, breath: float
