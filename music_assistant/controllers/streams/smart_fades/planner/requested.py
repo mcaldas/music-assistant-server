@@ -228,6 +228,7 @@ class RequestedTransitionPlanner(TransitionPlanner):
         fade_in_seconds: float = float(SMART_CROSSFADE_DURATION),
         cut_at_end: bool = False,
         incoming_head: npt.NDArray[np.bool_] | None = None,
+        fixed_entry: bool = False,
     ) -> None:
         """
         Initialize the planner for one requested transition.
@@ -239,12 +240,16 @@ class RequestedTransitionPlanner(TransitionPlanner):
             at its end position (``set_end_position``) rather than where the song ends.
         :param incoming_head: Which 10 ms windows of the incoming track's head are audible,
             from its start, read from the PCM the mixer holds; None when unknown.
+        :param fixed_entry: Whether the client chose where the incoming audio starts
+            (``set_start_position``): a blend then enters it at its first downbeat, never
+            deeper in.
         """
         super().__init__(logger)
         self.request = request
         self.fade_in_seconds = fade_in_seconds
         self.cut_at_end = cut_at_end
         self.incoming_head = incoming_head
+        self.fixed_entry = fixed_entry
         # where the incoming track's audio starts to sound, in its seconds
         self.incoming_audible_from = None if incoming_head is None else audible_start(incoming_head)
         # "applied" | "fallback", read by the stream's transition report
@@ -402,10 +407,13 @@ class RequestedTransitionPlanner(TransitionPlanner):
         """Build the blend's rungs ending on ``exit_s``, longest first, each its full length."""
         ramped = 0.1 < ctx.bpm_diff_percent <= TIME_STRETCH_BPM_PERCENTAGE_THRESHOLD
         rungs: list[list[Candidate]] = []
+        # where the client started B is its entry: pinned to B's first downbeat, so neither the
+        # natural entry nor the rolling-intro alignment skips the lead-in it chose
+        fixed = [float(ctx.incoming.downbeats[0])] if len(ctx.incoming.downbeats) else [None]
         for bars in (bars for bars in RUNG_LADDER if bars <= self.request.bars):
             built = [
                 candidate
-                for entry in (None, *_entry_options(ctx, bars))
+                for entry in (fixed if self.fixed_entry else (None, *_entry_options(ctx, bars)))
                 if (
                     candidate := factory.build(
                         CandidateSpec(ctx.tier, bars, exit_s, entry, source="requested")

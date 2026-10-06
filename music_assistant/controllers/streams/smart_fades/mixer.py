@@ -18,6 +18,7 @@ from music_assistant.controllers.streams.smart_fades.fades import (
     StandardCrossFade,
 )
 from music_assistant.controllers.streams.smart_fades.helpers import (
+    analysis_from,
     analysis_until,
     audible_start,
     audible_windows,
@@ -72,6 +73,7 @@ class SmartFadesMixer:
         fade_in_bytes_len: int,
         request: TransitionRequest | None = None,
         fade_out_end: float | None = None,
+        fade_in_start: float = 0.0,
     ) -> SmartFade:
         """
         Pick the SmartFade implementation, prime its filters, and return it.
@@ -92,6 +94,9 @@ class SmartFadesMixer:
             default smart fade in SMART_CROSSFADE mode.
         :param fade_out_end: Media second where the outgoing tail ends, when the outgoing
             item ends early (``set_end_position``); its analysis is cut there.
+        :param fade_in_start: Media second where the incoming audio starts, when the incoming
+            item starts later (``set_start_position``); its analysis starts there, and a
+            request enters it at its first downbeat from there.
         """
         # degradation chain: smart-crossfade → standard; richer modes prepend their builder
         smart_fade: SmartFade | None = None
@@ -105,6 +110,7 @@ class SmartFadesMixer:
                 pcm_format=pcm_format,
                 request=request,
                 fade_out_end=fade_out_end,
+                fade_in_start=fade_in_start,
             )
         if smart_fade is None:
             smart_fade = await self._build_standard_crossfade(
@@ -242,6 +248,7 @@ class SmartFadesMixer:
         pcm_format: AudioFormat,
         request: TransitionRequest | None = None,
         fade_out_end: float | None = None,
+        fade_in_start: float = 0.0,
     ) -> tuple[SmartFade | None, AudioAnalysisData | None]:
         """
         Attempt to build a SmartCrossFade and retain outgoing analysis for fallback.
@@ -255,6 +262,9 @@ class SmartFadesMixer:
         if fade_out_analysis is not None and fade_out_end is not None:
             # the item plays only until fade_out_end: its held tail ends there
             fade_out_analysis = analysis_until(fade_out_analysis, fade_out_end)
+        if fade_in_analysis is not None and fade_in_start > 0:
+            # the item plays from fade_in_start: the head the mix receives starts there
+            fade_in_analysis = analysis_from(fade_in_analysis, fade_in_start)
         if not (
             fade_out_analysis
             and fade_in_analysis
@@ -275,7 +285,9 @@ class SmartFadesMixer:
             )
             return None, fade_out_analysis
         audible_head = (
-            await self._audible_head(fade_in_streamdetails) if request is not None else None
+            await self._audible_head(fade_in_streamdetails, fade_in_start)
+            if request is not None
+            else None
         )
         try:
             smart_fade = SmartCrossFade(
@@ -289,6 +301,8 @@ class SmartFadesMixer:
                         fade_in_bytes_len / pcm_format.pcm_sample_size,
                         cut_at_end=fade_out_end is not None,
                         incoming_head=audible_head,
+                        # the client chose where the incoming item starts
+                        fixed_entry=fade_in_start > 0,
                     )
                     if request is not None
                     else None
@@ -305,25 +319,36 @@ class SmartFadesMixer:
             return None, fade_out_analysis
         return smart_fade, fade_out_analysis
 
-    async def _audible_head(self, streamdetails: StreamDetails) -> npt.NDArray[np.bool_] | None:
+    async def _audible_head(
+        self, streamdetails: StreamDetails, start: float = 0.0
+    ) -> npt.NDArray[np.bool_] | None:
         """
         Return which 10 ms of the incoming track's head are audible, from the head its buffer holds.
 
-        None when the buffer no longer holds the track's start, or a read fails: the planner
-        then judges from its analysis alone.
+        None when the buffer no longer holds the head, or a read fails: the planner then judges
+        from its analysis alone.
 
         :param streamdetails: Stream details of the incoming track.
+        :param start: Media second where the incoming audio starts; the head is read from there.
         """
         audio_buffer = cast("AudioBuffer | None", streamdetails.buffer)
         try:
-            if audio_buffer is None or audio_buffer.first_buffered_chunk != 0:
+            # the chunk the start falls in and its fraction, as the stream's exact read cuts them
+            first, fraction_ms = divmod(round(start * 1000), 1000)
+            if audio_buffer is None or audio_buffer.first_buffered_chunk > first:
                 return None
             # whole seconds already resident: nothing here waits on the source
-            seconds = min(_AUDIBLE_HEAD_SECONDS, audio_buffer.seconds_available)
-            head = [await audio_buffer.read_chunk_for_analysis(n) for n in range(seconds)]
+            resident = audio_buffer.first_buffered_chunk + audio_buffer.seconds_available - first
+            seconds = min(_AUDIBLE_HEAD_SECONDS, resident)
+            head = b"".join(
+                [await audio_buffer.read_chunk_for_analysis(first + n) for n in range(seconds)]
+            )
+            pcm_format = audio_buffer.pcm_format
+            frame_size = pcm_format.bit_depth // 8 * pcm_format.channels
+            head = head[pcm_format.sample_rate * fraction_ms // 1000 * frame_size :]
             if not head:
                 return None
-            audible = audible_windows(b"".join(head), audio_buffer.pcm_format)
+            audible = audible_windows(head, pcm_format)
         except Exception as err:
             self.logger.debug("Reading where the incoming track starts failed: %s", err)
             return None

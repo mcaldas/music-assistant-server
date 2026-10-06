@@ -32,6 +32,8 @@ AUDIBLE_FLOOR_DBFS = -60.0
 AUDIBLE_WINDOW_S = 0.01
 # the head starts where it stays audible this long: a lone click or pop before it is no start
 AUDIBLE_RUN_S = 0.05
+# the beat tracker's frame: a grid time can sit up to this much off the audio it marks
+_GRID_FRAME_S = 0.02
 
 
 def detect_effective_audio_end(
@@ -74,6 +76,45 @@ def detect_effective_audio_end(
     )
 
 
+def _rebin(envelope: Any, lo: float, hi: float, duration: float) -> Any:
+    """
+    Return a per-bin envelope re-binned over ``[lo, hi]`` of a track ``duration`` long.
+
+    The bin count is kept; each new bin takes the source bin under its centre.
+    """
+    if not isinstance(envelope, list) or not envelope:
+        return envelope
+    bins = len(envelope)
+    first = lo * bins / duration
+    return [
+        envelope[min(bins - 1, int(first + (i + 0.5) * (hi - lo) / duration))] for i in range(bins)
+    ]
+
+
+def _with_envelopes(
+    analysis: AudioAnalysisData, lo: float, hi: float, **changes: Any
+) -> AudioAnalysisData:
+    """Return a copy of ``analysis`` covering only ``[lo, hi]``, its envelopes re-binned."""
+    duration = analysis.duration
+    assert duration
+    extra_data = dict(analysis.extra_data or {})
+    if isinstance(extra_data.get("band_rms"), dict):
+        extra_data["band_rms"] = {
+            band: _rebin(envelope, lo, hi, duration)
+            for band, envelope in extra_data["band_rms"].items()
+        }
+    if "vocal_activity" in extra_data:
+        extra_data["vocal_activity"] = _rebin(extra_data["vocal_activity"], lo, hi, duration)
+    return replace(
+        analysis,
+        duration=hi - lo,
+        rms_energy=_rebin(analysis.rms_energy, lo, hi, duration),
+        spectral_centroid=_rebin(analysis.spectral_centroid, lo, hi, duration),
+        extra_data=extra_data if analysis.extra_data is not None else None,
+        **changes,
+    )
+
+
 def analysis_until(analysis: AudioAnalysisData, end: float) -> AudioAnalysisData:
     """
     Return a track's analysis as if the track ended at ``end`` (media seconds).
@@ -87,33 +128,48 @@ def analysis_until(analysis: AudioAnalysisData, end: float) -> AudioAnalysisData
     :param analysis: The track's stored analysis; never modified.
     :param end: Media second where the track's audio ends.
     """
-    duration = analysis.duration
-    if not duration or end >= duration:
+    if not analysis.duration or end >= analysis.duration:
         return analysis
-
-    def rebin(envelope: Any) -> Any:
-        if not isinstance(envelope, list) or not envelope:
-            return envelope
-        bins = len(envelope)
-        return [envelope[min(bins - 1, int((i + 0.5) * end / duration))] for i in range(bins)]
-
-    extra_data = dict(analysis.extra_data or {})
-    if isinstance(extra_data.get("band_rms"), dict):
-        extra_data["band_rms"] = {
-            band: rebin(envelope) for band, envelope in extra_data["band_rms"].items()
-        }
-    if "vocal_activity" in extra_data:
-        extra_data["vocal_activity"] = rebin(extra_data["vocal_activity"])
-    return replace(
+    return _with_envelopes(
         analysis,
-        duration=end,
+        0.0,
+        end,
         beats=None if analysis.beats is None else [b for b in analysis.beats if b <= end],
         downbeats=(
             None if analysis.downbeats is None else [d for d in analysis.downbeats if d <= end]
         ),
-        rms_energy=rebin(analysis.rms_energy),
-        spectral_centroid=rebin(analysis.spectral_centroid),
-        extra_data=extra_data if analysis.extra_data is not None else None,
+    )
+
+
+def analysis_from(analysis: AudioAnalysisData, start: float) -> AudioAnalysisData:
+    """
+    Return a track's analysis as if the track began at ``start`` (media seconds).
+
+    For a queue item played from ``start`` (``set_start_position``): the planner then reads
+    the head the mix really receives. Grids are shifted by ``start``; a beat within one of
+    the beat tracker's 20 ms frames before it counts as on it (at 0), so a downbeat placed
+    on the start is not pushed a bar later. The per-bin envelopes keep their bin count and
+    are re-binned over ``[start, duration]``. The analysis is returned unchanged when
+    ``start`` is not inside the track.
+
+    :param analysis: The track's stored analysis; never modified.
+    :param start: Media second where the track's audio starts.
+    """
+    duration = analysis.duration
+    if not duration or start <= 0 or start >= duration:
+        return analysis
+
+    def shift(grid: list[float] | None) -> list[float] | None:
+        if grid is None:
+            return None
+        return [max(0.0, t - start) for t in grid if t >= start - _GRID_FRAME_S]
+
+    return _with_envelopes(
+        analysis,
+        start,
+        duration,
+        beats=shift(analysis.beats),
+        downbeats=shift(analysis.downbeats),
     )
 
 
