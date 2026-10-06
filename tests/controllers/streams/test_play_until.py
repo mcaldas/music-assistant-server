@@ -500,6 +500,35 @@ async def test_single_boundary_holds_the_incoming_head(monkeypatch: pytest.Monke
     assert marks == [pytest.approx(STANDARD_CROSSFADE_DURATION)]
 
 
+async def test_single_fade_into_half_of_an_ended_item_hands_over_on_the_frame_it_stopped(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Half of B up to its end at 40.001 s is 20.0005 s: the fade takes 20 s of B's head.
+
+    B's own request goes on on the millisecond grid, so a window with a fraction of a
+    millisecond would play the frames past its last whole one twice (4 at 8 kHz).
+    """
+    import numpy as np  # noqa: PLC0415
+
+    first = _item("a", 1, 100, BufferSize.BALANCED)
+    second = _item("b", 2, 60, BufferSize.BALANCED, end=40.001)
+    await _filled(first, second)
+    audio, mass = _single_audio(monkeypatch, second)
+    await _run_single(audio, first, CrossfadeMode.SMART_CROSSFADE)
+    mass.player_queues.load_next_queue_item = AsyncMock(side_effect=QueueEmpty)
+    # the stand-in mix leaves B's head the fade read to B's request, then B goes on
+    b_out = await _run_single(audio, second, CrossfadeMode.SMART_CROSSFADE)
+
+    # every frame of B up to its fade-out at the end, each once
+    frames = np.frombuffer(b_out, dtype="<i2").reshape(-1, 2).astype(np.int64)[: -FADE - 1]
+    assert (frames[:, 0] // 1000 == 2).all()
+    positions = (frames[:, 0] % 1000) * SR + frames[:, 1]
+    assert np.array_equal(positions, np.arange(len(positions)))
+    # the body's end is read from 20 s on, where float noise can take a frame off it
+    assert int(40.001 * SR) - len(b_out) // FRAME in (0, 1)
+
+
 async def test_reader_follows_an_end_set_while_it_reads(monkeypatch: pytest.MonkeyPatch) -> None:
     """An end set mid-read is where the stream stops."""
     item = _item("a", 1, 120, BufferSize.BALANCED)

@@ -4686,6 +4686,10 @@ class StreamsAudio:
                 0.0, (media_end or streamdetails.duration) - streamdetails.seek_position
             )
             window = min(window, remaining_media / playback_speed / 2)
+        if media_end:
+            # the item's own request resumes it on whole milliseconds: a window of whole
+            # seconds ends on one, half of an end can end inside one and repeat its frames
+            window = float(int(window))
         if window < MIN_CROSSFADE_DURATION:
             self.logger.debug(
                 "Not fading into %s: a %.1f second window is too short", streamdetails.uri, window
