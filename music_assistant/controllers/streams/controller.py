@@ -1720,7 +1720,7 @@ class StreamsController(CoreController):
                 queue_item=queue_item,
                 pcm_format=pcm_format,
                 seek_position=(
-                    int(queue_item.streamdetails.seek_position) if queue_item.streamdetails else 0
+                    queue_item.streamdetails.seek_position if queue_item.streamdetails else 0
                 ),
                 playback_speed=cast(
                     "float", queue_item.extra_attributes.get("playback_speed", 1.0)
