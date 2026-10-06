@@ -851,6 +851,48 @@ async def test_a_quick_fade_never_fades_out_over_a_breath_shorter_than_an_analys
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("style", ["cut", "quick_fade"])
+@pytest.mark.parametrize("breath", [0.15, 0.06])
+async def test_a_lead_in_heard_alone_after_a_never_plays_a_breath_before_b_s_one(
+    style: str, breath: float
+) -> None:
+    """
+    At 100 vs 130 BPM B sings from 0.25 s and breathes just before its one at 1.1 s.
+
+    B's beat before its one is off A's grid, so the lead-in after it would play alone once A
+    stops; only the PCM head shows the breath there, and the default plan ships instead of
+    leaving the room that silence.
+    """
+    fade_out, fade_in = _tone(440.0, 45.0), np.zeros(int(45.0 * SR) * 2, dtype=np.float32)
+    voice = _tone(1760.0, 45.0)
+    for start, end in ((0.25, 1.1 - breath), (1.1, 45.0)):
+        fade_in[int(start * SR) * 2 : int(end * SR) * 2] = voice[
+            int(start * SR) * 2 : int(end * SR) * 2
+        ]
+    out, inc = _analysis(100.0, 240.0), _analysis(130.0, 240.0)
+    assert inc.beats is not None
+    # B's grid runs back from its one: beats at 0.18 s and 0.64 s before it
+    inc.beats = [beat + 1.1 - 2 * 60.0 / 130.0 for beat in inc.beats]
+    inc.downbeats = inc.beats[2::4]
+    inc.rms_energy = _bins_of(fade_in)
+    inc.extra_data = {"vocal_activity": [0.9 if i >= 2 else 0.05 for i in range(1800)]}
+    fade = await _through_the_mixer(
+        out, inc, fade_out, fade_in, TransitionRequest(style, "n", 0, 224.0)
+    )
+    mix = await _mix_of(fade, fade_out, fade_in)
+    timing = fade.timing_info
+    start = timing.pre_crossfade_duration
+    cut = start + timing.crossfade_duration
+
+    # no 10 ms stretch from A's last second to B's first drops 30 dB under a tone
+    assert (
+        _quietest_after(mix, start - 1.0, cut - start + 2.0)
+        > 20 * np.log10(0.2 / np.sqrt(2)) - 30.0
+    )
+    assert (fade.planner.outcome, fade.planner.reason) == ("fallback", "vocal")
+
+
+@pytest.mark.asyncio
 async def test_a_requested_cut_never_lands_on_a_click_before_b_s_music() -> None:
     """
     B clicks for 10 ms at 0.02 s, on its grid's first downbeat, and its music starts at 0.25 s.

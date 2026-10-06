@@ -456,7 +456,9 @@ class RequestedTransitionPlanner(TransitionPlanner):
                     # its first beat, which lands on A's exit; the rest plays alone after A,
                     # so it must carry level
                     land = self._pickup_landing(ctx, max(entry, heard), one)
-                    if land < one and _falls_quiet(ctx.incoming, land, one - land):
+                    if land < one and _falls_quiet(
+                        ctx.incoming, land, one - land, self.incoming_head
+                    ):
                         self._fallback("vocal")
                         return []
                     overlap = max(CUT_SECONDS, land - entry)
