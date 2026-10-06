@@ -297,7 +297,7 @@ class RequestedTransitionPlanner(TransitionPlanner):
             self.reason or "",
         )
         if plan is None:
-            default = SmartCrossFadePlanner(self.logger)
+            default = SmartCrossFadePlanner(self.logger, self.fixed_entry)
             plan = default.plan(fade_out_analysis, fade_in_analysis, buffer_duration)
             self.outgoing = default.outgoing
             return plan

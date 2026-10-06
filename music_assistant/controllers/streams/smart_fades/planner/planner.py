@@ -25,11 +25,12 @@ from music_assistant.controllers.streams.smart_fades.models import SmartFadeNotA
 from .assembly import EmergencyHandoffFactory, FallbackCrossfadeFactory, PlanAssembler
 from .candidates import (
     CandidateFactory,
+    CandidateSpec,
     RescueAnchorGenerator,
     TrimClosingAnchorGenerator,
     default_generators,
 )
-from .context import build_transition_context
+from .context import TransitionContext, build_transition_context
 from .policies import default_policies
 from .selection import CandidateSelector
 
@@ -73,6 +74,18 @@ class TransitionPlanner(ABC):
 class SmartCrossFadePlanner(TransitionPlanner):
     """Plans a defensive, musically-aligned crossfade that never edits the music."""
 
+    def __init__(self, logger: logging.Logger, fixed_entry: bool = False) -> None:
+        """
+        Initialize the planner.
+
+        :param logger: Logger for debug output.
+        :param fixed_entry: Whether the client chose where the incoming audio starts
+            (``set_start_position``): every candidate then enters it at its first downbeat,
+            never deeper in.
+        """
+        super().__init__(logger)
+        self.fixed_entry = fixed_entry
+
     def plan(
         self,
         fade_out_analysis: AudioAnalysisData,
@@ -94,7 +107,9 @@ class SmartCrossFadePlanner(TransitionPlanner):
             fade_out_analysis, fade_in_analysis, buffer_duration, self.logger
         )
         factory = CandidateFactory(ctx, self.logger)
-        specs = [spec for generator in default_generators() for spec in generator.generate(ctx)]
+        specs = self._entered(
+            ctx, [spec for generator in default_generators() for spec in generator.generate(ctx)]
+        )
         candidates = [candidate for spec in specs if (candidate := factory.build(spec)) is not None]
         if self.logger.isEnabledFor(VERBOSE_LOG_LEVEL):
             self.logger.log(
@@ -112,10 +127,13 @@ class SmartCrossFadePlanner(TransitionPlanner):
             # every phrased candidate breached a hard rejection: retry with the
             # ungated audible-end ladder plus a modest late-anchored rescue rung
             # before falling back to the handoff
-            rescue_specs = [
-                *TrimClosingAnchorGenerator(min_gap=0.0).generate(ctx),
-                *RescueAnchorGenerator().generate(ctx),
-            ]
+            rescue_specs = self._entered(
+                ctx,
+                [
+                    *TrimClosingAnchorGenerator(min_gap=0.0).generate(ctx),
+                    *RescueAnchorGenerator().generate(ctx),
+                ],
+            )
             rescue_candidates = [
                 candidate for spec in rescue_specs if (candidate := factory.build(spec)) is not None
             ]
@@ -145,3 +163,11 @@ class SmartCrossFadePlanner(TransitionPlanner):
             downbeats=ctx.outgoing.downbeats[ctx.outgoing.downbeats <= plan.fade_out_window],
         )
         return plan
+
+    def _entered(self, ctx: TransitionContext, specs: list[CandidateSpec]) -> list[CandidateSpec]:
+        """Pin every spec's entry to the incoming first downbeat when the client chose it."""
+        if not self.fixed_entry or not len(ctx.incoming.downbeats):
+            return specs
+        entry = float(ctx.incoming.downbeats[0])
+        # pinned, specs that differed only in their entry are one
+        return list(dict.fromkeys(replace(spec, entry_s=entry) for spec in specs))

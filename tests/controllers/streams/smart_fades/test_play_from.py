@@ -165,6 +165,36 @@ def test_a_fixed_entry_is_the_first_downbeat_at_or_after_the_start() -> None:
     assert plan.fadein_trim_start == pytest.approx(1.0)
 
 
+def _track_with_a_long_quiet_lead_in() -> AudioAnalysisData:
+    """Return a 100 BPM track whose part from 60 s has its kick 12 s in, sung from 8 s in."""
+    rms = np.full(1800, 0.5, dtype=np.float32)
+    rms[int(START / 240 * 1800) : int((START + 12.0) / 240 * 1800)] = 0.12
+    return _with_vocal_activity(_analysis(100.0, rms_energy=rms), [(START + 8.0, 200.0)])
+
+
+async def test_smart_fades_own_plan_into_a_started_item_keeps_its_entry() -> None:
+    """
+    A blend from 120 into 100 BPM cannot play: Smart Fades' own plan ships, from the start.
+
+    Left to itself it would enter the part 3 s in, toward its kick, skipping the lead-in
+    the client chose; with no request at all the mixer tells it the same.
+    """
+    track = _track_with_a_long_quiet_lead_in()
+    planner = RequestedTransitionPlanner(
+        LOGGER, TransitionRequest("blend", "n", 8), 45.0, fixed_entry=True
+    )
+    plan = planner.plan(_analysis(120.0), analysis_from(track, START), 45.0)
+    assert (planner.outcome, planner.reason) == ("fallback", "not_blendable")
+    assert (plan.fadein_trim_start or 0.0) == pytest.approx(0.0, abs=0.001)
+
+    mixer = _make_mixer({"out": _analysis(120.0), "in": track})
+    started = await mixer.build(**_build_kwargs(), fade_in_start=START)
+    assert isinstance(started, SmartCrossFade)
+    assert isinstance(started.planner, SmartCrossFadePlanner)
+    assert started.plan is not None
+    assert (started.plan.fadein_trim_start or 0.0) == pytest.approx(0.0, abs=0.001)
+
+
 async def test_the_incoming_head_is_read_from_the_start() -> None:
     """The audible head the planner gets begins at the start, not at the track's beginning."""
     mixer = _make_mixer()

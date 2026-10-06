@@ -24,6 +24,7 @@ from music_assistant.controllers.streams.smart_fades.helpers import (
     audible_windows,
     detect_effective_audio_end,
 )
+from music_assistant.controllers.streams.smart_fades.planner import SmartCrossFadePlanner
 from music_assistant.controllers.streams.smart_fades.planner.requested import (
     RequestedTransitionPlanner,
 )
@@ -305,7 +306,8 @@ class SmartFadesMixer:
                         fixed_entry=fade_in_start > 0,
                     )
                     if request is not None
-                    else None
+                    # the client chose where the incoming item starts
+                    else SmartCrossFadePlanner(self.logger, fixed_entry=fade_in_start > 0)
                 ),
             )
             smart_fade.build(fade_out_bytes_len, fade_in_bytes_len, pcm_format)
