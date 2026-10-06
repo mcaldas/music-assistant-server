@@ -93,6 +93,9 @@ _LAZY_DUTY_MAX: float = 0.10
 # position can read just past it, and a bar of the grid can run up to a frame longer than the
 # bpm's
 _GRID_FRAME_S: float = 0.02
+# a tail position derived from a downbeat sums float32 grid times in float64: it can read a few
+# microseconds either side of that downbeat, which must still count as on it
+_GRID_EPSILON_S: float = 0.001
 
 
 @dataclass(frozen=True, slots=True)
@@ -651,9 +654,11 @@ class CandidateFactory:
 
         # Collect timing points within the stretch window
         beats = tail.beats
-        beat_mask = (beats >= stretch_start) & (beats <= stretch_end)
+        # the window ends on the downbeat the overlap starts on
+        end = stretch_end + _GRID_EPSILON_S
+        beat_mask = (beats >= stretch_start) & (beats <= end)
         db_mask = (tail.extrapolated_downbeats >= stretch_start) & (
-            tail.extrapolated_downbeats <= stretch_end
+            tail.extrapolated_downbeats <= end
         )
         window_beats = beats[beat_mask] - stretch_start
         window_downbeats = tail.extrapolated_downbeats[db_mask] - stretch_start
@@ -771,9 +776,9 @@ class CandidateFactory:
         later_downbeat = None
 
         for downbeat in tail.extrapolated_downbeats:
-            if downbeat < min_downbeat_pos:
+            if downbeat < min_downbeat_pos - _GRID_EPSILON_S:
                 continue
-            if downbeat <= ideal_start_pos:
+            if downbeat <= ideal_start_pos + _GRID_EPSILON_S:
                 earlier_downbeat = downbeat
             elif downbeat > ideal_start_pos and later_downbeat is None:
                 later_downbeat = downbeat
