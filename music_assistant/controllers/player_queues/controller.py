@@ -87,7 +87,11 @@ from music_assistant.controllers.player_queues.queue_loader import QueueLoaderMi
 from music_assistant.controllers.player_queues.smart_shuffle import SmartShuffle
 from music_assistant.controllers.player_queues.state import PlayerQueueData
 from music_assistant.controllers.player_queues.stream_feeder import StreamFeederMixin
-from music_assistant.controllers.streams.audio import get_end_position, get_start_position
+from music_assistant.controllers.streams.audio import (
+    MIN_CROSSFADE_DURATION,
+    get_end_position,
+    get_start_position,
+)
 from music_assistant.controllers.streams.smart_fades.helpers import SMART_CROSSFADE_DURATION
 from music_assistant.controllers.streams.smart_fades.planner.candidates import RUNG_LADDER
 from music_assistant.controllers.streams.smart_fades.planner.requested import (
@@ -554,9 +558,9 @@ class PlayerQueuesController(QueueLoaderMixin, PlaybackTrackerMixin, StreamFeede
             filter_sweep only.
         :param exit_at: Second of the outgoing track where its audio should end, moved to the
             nearest downbeat; within its last 45 s, before its end position when one is set
-            (half of what plays when shorter). A sung phrase after it is left out; one it cuts
-            into falls back ("vocal"). 0 lets Smart Fades choose, moved to the nearest downbeat
-            no sung phrase runs past.
+            (half of what plays, in whole seconds, when shorter; refused under 3 s). A sung
+            phrase after it is left out; one it cuts into falls back ("vocal"). 0 lets Smart
+            Fades choose, moved to the nearest downbeat no sung phrase runs past.
         """
         self._check_player_permission(queue_id)
         if (
@@ -591,11 +595,13 @@ class PlayerQueuesController(QueueLoaderMixin, PlaybackTrackerMixin, StreamFeede
             # stored to the millisecond, so an exit sent as the same number must compare equal
             exit_at = round(exit_at, 3)
             stop = get_end_position(queue_item) or queue_item.duration
-            window = min(
-                float(SMART_CROSSFADE_DURATION), (stop - get_start_position(queue_item)) / 2
-            )
+            # the tail the item holds for its fade (tail_hold_target): whole seconds, at most
+            # half of what it plays, and none under the shortest fade
+            window = min(SMART_CROSSFADE_DURATION, int((stop - get_start_position(queue_item)) / 2))
+            if window < MIN_CROSSFADE_DURATION:
+                raise InvalidDataError("The item plays too little to hold a tail for an exit")
             if not stop - window < exit_at <= stop:
-                raise InvalidDataError(f"exit_at must be in the last {window:.0f}s of the item")
+                raise InvalidDataError(f"exit_at must be in the last {window}s of the item")
         if next_item is None:
             raise QueueEmpty(f"No item after {queue_item_id} to transition into")
         if (

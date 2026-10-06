@@ -207,6 +207,26 @@ async def test_the_exit_window_is_half_of_what_plays() -> None:
     await ctrl.set_transition("q1", item.queue_item_id, "cut", exit_at=31.0)
 
 
+async def test_the_exit_window_is_the_tail_the_item_holds() -> None:
+    """
+    From 60.25 s to 100 s the item plays 39.75 s and holds a 19 s tail: exits lie in it.
+
+    An exit before it (80.25 s, past half of what plays) would find no tail to cut in; an
+    item playing under 6 s holds none, so it takes no exit at all.
+    """
+    ctrl = _ctrl()
+    item = _item(ctrl, 1)
+    item.extra_attributes["start_position"] = 60.25
+    item.extra_attributes["end_position"] = 100.0
+    for exit_at in (80.25, 80.9):
+        with pytest.raises(InvalidDataError):
+            await ctrl.set_transition("q1", item.queue_item_id, "cut", exit_at=exit_at)
+    await ctrl.set_transition("q1", item.queue_item_id, "cut", exit_at=81.25)
+    item.extra_attributes["end_position"] = 65.75
+    with pytest.raises(InvalidDataError, match="too little"):
+        await ctrl.set_transition("q1", item.queue_item_id, "cut", exit_at=65.75)
+
+
 async def test_a_seek_clears_the_start() -> None:
     """A seek is the listener's own position: the item plays from it, and seek 0 plays 0."""
     ctrl, queue, _signals = _controller_with_stale_queue()
