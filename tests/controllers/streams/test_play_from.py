@@ -225,6 +225,34 @@ async def test_single_a_fade_capped_by_half_of_b_hands_over_on_the_frame_the_mix
     assert marked == pytest.approx(1.345 + 19)
 
 
+async def test_single_an_item_without_a_start_is_asked_again_as_before(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Without a start, a speaker asking again reads from its elapsed offset as it always did.
+
+    24.3 s of trim and 8 s of overlap make an offset of 32.29999...: truncated to the
+    millisecond, then to 100 ms steps, the read starts at 32.2 s (rounding would say 32.3).
+    """
+    second = _item("b", 2, 120, BufferSize.BALANCED)
+    first = _item("a", 1, 100, BufferSize.BALANCED)
+    await _filled(first, second)
+    audio, mass = _boundary_audio(monkeypatch, second)
+
+    async def _deep_trim(**kw: Any) -> SimpleNamespace:
+        fade = await _timed_build(**kw)
+        fade.timing_info.fadein_trimmed_duration = 24.3
+        return fade
+
+    monkeypatch.setattr(audio.smart_fades_mixer, "build", AsyncMock(side_effect=_deep_trim))
+    await _run_single(audio, first, CrossfadeMode.SMART_CROSSFADE)
+    mass.player_queues.load_next_queue_item = AsyncMock(side_effect=QueueEmpty)
+    await _run_single(audio, second, CrossfadeMode.SMART_CROSSFADE)
+    assert second.streamdetails.seek_position * 1000 < 32300
+    again = await _run_single(audio, second, CrossfadeMode.SMART_CROSSFADE)
+    _assert_runs(again, 2, 32.2, 120)
+
+
 async def test_single_a_start_sent_as_a_long_json_number_keeps_the_mix(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

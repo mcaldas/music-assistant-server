@@ -151,3 +151,30 @@ async def test_abandoned_direct_pcm_stream_releases_the_gauge() -> None:
 
     await stream.aclose()
     assert controller.output_stream_active() is False
+
+
+@pytest.mark.parametrize(
+    ("seek_position", "start", "read_from"),
+    [(32.3, None, 32), (12.345, 12.345, 12.345)],
+    ids=["no-start", "start"],
+)
+def test_single_item_stream_reads_a_start_exactly_and_other_seeks_in_whole_seconds(
+    seek_position: float, start: float | None, read_from: float
+) -> None:
+    """A client's start is read to the millisecond; any other seek in whole seconds, as always."""
+    queue_item = _queue_item(cast("int", seek_position))
+    if start is not None:
+        queue_item.extra_attributes["start_position"] = start
+    controller, call_kwargs = _controller(queue_item)
+
+    controller.get_stream(
+        PlayerMedia(
+            uri="library://audiobook/1",
+            media_type=MediaType.AUDIOBOOK,
+            source_id=QUEUE_ID,
+            queue_item_id=QUEUE_ITEM_ID,
+        ),
+        PCM_FORMAT,
+    )
+
+    assert call_kwargs["seek_position"] == read_from

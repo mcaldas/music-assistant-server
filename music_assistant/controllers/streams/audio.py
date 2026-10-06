@@ -1680,7 +1680,13 @@ class StreamsAudio:
         # get or create the AudioBuffer (stores raw decoded PCM). This runs before the
         # filters are built because a source-capacity reselection can hand back another
         # provider's streamdetails, which everything below must then work with.
-        seek_position_ms = round(seek_position * 1000)
+        # a client's start is stored to the millisecond: reads at it or from a handover after
+        # it keep that millisecond, where float noise could take one off (others truncate)
+        seek_position_ms = (
+            round(seek_position * 1000)
+            if (start := get_start_position(queue_item)) and (exact_seek or seek_position == start)
+            else int(seek_position * 1000)
+        )
         try:
             if prepared_buffer is not None:
                 if streamdetails.buffer is not prepared_buffer or not prepared_buffer.is_valid(
