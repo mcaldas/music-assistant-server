@@ -237,6 +237,8 @@ class CrossfadeHandover:
     # the running mix underneath the continuation: closing an unstarted generator
     # wrapper never runs its finally, so the source needs closing of its own
     source: AsyncGenerator[bytes] | None = None
+    # the same in whole frames of `pcm_format`, where the next item resumes exactly
+    fade_in_frames: int = 0
 
     async def close(self) -> None:
         """Release a mix continuation nothing is going to consume."""
@@ -1520,6 +1522,7 @@ class StreamsAudio:
         session_id: str | None = None,
         prepared_buffer: AudioBuffer | None = None,
         exact_seek: bool = False,
+        seek_frame: int | None = None,
     ) -> AsyncGenerator[bytes]:
         """
         Get the (PCM) audio stream for a single queue item.
@@ -1537,6 +1540,8 @@ class StreamsAudio:
         :param session_id: Queue session that owns processing-detail updates.
         :param prepared_buffer: Existing buffer that must be used without opening a new source.
         :param exact_seek: Preserve millisecond precision instead of user-seek quantization.
+        :param seek_frame: Frame of ``pcm_format`` to start on exactly (where a crossfade's
+            mix stopped reading the item), between the milliseconds ``seek_position`` has.
         """
         streamdetails = queue_item.streamdetails
         assert streamdetails
@@ -1603,7 +1608,11 @@ class StreamsAudio:
         # get or create the AudioBuffer (stores raw decoded PCM). This runs before the
         # filters are built because a source-capacity reselection can hand back another
         # provider's streamdetails, which everything below must then work with.
-        seek_position_ms = int(seek_position * 1000)
+        seek_position_ms = (
+            int(seek_position * 1000)
+            if seek_frame is None
+            else seek_frame * 1000 // pcm_format.sample_rate
+        )
         try:
             if prepared_buffer is not None:
                 if streamdetails.buffer is not prepared_buffer or not prepared_buffer.is_valid(
@@ -1716,15 +1725,15 @@ class StreamsAudio:
         finished = False
         next_buffer_triggered = False
         stream_started_at = asyncio.get_event_loop().time()
-        # an exact seek (where a crossfade handed over) falls between milliseconds, and the
-        # buffer starts at the millisecond before it: drop the samples in between, or the
+        # a frame to start on (where a crossfade handed over) falls between milliseconds, and
+        # the buffer starts at the millisecond before it: drop the frames in between, or the
         # handover replays them
-        skip_bytes = 0
-        if exact_seek and playback_speed == 1.0:
-            rate = pcm_format.sample_rate
-            skip_bytes = max(0, round(seek_position * rate) - seek_position_ms * rate // 1000) * (
-                pcm_format.bit_depth // 8 * pcm_format.channels
-            )
+        skip_bytes = (
+            0
+            if seek_frame is None
+            else (seek_frame - seek_position_ms * pcm_format.sample_rate // 1000)
+            * (pcm_format.bit_depth // 8 * pcm_format.channels)
+        )
         try:
             async for source_chunk in media_stream_gen:
                 chunk = source_chunk[skip_bytes:] if skip_bytes else source_chunk
@@ -1949,11 +1958,16 @@ class StreamsAudio:
                     # failure (or abandonment) before its first pull would strand
                     # the raw mix behind it, so release the whole handover
                     await handover.close()
-            # skip past the source media the mix consumed (final now it is drained)
+            # skip past the source media the mix consumed (final now it is drained), on the
+            # frame after the last one it read, in this stream's frames
             discard_position = handover.fade_in_media_duration
+            resume_frame = (
+                handover.fade_in_frames * pcm_format.sample_rate // handover.pcm_format.sample_rate
+            )
             handover = None
         else:
             discard_position = float(streamdetails.seek_position)
+            resume_frame = None
 
         total_chunks_received = 0
         playback_speed = cast("float", queue_item.extra_attributes.get("playback_speed", 1.0))
@@ -1965,6 +1979,7 @@ class StreamsAudio:
             normalization_override=norm_override,
             session_id=session_id,
             exact_seek=exact_buffer_seek,
+            seek_frame=resume_frame if playback_speed == 1.0 else None,
         ):
             total_chunks_received += 1
             tail_window.extend(chunk)
@@ -2136,6 +2151,7 @@ class StreamsAudio:
                                 next_handover.fade_in_media_duration = (
                                     fade_in_bytes_consumed / pcm_format.pcm_sample_size
                                 ) * fade_in_playback_speed
+                                next_handover.fade_in_frames = fade_in_bytes_consumed // frame_size
                                 yield take
                                 if len(chunk) >= remaining:
                                     break

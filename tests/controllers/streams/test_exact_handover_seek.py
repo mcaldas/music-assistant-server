@@ -83,9 +83,15 @@ def _queue_item() -> MagicMock:
     return queue_item
 
 
-async def _first_sample(audio: StreamsAudio, seek_position: float, exact_seek: bool) -> int:
+async def _first_sample(
+    audio: StreamsAudio, seek_position: float, exact_seek: bool, seek_frame: int | None = None
+) -> int:
     stream = audio.get_queue_item_stream(
-        _queue_item(), PCM_FORMAT, seek_position=seek_position, exact_seek=exact_seek
+        _queue_item(),
+        PCM_FORMAT,
+        seek_position=seek_position,
+        exact_seek=exact_seek,
+        seek_frame=seek_frame,
     )
     async for chunk in stream:
         await stream.aclose()
@@ -94,14 +100,25 @@ async def _first_sample(audio: StreamsAudio, seek_position: float, exact_seek: b
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("seek_position", [7.869387755, 12.3456789, 3.0])
-async def test_an_exact_seek_resumes_on_the_exact_sample(
-    audio: StreamsAudio, seek_position: float
+@pytest.mark.parametrize(
+    ("seek_position", "seek_frame"),
+    [
+        (7.869387755, 347040),
+        (12.3456789, 544444),
+        (3.0, 132300),
+        # a whole millisecond between two frames (12.345 s is frame 544414.5 at 44.1 kHz):
+        # the frame the mix stopped on decides, not how the float rounds
+        (12.345, 544414),
+        (12.345, 544415),
+    ],
+)
+async def test_a_handover_resumes_on_the_frame_the_mix_stopped(
+    audio: StreamsAudio, seek_position: float, seek_frame: int
 ) -> None:
-    """A handover between milliseconds resumes on its own sample, not up to 1 ms earlier."""
-    first = await _first_sample(audio, seek_position, exact_seek=True)
+    """A handover between milliseconds resumes on its own frame, not up to 1 ms earlier."""
+    first = await _first_sample(audio, seek_position, exact_seek=True, seek_frame=seek_frame)
 
-    assert first == round(seek_position * PCM_FORMAT.sample_rate) % 32768
+    assert first == seek_frame % 32768
 
 
 @pytest.mark.asyncio

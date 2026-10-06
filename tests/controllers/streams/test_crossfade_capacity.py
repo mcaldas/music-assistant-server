@@ -348,3 +348,5 @@ async def test_crossfade_reads_its_window_past_the_resident_buffer(
     # the next track resumes at the media time the blend already played
     assert crossfade_data.fade_in_media_duration == pytest.approx(expected_window * playback_speed)
     assert crossfade_data.fade_in_media_duration <= next_details.duration / 2
+    # and on the frame after the last one the blend read
+    assert crossfade_data.fade_in_frames == int(pcm_format.sample_rate * expected_window)
