@@ -133,6 +133,7 @@ from music_assistant.helpers.audio import (
     build_concat_filelist,
     calculate_content_length,
     decoded_pcm_format,
+    fade_in_pcm,
     fade_out_pcm,
     get_bit_rate,
     get_normalization_mode,
@@ -195,7 +196,8 @@ if TYPE_CHECKING:
 MIN_CROSSFADE_DURATION = 3
 
 # Seconds an item cut short by its end position (set_end_position) fades out over, so
-# a boundary without a crossfade stops it without a click instead of mid-waveform.
+# a boundary without a crossfade stops it without a click instead of mid-waveform; an
+# item read from its start position (set_start_position) fades in over as long.
 END_POSITION_FADE = 0.02
 
 # Bounded wait for the fade-in prefetcher to release a stream at the handover. In
@@ -1703,10 +1705,10 @@ class StreamsAudio:
             return
         streamdetails = queue_item.streamdetails
         assert streamdetails  # for type checking
-        # a read from the start a client set (set_start_position) starts exactly there
-        exact_seek = exact_seek or (
-            seek_position > 0 and seek_position == get_start_position(queue_item)
-        )
+        # a read from the start a client set (set_start_position) starts exactly there, and
+        # mid-waveform: it fades in over its first moments, as an end fades out
+        from_start = seek_position > 0 and seek_position == get_start_position(queue_item)
+        exact_seek = exact_seek or from_start
         if normalization_override is not None:
             # a capacity reselection hands back freshly resolved details, so the
             # crossfade's intro/body normalization pin must be re-applied to them
@@ -1799,6 +1801,7 @@ class StreamsAudio:
         read_from = (seek_position_ms if exact_seek else seek_position_ms // 100 * 100) / 1000
         frame_size = pcm_format.bit_depth // 8 * pcm_format.channels
         end_fade_bytes = int(END_POSITION_FADE * pcm_format.sample_rate) * frame_size
+        start_fade_bytes = end_fade_bytes if from_start else 0
         cut = False
         # the start of a frame the source split between two chunks, held for the next one
         split_frame = b""
@@ -1830,6 +1833,8 @@ class StreamsAudio:
                         whole = max(0, len(chunk) - (bytes_received + len(chunk)) % frame_size)
                         chunk, split_frame = chunk[:whole], chunk[whole:]
                     chunk = fade_out_pcm(chunk, pcm_format, left, end_fade_bytes)
+                if bytes_received < start_fade_bytes:
+                    chunk = fade_in_pcm(chunk, pcm_format, -bytes_received, start_fade_bytes)
                 bytes_received += len(chunk)
                 # once cut, the pass is read to its end: that end can no longer move
                 mark_read(

@@ -32,6 +32,7 @@ from tests.controllers.streams.test_crossfade_same_album import (
 )
 from tests.controllers.streams.test_crossfade_transition import TEST_PCM_FORMAT, _transition_keys
 from tests.controllers.streams.test_play_until import (
+    FADE,
     FRAME,
     SECOND,
     SR,
@@ -96,12 +97,26 @@ def _started(item_id: str, tag: int, seconds: int, start: float, **kwargs: Any) 
     return item
 
 
-def _assert_runs(data: bytes | bytearray, tag: int, start: float, end: float) -> None:
-    """Assert ``data`` is song ``tag`` from ``start`` up to ``end``, every frame exactly once."""
+def _assert_runs(
+    data: bytes | bytearray, tag: int, start: float, end: float, faded_in: bool = False
+) -> None:
+    """
+    Assert ``data`` is song ``tag`` from ``start`` up to ``end``, every frame exactly once.
+
+    ``faded_in``: ``data`` is a read from the item's start, which fades in over its first
+    frames (END_POSITION_FADE): those are checked as the ramp of the frames they carry.
+    """
     frames = np.frombuffer(bytes(data), dtype="<i2").reshape(-1, 2).astype(np.int64)
+    expected = np.arange(round(start * SR), round(end * SR))
+    assert len(frames) == len(expected)
+    if faded_in:
+        head = expected[:FADE]
+        source = np.stack([tag * 1000 + head // SR, head % SR], axis=1)
+        ramp = (source * (np.arange(FADE) / FADE)[:, None]).astype(np.int16)
+        assert np.array_equal(frames[:FADE], ramp)
+        frames, expected = frames[FADE:], expected[FADE:]
     assert (frames[:, 0] // 1000 == tag).all()
     positions = (frames[:, 0] % 1000) * SR + frames[:, 1]
-    expected = np.arange(round(start * SR), round(end * SR))
     assert len(positions) == len(expected)
     assert np.array_equal(positions, expected), (positions[:3] / SR, start)
 
@@ -293,7 +308,7 @@ async def test_single_repeat_one_plays_the_item_again_from_its_start(
     second_pass = await _run_single(audio, item, CrossfadeMode.SMART_CROSSFADE)
 
     played, blended = first_pass[: -int(CF * SR) * FRAME], first_pass[-int(CF * SR) * FRAME :]
-    _assert_runs(played, 1, START, 100 - CF)
+    _assert_runs(played, 1, START, 100 - CF, faded_in=True)
     _assert_runs(blended, 1, START + TRIM, START + TRIM + CF)
     _assert_runs(second_pass, 1, START + TRIM + CF, 100)
 
@@ -301,11 +316,15 @@ async def test_single_repeat_one_plays_the_item_again_from_its_start(
 async def test_single_without_a_crossfade_b_starts_exactly_at_its_start(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """No fade: A plays out whole and B's request starts at 12.250, not at 12.200."""
+    """
+    No fade: A plays out whole and B's request starts at 12.250, not at 12.200.
+
+    B starts mid-waveform, so it fades in over its first 20 ms instead of jumping in.
+    """
     second = _started("b", 2, 120, START)
     a_out, b_out, _audio, _ = await _a_then_b(monkeypatch, second, CrossfadeMode.DISABLED)
     _assert_runs(a_out, 1, 0, 100)
-    _assert_runs(b_out, 2, START, 120)
+    _assert_runs(b_out, 2, START, 120, faded_in=True)
 
 
 @pytest.mark.parametrize("case", ["slow", "realtime", "minimal", "moved"])
@@ -367,7 +386,7 @@ async def test_single_audio_not_there_at_the_start_is_a_fade_or_a_clean_cut(
         # no fade: A plays out whole and B starts at its start, nothing raised or lost
         assert blended == b""
         _assert_runs(a_part, 1, 0, 100)
-        _assert_runs(b_out, 2, start, 200)
+        _assert_runs(b_out, 2, start, 200, faded_in=True)
     await cast("AudioBuffer", second.streamdetails.buffer).clear()
 
 
@@ -387,9 +406,9 @@ async def test_flow_plays_b_from_its_start(monkeypatch: pytest.MonkeyPatch, pref
     if not prefetch:
         monkeypatch.setattr(_IncomingFadePrefetcher, "ensure_started", lambda *_a, **_kw: None)
     out, audio, _mass, _log = await _run_flow(monkeypatch, first, second)
-    a_part, b_part = _split(out, 2)
+    a_part, b_part = out[: 40 * SECOND], out[40 * SECOND :]
     _assert_runs(a_part, 1, 0, 40)
-    _assert_runs(b_part, 2, START, 60)
+    _assert_runs(b_part, 2, START, 60, faded_in=True)
     build = cast("AsyncMock", audio.smart_fades_mixer.build)
     assert build.call_args.kwargs["fade_in_start"] == START
     assert _transition_keys(first)["transition_incoming_entry"] == START
@@ -410,9 +429,9 @@ async def test_flow_a_failed_mix_plays_b_from_its_start(monkeypatch: pytest.Monk
         return _mix
 
     out, _audio, _mass, _log = await _run_flow(monkeypatch, first, second, mix=_failing)
-    a_part, b_part = _split(out, 2)
+    a_part, b_part = out[: 40 * SECOND], out[40 * SECOND :]
     _assert_runs(a_part, 1, 0, 40)
-    _assert_runs(b_part, 2, START, 60)
+    _assert_runs(b_part, 2, START, 60, faded_in=True)
     assert second.streamdetails.seek_position == START
 
 
@@ -436,7 +455,7 @@ async def test_flow_fixes_the_start_when_the_item_comes_up(
     out, _audio, _mass, _log = await _run_flow(monkeypatch, first, second)
     assert refused == [True]
     assert second.extra_attributes["start_position"] == START
-    _assert_runs(_split(out, 2)[1], 2, START, 60)
+    _assert_runs(out[40 * SECOND :], 2, START, 60, faded_in=True)
 
 
 # ---- hold and fade sizing ----
