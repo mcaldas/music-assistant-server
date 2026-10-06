@@ -485,6 +485,24 @@ def test_a_sung_pickup_whose_beats_would_drift_never_plays_a_break_alone(style: 
     assert (planner.outcome, planner.reason) == ("fallback", "vocal")
 
 
+def _quiet_first_bar() -> AudioAnalysisData:
+    """Return q128's head: its first bar 11 dB under its level, its last beat near silent."""
+    rms = np.full(1800, 0.5, dtype=np.float32)
+    # the one 1 s in at 120 bpm; the bar to 3 s, its last beat from 2.5 s
+    rms[int(1.0 / BIN + 0.5) : int(3.0 / BIN + 0.5)] = 0.5 * 10 ** (-11 / 20)
+    rms[int(2.5 / BIN + 0.5) : int(3.0 / BIN + 0.5)] = 0.5 * 10 ** (-44 / 20)
+    return _shifted(_analysis(120.0, rms_energy=rms), 1.0)
+
+
+@pytest.mark.parametrize("style", ["cut", "quick_fade"])
+def test_a_switch_never_lands_on_a_quiet_bar_that_falls_silent(style: str) -> None:
+    """B's quiet first bar goes near silent three beats in: B never started, so it is a gap."""
+    planner, plan = _plan(_analysis(100.0), _quiet_first_bar(), style, exit_at=224.0)
+
+    assert planner.outcome == "applied"
+    assert (plan.fadein_trim_start or 0.0) + plan.crossfade_duration == pytest.approx(3.0)
+
+
 @pytest.mark.parametrize(
     ("level", "one"),
     [(0.001, 3.0), (0.02, 1.0), (0.5, 1.0)],

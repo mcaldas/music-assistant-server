@@ -596,3 +596,40 @@ async def test_a_requested_cut_keeps_the_one_when_the_incoming_track_stops_later
     # B sounds from the switch on; its stop comes 1.25 s after it, as B has it after its one
     assert levels(cut + 0.03, cut + 1.2).min() > -50.0
     assert levels(cut + 1.3, cut + 1.45).max() < -60.0
+
+
+def _quietest_after(mix: np.ndarray, at: float, seconds: float) -> float:
+    """Return the quietest 10 ms of the (interleaved stereo) mix in ``seconds`` from ``at``, in dBFS."""
+    part = mix[int(at * SR) * 2 : int((at + seconds) * SR) * 2][0::2]
+    rms = np.sqrt(np.mean(part[: len(part) // 441 * 441].reshape(-1, 441) ** 2, axis=1))
+    return float(20 * np.log10(rms.min() + 1e-12))
+
+
+@pytest.mark.asyncio
+async def test_a_requested_cut_never_lands_on_a_quiet_bar_that_falls_silent() -> None:
+    """B's first bar plays 11 dB under its level and its last beat near silent: B's next one."""
+    fade_out, fade_in = _tone(440.0, 45.0), _tone(1760.0, 45.0)
+    fade_in[int(1.0 * SR) * 2 : int(3.0 * SR) * 2] *= 10 ** (-11 / 20)
+    fade_in[int(2.5 * SR) * 2 : int(3.0 * SR) * 2] *= 10 ** (-33 / 20)
+    out, inc = _analysis(120.0, 240.0), _analysis(120.0, 240.0)
+    assert inc.beats is not None
+    assert inc.rms_energy is not None
+    inc.beats = [beat + 1.0 for beat in inc.beats]
+    inc.downbeats = inc.beats[::4]
+    bin_s = 240.0 / 1800
+    for start, end, db in ((1.0, 3.0, -11.0), (2.5, 3.0, -44.0)):
+        for i in range(int(start / bin_s + 0.5), int(end / bin_s + 0.5)):
+            inc.rms_energy[i] = 0.5 * 10 ** (db / 20)
+    planner = RequestedTransitionPlanner(
+        logging.getLogger(), TransitionRequest("cut", "n", 0, 224.0)
+    )
+    fade = SmartCrossFade(logging.getLogger(), out, inc, planner)
+    fade.build(fade_out.nbytes, fade_in.nbytes, PCM)
+    chunks = [chunk async for chunk in fade.apply(fade_out.tobytes(), fade_in.tobytes(), PCM)]
+    mix = np.frombuffer(b"".join(chunks), dtype=np.float32)
+    timing = fade.timing_info
+    cut = timing.pre_crossfade_duration + timing.crossfade_duration
+
+    assert planner.outcome == "applied"
+    assert cut == pytest.approx(29.0, abs=0.001)
+    assert _quietest_after(mix, cut, 2.0) > -50.0

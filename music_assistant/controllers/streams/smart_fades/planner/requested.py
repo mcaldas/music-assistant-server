@@ -78,6 +78,9 @@ _SILENT_FRACTION = 0.021
 # how far into a landing bar such a bin is a gap at the switch; later on it is B's own
 # stop, heard after B has started (48 analysed songs: gaps began by 1.41 beats, stops at 1.96+)
 _LANDING_BEATS = 1.75
+# ... but only once B has reached its level there: a bar whose first beats sit this far under
+# the sustained level (-6 dB) has not started, and a silent bin anywhere in it is a gap
+_STARTED_FRACTION = 0.5
 # a bar whose stored energy sits this far under the track's sustained level (-22 dB) for
 # most of it is a soft intro or the start of a fade-in: heard alone after A, near silence
 _QUIET_BAR_FRACTION = 0.079
@@ -553,10 +556,16 @@ def _falls_quiet(deck: Deck, start: float, seconds: float = 0.0) -> bool:
         high if seconds else max(low + 1, int((start + _LANDING_BEATS * beat) / bin_seconds + 0.5))
     )
     bar = bins[low:high]
+    if len(bar) == 0:
+        return False
     floor = sustained_energy_floor(bins)
+    # a silent bin late in the bar is B's own stop only once B has started at its level
+    landed = bins[low:landing]
+    if float(np.median(landed)) < _STARTED_FRACTION * floor:
+        landed = bar
     # the bins centred in the bar; their median is deaf to a loud bin at its edge (the next
     # bar's onset, as the bins round it)
-    return len(bar) > 0 and (
-        float(bins[low:landing].min()) <= _SILENT_FRACTION * floor
+    return (
+        float(landed.min()) <= _SILENT_FRACTION * floor
         or float(np.median(bar)) < _QUIET_BAR_FRACTION * floor
     )
