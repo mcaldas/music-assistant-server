@@ -558,7 +558,7 @@ def _pepas(bin_one_db: float = -25.0) -> AudioAnalysisData:
     return _with_vocal_activity(inc, [(0.32, 30.0)])
 
 
-@pytest.mark.parametrize("style", ["cut", "quick_fade"])
+@pytest.mark.parametrize("style", ["cut", "quick_fade", "echo_out"])
 @pytest.mark.parametrize(
     ("bin_one_db", "audible_from", "entry"),
     [(-25.0, None, BIN), (0.0, 0.38, 0.38)],
@@ -624,7 +624,7 @@ def _quiet_first_bar() -> AudioAnalysisData:
     return _shifted(_analysis(120.0, rms_energy=rms), 1.0)
 
 
-@pytest.mark.parametrize("style", ["cut", "quick_fade"])
+@pytest.mark.parametrize("style", ["cut", "quick_fade", "echo_out"])
 def test_a_switch_never_lands_on_a_quiet_bar_that_falls_silent(style: str) -> None:
     """B's quiet first bar goes near silent three beats in: B never started, so it is a gap."""
     planner, plan = _plan(_analysis(100.0), _quiet_first_bar(), style, exit_at=224.0)

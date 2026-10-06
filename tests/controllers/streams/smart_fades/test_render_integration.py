@@ -617,7 +617,7 @@ def _quietest_after(mix: np.ndarray, at: float, seconds: float) -> float:
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("style", ["cut", "quick_fade"])
+@pytest.mark.parametrize("style", ["cut", "quick_fade", "echo_out"])
 async def test_a_requested_switch_never_hands_over_to_b_s_silent_head(style: str) -> None:
     """
     Pepas: silent to 0.38 s, its grid back to 0.18 s: A's exit lands its first beat heard, 0.64 s.
