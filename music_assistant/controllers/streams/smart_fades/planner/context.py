@@ -143,6 +143,7 @@ def build_transition_context(
     fade_in_analysis: AudioAnalysisData,
     buffer_duration: float,
     logger: logging.Logger,
+    own_exit: bool = True,
 ) -> TransitionContext:
     """
     Build the immutable per-transition context from the two tracks' analysis.
@@ -154,6 +155,9 @@ def build_transition_context(
     :param fade_in_analysis: Analysis data for the incoming track.
     :param buffer_duration: Length in seconds of the available fade-out holdback.
     :param logger: Logger for verbose per-transition diagnostics.
+    :param own_exit: Whether Smart Fades' own exit must be usable. A caller that brings
+        its exit (a client's, on an end position) passes False: the tail is then not
+        refused for an anchor that is too short.
     """
     # numpy is imported inside the function to keep it off the server startup path
     import numpy as np  # noqa: PLC0415
@@ -206,7 +210,7 @@ def build_transition_context(
         kick_anchor,
         grid_beats,
         grid_downbeats,
-    ) = _cue_outgoing_tail(outgoing, outgoing_profile, buffer_duration)
+    ) = _cue_outgoing_tail(outgoing, outgoing_profile, buffer_duration, own_exit)
     outgoing = replace(outgoing, beats=grid_beats, downbeats=grid_downbeats)
 
     # Extrapolated up to the true RMS-audible boundary rather than the (possibly
@@ -337,7 +341,10 @@ def build_transition_context(
 
 
 def _cue_outgoing_tail(
-    outgoing: Deck, outgoing_profile: BandProfile | None, buffer_duration: float
+    outgoing: Deck,
+    outgoing_profile: BandProfile | None,
+    buffer_duration: float,
+    own_exit: bool = True,
 ) -> tuple[
     float, float, float, float, float | None, npt.NDArray[np.float32], npt.NDArray[np.float32]
 ]:
@@ -376,7 +383,7 @@ def _cue_outgoing_tail(
     # thus the tier) are kick-aware; the fold stays tier-decision-local here
     folded_mix_out = kick_anchor if kick_anchor is not None else raw_mix_out
     tier_anchor = min(silence_end, folded_mix_out)
-    if tier_anchor < MIN_EFFECTIVE_FADE_BUFFER:
+    if own_exit and tier_anchor < MIN_EFFECTIVE_FADE_BUFFER:
         raise SmartFadeNotApplicable(f"outgoing tail is mostly silent ({tier_anchor:.1f}s audible)")
 
     # Shift fade-out beats from full-track to buffer-local coordinates
@@ -393,7 +400,7 @@ def _cue_outgoing_tail(
     audio_end = min(silence_end, buffer_duration)
 
     tier_anchor = _snap_anchor(tier_anchor, buffer_duration, grid_downbeats, outgoing)
-    if tier_anchor < MIN_EFFECTIVE_FADE_BUFFER:
+    if own_exit and tier_anchor < MIN_EFFECTIVE_FADE_BUFFER:
         raise SmartFadeNotApplicable(
             f"outgoing tail too short after anchoring ({tier_anchor:.1f}s)"
         )

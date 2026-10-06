@@ -11,7 +11,11 @@ import pytest
 from music_assistant_models.enums import CrossfadeMode
 
 from music_assistant.controllers.streams.audio_buffer import AudioBuffer
-from music_assistant.controllers.streams.smart_fades.fades import SmartCrossFade
+from music_assistant.controllers.streams.smart_fades.fades import (
+    SmartCrossFade,
+    SmartFadeNotApplicable,
+    StandardCrossFade,
+)
 from music_assistant.controllers.streams.smart_fades.helpers import (
     analysis_from,
     analysis_until,
@@ -235,3 +239,47 @@ def test_with_no_downbeat_near_the_exit_the_default_plan_ships() -> None:
     plan = planner.plan(out, inc, 45.0)
     assert (planner.outcome, planner.reason) == ("fallback", "no_room")
     assert plan == SmartCrossFadePlanner(LOGGER).plan(out, inc, 45.0)
+
+
+# a 100 BPM part ending on its 144 s downbeat whose energy drops 4 s into the 45 s tail:
+# Smart Fades' own exit would be there, too short a tail for any fade of its own
+EARLY_DROP_END = 144.0
+
+
+def _part_dropping_early() -> AudioAnalysisData:
+    """Return a 100 BPM track cut at a 144 s end, its energy low from 103 s on."""
+    rms = np.full(1800, 0.5, dtype=np.float32)
+    rms[0] = 1.0
+    rms[int(103.0 / 240.0 * 1800) :] = 0.1
+    return analysis_until(_analysis(100.0, rms_energy=rms), EARLY_DROP_END)
+
+
+@pytest.mark.parametrize(
+    ("style", "bars", "outcome"),
+    [("cut", 0, ("applied", None)), ("blend", 4, ("fallback", "not_blendable"))],
+)
+async def test_an_exit_on_an_end_holds_when_smart_fades_has_no_exit_of_its_own(
+    style: str, bars: int, outcome: tuple[str, str | None]
+) -> None:
+    """
+    A tail Smart Fades cannot anchor still takes the client's exit: a cut on A's end downbeat.
+
+    Without the request, or without the end, the standard crossfade plays as before.
+    """
+    out, inc = _part_dropping_early(), _analysis(128.0)
+    with pytest.raises(SmartFadeNotApplicable):
+        SmartCrossFadePlanner(LOGGER).plan(out, inc, 45.0)
+    mixer = _make_mixer({"out": out, "in": inc})
+    request = TransitionRequest(style, "in", bars, EARLY_DROP_END)
+    fade = await mixer.build(**_build_kwargs(), request=request, fade_out_end=EARLY_DROP_END)
+
+    assert isinstance(fade, SmartCrossFade)
+    assert isinstance(fade.planner, RequestedTransitionPlanner)
+    assert (fade.planner.outcome, fade.planner.reason) == outcome
+    assert fade.plan is not None
+    assert EARLY_DROP_END - 45.0 + fade.plan.fade_out_window == pytest.approx(EARLY_DROP_END)
+    assert fade.timing_info.crossfade_duration == pytest.approx(CUT_SECONDS)
+    # A's tail plays up to the exit, B's one lands on it
+    assert fade.timing_info.pre_crossfade_duration + CUT_SECONDS == pytest.approx(45.0, abs=1e-3)
+    for kwargs in ({"fade_out_end": EARLY_DROP_END}, {"request": request}):
+        assert isinstance(await mixer.build(**_build_kwargs(), **kwargs), StandardCrossFade)

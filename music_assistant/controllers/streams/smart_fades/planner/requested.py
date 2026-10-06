@@ -26,6 +26,7 @@ from music_assistant.controllers.streams.smart_fades.models import (
     EqPlan,
     FadeOutTrim,
     PlanMetrics,
+    SmartFadeNotApplicable,
     SweepSchedule,
     TempoPlan,
     TransitionPlan,
@@ -270,9 +271,18 @@ class RequestedTransitionPlanner(TransitionPlanner):
         :param fade_in_analysis: Analysis data for the incoming track.
         :param buffer_duration: Length in seconds of the available fade-out holdback.
         """
-        ctx = build_transition_context(
-            fade_out_analysis, fade_in_analysis, buffer_duration, self.logger
-        )
+        try:
+            ctx = build_transition_context(
+                fade_out_analysis, fade_in_analysis, buffer_duration, self.logger
+            )
+        except SmartFadeNotApplicable:
+            if not (self.cut_at_end and self.request.exit_at):
+                raise
+            # Smart Fades finds no exit of its own in this tail (its energy drops early), but
+            # the client named one on an end position: A's downbeats are all that takes
+            ctx = build_transition_context(
+                fade_out_analysis, fade_in_analysis, buffer_duration, self.logger, own_exit=False
+            )
         plan = self._plan_request(ctx)
         if plan is None and self.cut_at_end and self.request.exit_at:
             # the client fixed where A ends: a cut there, never Smart Fades' own exit, which can
