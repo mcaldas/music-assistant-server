@@ -4742,9 +4742,10 @@ class StreamsAudio:
                 0.0, (media_end or streamdetails.duration) - streamdetails.seek_position
             )
             window = min(window, remaining_media / playback_speed / 2)
-        if media_end:
-            # the item's own request resumes it on whole milliseconds: a window of whole
-            # seconds ends on one, half of an end can end inside one and repeat its frames
+        if streamdetails.seek_position or media_end:
+            # the item's own request resumes it on the millisecond grid of its start: a
+            # window of whole seconds ends on a frame of that grid, half of what a start or
+            # an end leaves can end inside a millisecond and repeat (or skip) its frames
             window = float(int(window))
         if window < MIN_CROSSFADE_DURATION:
             self.logger.debug(

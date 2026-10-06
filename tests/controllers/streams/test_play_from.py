@@ -200,6 +200,16 @@ async def test_single_mix_reads_b_from_its_start_and_b_goes_on_from_the_mix(
     _assert_runs(again, 2, 21.7, 120)
 
 
+async def test_single_a_fade_capped_by_half_of_b_hands_over_on_the_frame_the_mix_stopped(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Half of B from 1.345 is 19.3275 s: the fade takes 19 s, and B goes on at the next frame."""
+    second = _started("b", 2, 40, 1.345)
+    a_out, b_out, _audio, (_first, marked) = await _a_then_b(monkeypatch, second)
+    _assert_runs(_split(a_out, 2)[1] + b_out, 2, 1.345 + TRIM, 40)
+    assert marked == pytest.approx(1.345 + 19)
+
+
 async def test_single_a_start_sent_as_a_long_json_number_keeps_the_mix(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
