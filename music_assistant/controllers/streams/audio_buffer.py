@@ -430,6 +430,7 @@ class AudioBuffer:
         reason: str = "",
         source_wait_timeout: float | None = STREAM_SLOT_WAIT_TIMEOUT,
         on_complete: Callable[[], None] | None = None,
+        exact_seek: bool = False,
     ) -> AudioBuffer:
         """
         Get or create an AudioBuffer for the given streamdetails.
@@ -447,6 +448,8 @@ class AudioBuffer:
             without a timeout.
         :param on_complete: Called once the source of a newly created buffer has delivered
             all of its audio. Not called when an existing buffer is reused.
+        :param exact_seek: The seek must land on its sample (a client's start): a new buffer
+            decodes the audio before it when it can hold it, instead of seeking at the source.
         :raises AudioError: If the buffer does not become ready, wrapping the typed
             producer error (e.g. ProviderStreamLimitError) when there is one.
         """
@@ -497,7 +500,12 @@ class AudioBuffer:
                 return existing_buffer
 
         audio_buffer, buffer_seek_seconds = _new_buffer(
-            mass, streamdetails, seek_position_ms, log_prefix, session_start=reason == "prepare"
+            mass,
+            streamdetails,
+            seek_position_ms,
+            log_prefix,
+            session_start=reason == "prepare",
+            exact_seek=exact_seek,
         )
 
         # start filling from the media stream (seek in seconds for FFmpeg)
@@ -797,6 +805,7 @@ def _new_buffer(
     log_prefix: str,
     *,
     session_start: bool = False,
+    exact_seek: bool = False,
 ) -> tuple[AudioBuffer, int]:
     """
     Create the buffer for the given stream details and attach it to them.
@@ -807,6 +816,9 @@ def _new_buffer(
     :param log_prefix: Caller context for logging.
     :param session_start: Whether this buffer starts a playback session rather than
         preparing the next item of one.
+    :param exact_seek: The seek must land on its sample (a client's start): the audio
+        before it is decoded rather than skipped by the source's own seek, whenever the
+        buffer can hold it.
     :return: The buffer and the position (in seconds) its producer should start at.
     """
     # determine buffer size from config
@@ -825,7 +837,11 @@ def _new_buffer(
     # for large seeks without existing buffer, start at seek position.
     # A realtime source can not produce the skipped audio any faster than playback,
     # so it always seeks at the source instead of buffering up to the seek point.
-    buffer_seek_seconds = seek_seconds if streamdetails.is_realtime or seek_seconds > 60 else 0
+    # A source's seek can land a codec frame off (ffmpeg 9 on AAC in MP4 takes the next
+    # 1024-sample frame), so an exact seek decodes up to it while the buffer holds that.
+    buffer_seek_seconds = (
+        seek_seconds if streamdetails.is_realtime or (seek_seconds > 60 and not exact_seek) else 0
+    )
 
     pcm_format = _buffer_pcm_format(streamdetails)
 

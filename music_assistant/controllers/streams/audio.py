@@ -3901,6 +3901,8 @@ class StreamsAudio:
                         queue_item.queue_id,
                         queue_item.queue_item_id,
                     ),
+                    # an item with a client's start is only read from it (or after it)
+                    exact_seek=bool(get_start_position(queue_item)),
                 )
             except ProviderStreamLimitError as err:
                 last_capacity_error = err

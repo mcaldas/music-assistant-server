@@ -20,7 +20,11 @@ from music_assistant.controllers.streams.audio import (
     tail_hold_target,
 )
 from music_assistant.controllers.streams.audio_buffer import AudioBuffer
-from music_assistant.controllers.streams.constants import BufferMode, BufferSize
+from music_assistant.controllers.streams.constants import (
+    CONF_BUFFER_SIZE,
+    BufferMode,
+    BufferSize,
+)
 from tests.controllers.streams.test_audio_buffer import (
     _make_mass_for_get_buffer,
     _make_stream_details,
@@ -416,6 +420,65 @@ async def test_single_audio_not_there_at_the_start_is_a_fade_or_a_clean_cut(
         _assert_runs(a_part, 1, 0, 100)
         _assert_runs(b_out, 2, start, 200, faded_in=True)
     await cast("AudioBuffer", second.streamdetails.buffer).clear()
+
+
+def _frame_snapping_source(tag: int, seconds: int) -> Any:
+    """
+    Return a get_media_stream whose seek lands on the next 1024-sample codec frame.
+
+    That is how ffmpeg 9 seeks AAC in MP4 (Apple Music's format): 71 s lands 320 samples
+    late at 8 kHz. Frames say their second and index, as ``_source``'s do.
+    """
+
+    def _get_media_stream(_details: Any, _pcm: Any, seek_position: int = 0, **_kw: Any) -> Any:
+        async def _gen() -> AsyncGenerator[bytes]:
+            first = -(-seek_position * SR // 1024) * 1024
+            for begin in range(first, seconds * SR, SR):
+                index = np.arange(begin, min(begin + SR, seconds * SR))
+                chunk = np.empty((len(index), 2), dtype="<i2")
+                chunk[:, 0] = tag * 1000 + index // SR
+                chunk[:, 1] = index % SR
+                yield chunk.tobytes()
+                await asyncio.sleep(0)
+
+        return _gen()
+
+    return _get_media_stream
+
+
+@pytest.mark.parametrize("start", [71.5, 37.25])
+async def test_a_start_plays_from_its_sample_when_the_source_seeks_a_frame_off(
+    monkeypatch: pytest.MonkeyPatch, start: float
+) -> None:
+    """A start past a minute is decoded up to, not seeked to at a source that lands off it."""
+    details = _make_stream_details(MediaType.TRACK, duration=120, allow_seek=True)
+    details.audio_format = TEST_PCM_FORMAT
+    details.seek_position = start
+    details.loudness = 0.0
+    item = _item("b", 2, 120, BufferSize.BALANCED)
+    await item.streamdetails.buffer.clear()
+    item.streamdetails = details
+    item.extra_attributes["start_position"] = start
+    audio, mass = _single_audio(monkeypatch, None)
+    mass.config.get_raw_core_config_value.side_effect = lambda *args: (
+        BufferSize.BALANCED.value if CONF_BUFFER_SIZE in args else None
+    )
+    mass.player_queues.get.return_value = None
+    mass.player_queues.queue_data_or_none.return_value = None
+    mass.streams.audio.get_media_stream = _frame_snapping_source(2, 120)
+    # prepared at its start as prepare_next does, through the queue's own buffer lookup
+    prepared = await StreamsAudio.get_audio_buffer(
+        audio, cast("Any", item), seek_position_ms=round(start * 1000), reason="prepare_next"
+    )
+    out = bytearray()
+    async for chunk in audio.get_queue_item_stream(
+        cast("Any", item), TEST_PCM_FORMAT, seek_position=start
+    ):
+        out.extend(chunk)
+        if len(out) >= 10 * SECOND:
+            break
+    _assert_runs(out[: 10 * SECOND], 2, start, start + 10, faded_in=True)
+    await prepared.clear()
 
 
 # ---- flow mode ----
