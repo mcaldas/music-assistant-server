@@ -87,7 +87,7 @@ from music_assistant.controllers.player_queues.queue_loader import QueueLoaderMi
 from music_assistant.controllers.player_queues.smart_shuffle import SmartShuffle
 from music_assistant.controllers.player_queues.state import PlayerQueueData
 from music_assistant.controllers.player_queues.stream_feeder import StreamFeederMixin
-from music_assistant.controllers.streams.audio import get_end_position
+from music_assistant.controllers.streams.audio import get_end_position, get_start_position
 from music_assistant.controllers.streams.smart_fades.helpers import SMART_CROSSFADE_DURATION
 from music_assistant.controllers.streams.smart_fades.planner.candidates import RUNG_LADDER
 from music_assistant.controllers.streams.smart_fades.planner.requested import (
@@ -590,7 +590,9 @@ class PlayerQueuesController(QueueLoaderMixin, PlaybackTrackerMixin, StreamFeede
             # stored to the millisecond, so an exit sent as the same number must compare equal
             exit_at = round(exit_at, 3)
             stop = get_end_position(queue_item) or queue_item.duration
-            window = min(float(SMART_CROSSFADE_DURATION), stop / 2)
+            window = min(
+                float(SMART_CROSSFADE_DURATION), (stop - get_start_position(queue_item)) / 2
+            )
             if not stop - window < exit_at <= stop:
                 raise InvalidDataError(f"exit_at must be in the last {window:.0f}s of the item")
         if next_item is None:
@@ -623,7 +625,8 @@ class PlayerQueuesController(QueueLoaderMixin, PlaybackTrackerMixin, StreamFeede
         moving or clearing the end drops a transition request pending on the item, as it was
         made for the old end: send it again afterwards. The end is stored on the item as the
         ``end_position`` extra attribute and lapses when the item stops playing; a seek past
-        it plays the rest of the item.
+        it plays the rest of the item. It must lie after the item's start
+        (``set_start_position``).
 
         The audio is read well ahead of the player, so an end it has already been read past
         is refused, and so is one inside the start of an item that a planned fade already
@@ -647,6 +650,8 @@ class PlayerQueuesController(QueueLoaderMixin, PlaybackTrackerMixin, StreamFeede
             raise InvalidCommand("An end can be set only on a track with a known duration")
         if position >= queue_item.duration:
             raise InvalidDataError(f"The end must be before the item's {queue_item.duration}s")
+        if position and position <= get_start_position(queue_item):
+            raise InvalidDataError("The end must be after the item's start")
         read = self.mass.streams.audio.read_positions.get(queue_item_id)
         if read is not None and (position or float("inf")) <= read:
             raise ActionUnavailable("The item's audio has already been read past that point")
@@ -655,6 +660,61 @@ class PlayerQueuesController(QueueLoaderMixin, PlaybackTrackerMixin, StreamFeede
             attributes["end_position"] = round(position, 3)
         elif attributes.pop("end_position", None) is None:
             return
+        TransitionRequest.drop(attributes)
+        self.signal_update(queue_id, items_changed=True)
+
+    @api_command("player_queues/set_start_position", required_scope=Scope.QUEUES_CONTROL)
+    async def set_start_position(
+        self, queue_id: str, queue_item_id: str, position: float = 0.0
+    ) -> None:
+        """
+        Make a queue item's audio start at a chosen second instead of its beginning.
+
+        The start applies to every fresh play of the item: play_index with no seek, next, the
+        crossfade into it and a repeat all play it from ``position``, and Smart Fades plans the
+        fade into it from there. Elapsed time stays in the item's own seconds. A seek is the
+        listener's own position and clears the start; the end stays as ``set_end_position``
+        set it. The start is stored on the item as the ``start_position`` extra attribute and
+        lapses when the item stops being current. Setting, moving or clearing it drops a
+        transition request pending on the item, as its exit window depends on what plays.
+
+        The start is fixed once the item's audio is read from it: on Sonos when the queue's
+        ``index_in_buffer`` reaches the item, in flow mode when the fade into it is gathered.
+        A start sent after that is refused and the old one plays. play_media takes no start:
+        add the items, set their starts, then play_index the first.
+
+        :param queue_id: Queue the item is in.
+        :param queue_item_id: Item whose audio should start later.
+        :param position: Second of the item where its audio should start; 0 clears the start.
+        """
+        self._check_player_permission(queue_id)
+        if position < 0:
+            raise InvalidDataError(f"Invalid start position: {position}")
+        if self.get(queue_id) is None:
+            raise PlayerUnavailableError(f"Queue {queue_id} is not available")
+        if (queue_item := self.get_item(queue_id, queue_item_id)) is None:
+            raise InvalidDataError(f"Queue item {queue_item_id} not found in queue")
+        if queue_item.media_type != MediaType.TRACK or not queue_item.duration:
+            raise InvalidCommand("A start can be set only on a track with a known duration")
+        if position >= (stop := get_end_position(queue_item) or queue_item.duration):
+            raise InvalidDataError(f"The start must be before the item's end at {stop}s")
+        if queue_item_id in self.mass.streams.audio.read_positions:
+            raise ActionUnavailable("The item's audio is already being read from its start")
+        attributes = queue_item.extra_attributes
+        if position:
+            attributes["start_position"] = round(position, 3)
+        elif attributes.pop("start_position", None) is None:
+            return
+        if (streamdetails := queue_item.streamdetails) is not None:
+            # details resolved ahead of the stream start there now; audio prepared from
+            # elsewhere cannot serve that start, so it is let go (detached, then released)
+            streamdetails.seek_position = get_start_position(queue_item)
+            prepared = streamdetails.buffer
+            if prepared is not None and not prepared.is_valid(
+                int(streamdetails.seek_position * 1000)
+            ):
+                streamdetails.buffer = None
+                await prepared.clear()
         TransitionRequest.drop(attributes)
         self.signal_update(queue_id, items_changed=True)
 
@@ -1062,10 +1122,12 @@ class PlayerQueuesController(QueueLoaderMixin, PlaybackTrackerMixin, StreamFeede
             raise InvalidCommand("Can not seek outside of duration range.")
         if queue.current_index is None:
             raise InvalidCommand(f"Queue {queue_player.state.name} has no current index.")
+        # a seek is the listener's own position: a client's start no longer applies
+        started = queue.current_item.extra_attributes.pop("start_position", None) is not None
         # Publish the seek target before rebuilding the stream to prevent progress snapback.
         queue.elapsed_time = position
         queue.elapsed_time_last_updated = time.time()
-        self.signal_update(queue_id)
+        self.signal_update(queue_id, items_changed=started)
         await self.play_index(queue_id, queue.current_index, seek_position=position)
 
     @api_command("player_queues/resume", required_scope=Scope.QUEUES_CONTROL)
@@ -1176,13 +1238,14 @@ class PlayerQueuesController(QueueLoaderMixin, PlaybackTrackerMixin, StreamFeede
                 queue_id,
                 queue_data.session_id,
             )
-            # handle resume point of audiobook(chapter) or podcast(episode)
+            # handle resume point of audiobook(chapter) or podcast(episode), or a client's start
+            start_position: float = seek_position
             if (
                 not seek_position
                 and not restarting_ended_queue
                 and (queue_item := self.get_item(queue_id, index))
             ):
-                seek_position = await self._get_resume_position(queue_item)
+                start_position = await self._get_resume_position(queue_item)
 
             # restore the persisted playback speed for a freshly queued audiobook/episode
             # (an in-session item already carries its speed in extra_attributes)
@@ -1214,7 +1277,7 @@ class PlayerQueuesController(QueueLoaderMixin, PlaybackTrackerMixin, StreamFeede
                         await self._load_item(
                             queue_item,
                             is_start=True,
-                            seek_position=seek_position if index == requested_index else 0,
+                            seek_position=start_position if index == requested_index else 0,
                             fade_in=fade_in if index == requested_index else False,
                         )
                         queue.current_index = index
@@ -1224,7 +1287,7 @@ class PlayerQueuesController(QueueLoaderMixin, PlaybackTrackerMixin, StreamFeede
                         # reset the elapsed clock together with the item switch (like
                         # next/previous do), so queue updates signaled before the player
                         # reports position don't carry the previous item's elapsed_time
-                        queue.elapsed_time = seek_position if index == requested_index else 0
+                        queue.elapsed_time = start_position if index == requested_index else 0
                         queue.elapsed_time_last_updated = time.time()
                         loaded_item = queue_item
                         break
@@ -1567,9 +1630,11 @@ class PlayerQueuesController(QueueLoaderMixin, PlaybackTrackerMixin, StreamFeede
                 # we only allow 10 retries to prevent infinite loops
                 raise QueueEmpty("No more (playable) tracks left in the queue.")
             try:
-                # a repeat plays the item over from the start, not from where it was left off
+                # a repeat plays the item over from its start, not from where it was left off
                 seek_position = (
-                    await self._get_resume_position(queue_item) if next_index > cur_index else 0
+                    await self._get_resume_position(queue_item)
+                    if next_index > cur_index
+                    else get_start_position(queue_item)
                 )
                 await self._load_item(queue_item, seek_position=seek_position)
                 # we're all set, this is our next item

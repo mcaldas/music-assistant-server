@@ -287,8 +287,8 @@ class PlaybackTrackerMixin(_PlayerQueuesBase):
             self._handle_end_of_queue(queue, prev_state, new_state)
 
         # an item that stops being current has passed its boundary: a transition request
-        # or an end position still on it must not apply on a later pass, and its transition
-        # report describes this pass only
+        # or a start or end position still on it must not apply on a later pass, and its
+        # transition report describes this pass only
         if (
             "current_item_id" in changed_keys
             and prev_item_id is not None
@@ -299,7 +299,8 @@ class PlaybackTrackerMixin(_PlayerQueuesBase):
             stale = [
                 key
                 for key in attrs
-                if key == "end_position" or key.startswith(("transition_", REQUEST_PREFIX))
+                if key in ("start_position", "end_position")
+                or key.startswith(("transition_", REQUEST_PREFIX))
             ]
             for key in stale:
                 del attrs[key]

@@ -79,6 +79,7 @@ from music_assistant.controllers.streams.announcements import (
 from music_assistant.controllers.streams.audio import (
     StreamsAudio,
     get_end_position,
+    get_start_position,
     overlay_active,
 )
 from music_assistant.controllers.streams.audio_analysis import AudioAnalysisController
@@ -832,7 +833,7 @@ class StreamsController(CoreController):
             if not queue_item.streamdetails:
                 try:
                     queue_item.streamdetails = await self.audio.get_stream_details(
-                        queue_item=queue_item
+                        queue_item=queue_item, seek_position=get_start_position(queue_item)
                     )
                 except Exception as e:
                     self.logger.error(
@@ -958,7 +959,7 @@ class StreamsController(CoreController):
                 audio_input = self.audio.get_queue_item_stream(
                     queue_item=queue_item,
                     pcm_format=pcm_format,
-                    seek_position=int(queue_item.streamdetails.seek_position),
+                    seek_position=queue_item.streamdetails.seek_position,
                     playback_speed=cast(
                         "float", queue_item.extra_attributes.get("playback_speed", 1.0)
                     ),

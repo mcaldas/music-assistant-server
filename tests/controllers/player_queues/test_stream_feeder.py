@@ -125,6 +125,7 @@ def _controller_with_next_item() -> tuple[PlayerQueuesController, SimpleNamespac
         streamdetails=None,
         name="Current",
         available=True,
+        extra_attributes={},
     )
     next_item = SimpleNamespace(
         queue_item_id="next",
@@ -132,6 +133,7 @@ def _controller_with_next_item() -> tuple[PlayerQueuesController, SimpleNamespac
         streamdetails=SimpleNamespace(buffer=None),
         name="Next",
         available=True,
+        extra_attributes={},
     )
     queue = SimpleNamespace(
         current_item=current_item,
@@ -199,6 +201,7 @@ async def test_prepare_next_uses_the_speculative_capacity_budget() -> None:
 
     mass.streams.audio.get_audio_buffer.assert_awaited_once_with(
         next_item,
+        seek_position_ms=0,
         reason="prepare_next",
         capacity_wait_timeout=STREAM_SLOT_WAIT_TIMEOUT,
         allow_provider_match=False,
@@ -673,6 +676,7 @@ async def test_a_repeated_prepare_joins_a_preparation_that_skipped_ahead() -> No
         streamdetails=None,
         name="Later",
         available=True,
+        extra_attributes={},
     )
     controller._queue_data["queue-1"].items.append(cast("Any", later_item))
     filling = asyncio.Event()

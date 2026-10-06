@@ -63,6 +63,7 @@ from music_assistant.controllers.player_queues.helpers import (
     is_dynamic_source,
 )
 from music_assistant.controllers.player_queues.managed_pool import gate_tracks
+from music_assistant.controllers.streams.audio import get_start_position
 from music_assistant.controllers.webserver.helpers.auth_middleware import (
     get_current_user,
     set_current_user,
@@ -306,7 +307,7 @@ class QueueLoaderMixin(_PlayerQueuesBase):
         self,
         queue_item: QueueItem,
         is_start: bool = False,
-        seek_position: int = 0,
+        seek_position: float = 0,
         fade_in: bool = False,
     ) -> None:
         """
@@ -464,8 +465,15 @@ class QueueLoaderMixin(_PlayerQueuesBase):
             # store it so listings and later playbacks have it up front
             self.mass.create_task(store_probed_duration(self.mass, uri, duration))
 
-    async def _get_resume_position(self, queue_item: QueueItem) -> int:
-        """Return the position (in seconds) to resume an audiobook/episode from, 0 to start over."""
+    async def _get_resume_position(self, queue_item: QueueItem) -> float:
+        """
+        Return the position (in seconds) a fresh play of the item starts from.
+
+        A client's start (set_start_position) first, else where to resume an audiobook/episode,
+        else 0 to start over.
+        """
+        if start := get_start_position(queue_item):
+            return start
         if not (resume_position_ms := getattr(queue_item.media_item, "resume_position_ms", 0)):
             return 0
         # the client may have fetched the item before its duration was known

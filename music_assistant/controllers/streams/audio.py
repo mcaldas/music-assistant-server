@@ -318,6 +318,24 @@ def get_end_position(queue_item: QueueItem) -> float | None:
     return float(end) if isinstance(end, int | float) and end > start else None
 
 
+def get_start_position(queue_item: QueueItem) -> float:
+    """
+    Return the media second a client asked the item's audio to start from, 0 for none.
+
+    Set by ``player_queues/set_start_position``. A stream that cannot seek plays from its
+    beginning, so 0 is returned for it.
+
+    :param queue_item: The queue item.
+    """
+    start = queue_item.extra_attributes.get("start_position")
+    if not isinstance(start, int | float) or start <= 0:
+        return 0.0
+    details = queue_item.streamdetails
+    if details is not None and (not details.allow_seek or not details.duration):
+        return 0.0
+    return float(start)
+
+
 def tail_hold_target(queue_item: QueueItem, max_bytes: int, pcm_format: AudioFormat) -> int:
     """
     Return how many bytes of tail may be held back for a fade right now.
@@ -644,7 +662,7 @@ class StreamsAudio:
     async def get_stream_details(
         self,
         queue_item: QueueItem,
-        seek_position: int = 0,
+        seek_position: float = 0,
         fade_in: bool = False,
         prefer_album_loudness: bool = False,
         excluded_provider_instances: set[str] | None = None,
@@ -1652,7 +1670,7 @@ class StreamsAudio:
         # get or create the AudioBuffer (stores raw decoded PCM). This runs before the
         # filters are built because a source-capacity reselection can hand back another
         # provider's streamdetails, which everything below must then work with.
-        seek_position_ms = int(seek_position * 1000)
+        seek_position_ms = round(seek_position * 1000)
         try:
             if prepared_buffer is not None:
                 if streamdetails.buffer is not prepared_buffer or not prepared_buffer.is_valid(
@@ -1677,6 +1695,10 @@ class StreamsAudio:
             return
         streamdetails = queue_item.streamdetails
         assert streamdetails  # for type checking
+        # a read from the start a client set (set_start_position) starts exactly there
+        exact_seek = exact_seek or (
+            seek_position > 0 and seek_position == get_start_position(queue_item)
+        )
         if normalization_override is not None:
             # a capacity reselection hands back freshly resolved details, so the
             # crossfade's intro/body normalization pin must be re-applied to them
@@ -3542,7 +3564,7 @@ class StreamsAudio:
     async def _get_stream_details(
         self,
         queue_item: QueueItem,
-        seek_position: int,
+        seek_position: float,
         fade_in: bool,
         prefer_album_loudness: bool,
         excluded_provider_instances: set[str] | None,
@@ -3730,7 +3752,7 @@ class StreamsAudio:
         # the playback intent lives on the details we start from; keep it across a reselection
         initial_streamdetails = queue_item.streamdetails
         seek_position = (
-            int(initial_streamdetails.seek_position)
+            initial_streamdetails.seek_position
             if initial_streamdetails
             else seek_position_ms // 1000
         )

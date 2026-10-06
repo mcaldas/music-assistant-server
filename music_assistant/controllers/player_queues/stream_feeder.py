@@ -27,6 +27,7 @@ from music_assistant.constants import (
     VERBOSE_LOG_LEVEL,
 )
 from music_assistant.controllers.player_queues.base import _PlayerQueuesBase
+from music_assistant.controllers.streams.audio import get_start_position
 from music_assistant.controllers.streams.constants import STREAM_SLOT_WAIT_TIMEOUT
 from music_assistant.controllers.webserver.helpers.auth_middleware import (
     get_current_user,
@@ -61,11 +62,11 @@ class StreamFeederMixin(_PlayerQueuesBase):
         # AudioSource items are realtime/live and bypass the AudioBuffer
         if next_item.media_type == MediaType.AUDIO_SOURCE:
             return None
-        # check if buffer already exists and is valid
+        # check if buffer already exists and is valid for where the item starts
         if (
             next_item.streamdetails
             and next_item.streamdetails.buffer
-            and next_item.streamdetails.buffer.is_valid()
+            and next_item.streamdetails.buffer.is_valid(int(get_start_position(next_item) * 1000))
         ):
             # reusing audio an earlier session left behind claims it for this one, so its
             # stop releases it and the earlier session's stop no longer can
@@ -107,6 +108,8 @@ class StreamFeederMixin(_PlayerQueuesBase):
                 )
                 await self.mass.streams.audio.get_audio_buffer(
                     prepared_item,
+                    # at a client's start: the fade into the item reads it from there
+                    seek_position_ms=int(get_start_position(prepared_item) * 1000),
                     reason="prepare_next",
                     capacity_wait_timeout=STREAM_SLOT_WAIT_TIMEOUT,
                     # speculative preparation gives up softly, so it must stay cheap and
