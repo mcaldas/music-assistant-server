@@ -82,8 +82,12 @@ _LANDING_BEATS = 1.75
 # the sustained level (-6 dB) has not started, and a silent bin anywhere in it is a gap
 _STARTED_FRACTION = 0.5
 # a bar whose stored energy sits this far under the track's sustained level (-22 dB) for
-# most of it is a soft intro or the start of a fade-in: heard alone after A, near silence
+# most of it is a soft intro or the start of a fade-in: heard alone after A, near silence.
+# B carries level from the first bin at this line; no beat before it lands on A's exit
 _QUIET_BAR_FRACTION = 0.079
+# how far before the incoming audio's first audible 10 ms (read from its PCM head) a landing
+# may sit: under a 30 ms gap, and about a frame of the analysis' beat grid
+_HEARD_SLACK_S = 0.02
 
 
 @dataclass(frozen=True, slots=True)
@@ -184,6 +188,7 @@ class RequestedTransitionPlanner(TransitionPlanner):
         logger: logging.Logger,
         request: TransitionRequest,
         fade_in_seconds: float = float(SMART_CROSSFADE_DURATION),
+        incoming_audible_from: float | None = None,
     ) -> None:
         """
         Initialize the planner for one requested transition.
@@ -191,10 +196,13 @@ class RequestedTransitionPlanner(TransitionPlanner):
         :param logger: Logger for debug output.
         :param request: The client's request for this boundary.
         :param fade_in_seconds: Length of the incoming track's head the mix will receive.
+        :param incoming_audible_from: Where the incoming track's audio first becomes audible,
+            in its seconds, read from the PCM head the mixer holds; None when unknown.
         """
         super().__init__(logger)
         self.request = request
         self.fade_in_seconds = fade_in_seconds
+        self.incoming_audible_from = incoming_audible_from
         # "applied" | "fallback", read by the stream's transition report
         self.outcome = "applied"
         self.reason: str | None = None
@@ -405,9 +413,14 @@ class RequestedTransitionPlanner(TransitionPlanner):
             # B's first later downbeat whose bar carries level. A quick fade under a bar
             # fades in what B plays before that one under A's last beats (they meet on the
             # one and drift apart going back), only from B's first beat and only where it
-            # carries level: A fading out over B's silence leaves the room a dip
-            first_beat = float(ctx.incoming.beats[0]) if len(ctx.incoming.beats) else b_one
-            for one in [float(d) for d in ctx.incoming.downbeats] or [0.0]:
+            # carries level: A fading out over B's silence leaves the room a dip. Nothing of B
+            # before it is heard plays alone after A: a grid beat or downbeat there (extrapolated
+            # back over a silent head) would leave the room B's silence
+            heard = self._heard_from(ctx)
+            first_beat = max(
+                float(ctx.incoming.beats[0]) if len(ctx.incoming.beats) else b_one, heard
+            )
+            for one in [float(d) for d in ctx.incoming.downbeats if d >= heard] or [heard]:
                 overlap = max(CUT_SECONDS, min(fade, one - first_beat))
                 if overlap > CUT_SECONDS and _falls_quiet(ctx.incoming, one - overlap, overlap):
                     overlap = CUT_SECONDS
@@ -417,14 +430,14 @@ class RequestedTransitionPlanner(TransitionPlanner):
                     # B sings a lead-in before its one: it comes in under A's last beats, so
                     # B's one still lands on A's exit (a pre-roll). Longer than a bar of A it
                     # is no cut any more: the default plan ships
-                    entry = self._pickup_start(ctx)
+                    entry = min(self._pickup_start(ctx), one - CUT_SECONDS)
                     if one - entry > min(bar_out, exit_s):
                         self._fallback("vocal")
                         return []
                     # a lead-in whose beats would drift off A's comes in under A only up to
                     # its first beat, which lands on A's exit; the rest plays alone after A,
                     # so it must carry level
-                    land = self._pickup_landing(ctx, entry, one)
+                    land = self._pickup_landing(ctx, max(entry, heard), one)
                     if land < one and _falls_quiet(ctx.incoming, land, one - land):
                         self._fallback("vocal")
                         return []
@@ -483,8 +496,7 @@ class RequestedTransitionPlanner(TransitionPlanner):
             metrics = _at_full(metrics)
         return [[Candidate(spec, plan, metrics, 1)]]
 
-    @staticmethod
-    def _pickup_start(ctx: TransitionContext) -> float:
+    def _pickup_start(self, ctx: TransitionContext) -> float:
         """Where B's sung lead-in starts, its detector lag padded, never before B's audio."""
         import numpy as np  # noqa: PLC0415
 
@@ -498,16 +510,37 @@ class RequestedTransitionPlanner(TransitionPlanner):
             loud = np.flatnonzero(bins > _SILENT_FRACTION * sustained_energy_floor(bins))
             if len(loud):
                 audible = min(sung, float(loud[0]) * duration / len(rms))
-        return max(0.0, sung - VOCAL_LEFT_PADDING, audible)
+        return max(0.0, sung - VOCAL_LEFT_PADDING, audible, self.incoming_audible_from or 0.0)
+
+    def _heard_from(self, ctx: TransitionContext) -> float:
+        """
+        Return where B first carries level: no landing before it, where B would play alone.
+
+        The first bin at the quiet-bar line, as a landing rounds to its nearest bin, and no
+        earlier than the PCM head says B's audio starts (bins of ~0.1-0.2s blur that onset).
+        """
+        import numpy as np  # noqa: PLC0415
+
+        heard = 0.0
+        rms = ctx.incoming.analysis.rms_energy
+        duration = ctx.incoming.analysis.duration
+        if rms is not None and len(rms) and duration:
+            bins = np.asarray(rms, dtype=np.float32)
+            loud = np.flatnonzero(bins >= _QUIET_BAR_FRACTION * sustained_energy_floor(bins))
+            if len(loud):
+                heard = max(0.0, (float(loud[0]) - 0.5) * duration / len(bins))
+        if self.incoming_audible_from is not None:
+            heard = max(heard, self.incoming_audible_from - _HEARD_SLACK_S)
+        return heard
 
     @staticmethod
     def _pickup_landing(ctx: TransitionContext, entry: float, one: float) -> float:
         """
-        Return where in B a lead-in played from ``entry`` meets A's exit downbeat.
+        Return where in B a lead-in heard from ``entry`` meets A's exit downbeat.
 
         B's one, when every beat B plays before it then falls within the quick fade's drift
-        budget of one of A's beats; otherwise B's first beat, so that none of B's beats plays
-        under A's.
+        budget of one of A's beats; otherwise B's first beat heard, so that none of B's beats
+        plays under A's and B carries level once A has gone.
         """
         beat = 60.0 / ctx.outgoing.bpm
         lead = [float(b) for b in ctx.incoming.beats if entry <= b < one]

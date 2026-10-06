@@ -4,9 +4,12 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+from music_assistant_models.enums import ContentType
+
 if TYPE_CHECKING:
     import numpy as np
     import numpy.typing as npt
+    from music_assistant_models.media_items import AudioFormat
 
 # Buffer size in seconds for crossfade analysis
 SMART_CROSSFADE_DURATION = 45
@@ -18,6 +21,11 @@ MIN_EFFECTIVE_FADE_BUFFER = 8.0
 # Fraction of sustained (median-active) energy below which the outro no longer
 # carries the groove; the crossfade should end at or before this point.
 MIX_OUT_ENERGY_FRACTION = 0.70
+
+# A track's PCM head is audible from its first 10 ms within this many dB of its loudest
+# 50 ms, and never under the floor (a source's noise before the music starts).
+AUDIBLE_RANGE_DB = 30.0
+AUDIBLE_FLOOR_DBFS = -60.0
 
 
 def detect_effective_audio_end(
@@ -232,6 +240,39 @@ def generate_synthetic_timestamps(
     bar_duration = beats_per_bar * (60.0 / bpm)
     n_points = max(n_min, int(stretch_duration / bar_duration))
     return np.linspace(0, stretch_duration, n_points, dtype=np.float32)
+
+
+def audible_start(pcm: bytes, pcm_format: AudioFormat) -> float:
+    """
+    Return where a track's PCM head first becomes audible, in seconds from its start.
+
+    Its first 10 ms within ``AUDIBLE_RANGE_DB`` of its loudest 50 ms and over
+    ``AUDIBLE_FLOOR_DBFS``; the head's whole length when nothing in it is.
+
+    :param pcm: Interleaved little-endian PCM from the track's start (integer or float).
+    :param pcm_format: Format of the audio.
+    """
+    import numpy as np  # noqa: PLC0415
+
+    width = pcm_format.bit_depth // 8
+    frame_size = width * pcm_format.channels
+    raw = np.frombuffer(pcm[: len(pcm) // frame_size * frame_size], dtype=np.uint8)
+    raw = raw.reshape(-1, width)
+    if width == 3:
+        # no numpy type holds packed 24-bit samples: widen them to the top of an int32
+        raw = np.pad(raw, ((0, 0), (1, 0)))
+    floating = pcm_format.content_type in (ContentType.PCM_F32LE, ContentType.PCM_F64LE)
+    samples = raw.view(f"<{'f' if floating else 'i'}{raw.shape[1]}").astype(np.float64)
+    if not floating:
+        samples /= 2.0 ** (8 * raw.shape[1] - 1)
+    frames = np.mean(samples.reshape(-1, pcm_format.channels) ** 2, axis=1)
+    step = max(1, pcm_format.sample_rate // 100)
+    windows = len(frames) // step
+    power = frames[: windows * step].reshape(windows, step).mean(axis=1)
+    loudest = float(np.convolve(power, np.ones(5) / 5, mode="valid").max()) if windows >= 5 else 0.0
+    line = max(loudest * 10 ** (-AUDIBLE_RANGE_DB / 10), 10 ** (AUDIBLE_FLOOR_DBFS / 10))
+    heard = np.flatnonzero(power >= line)
+    return float(heard[0] * step if len(heard) else len(frames)) / pcm_format.sample_rate
 
 
 def sustained_energy_floor(rms_energy: npt.NDArray[np.float32]) -> float:

@@ -6,17 +6,21 @@ import asyncio
 import logging
 import sys
 from collections.abc import AsyncGenerator
+from unittest.mock import AsyncMock, MagicMock
 
 import numpy as np
 import pytest
-from music_assistant_models.enums import ContentType
+from music_assistant_models.enums import ContentType, CrossfadeMode, MediaType, StreamType
 from music_assistant_models.media_items import AudioFormat
+from music_assistant_models.streamdetails import StreamDetails
 
+from music_assistant.controllers.streams.audio_buffer import AudioBuffer
 from music_assistant.controllers.streams.smart_fades.fades import (
     SmartCrossFade,
     StandardCrossFade,
     _feed_ffmpeg_stdin,
 )
+from music_assistant.controllers.streams.smart_fades.mixer import SmartFadesMixer
 from music_assistant.controllers.streams.smart_fades.planner.requested import (
     CUT_SECONDS,
     RequestedTransitionPlanner,
@@ -606,6 +610,96 @@ def _quietest_after(mix: np.ndarray, at: float, seconds: float) -> float:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("style", ["cut", "quick_fade"])
+async def test_a_requested_switch_never_hands_over_to_b_s_silent_head(style: str) -> None:
+    """
+    Pepas: silent to 0.38 s, its grid back to 0.18 s: A's exit lands its first beat heard, 0.64 s.
+
+    Landed on 0.18 s (live, PROVENZA -> Pepas) the room heard A stop, then 0.2 s of silence.
+    """
+    fade_out = _tone(440.0, 45.0)
+    fade_in = _tone(1760.0, 45.0)
+    fade_in[: int(0.38 * SR) * 2] = 0.0
+    out, inc = _analysis(100.0, 240.0), _analysis(130.0, 240.0)
+    assert inc.beats is not None
+    assert inc.rms_energy is not None
+    inc.beats = [beat + 0.18 for beat in inc.beats]
+    inc.downbeats = inc.beats[2::4]
+    # the analysis' bins: the first silent, the onset's smear 25 dB under the track's level
+    inc.rms_energy[0], inc.rms_energy[1] = 0.0, 0.5 * 10 ** (-25 / 20)
+    inc.extra_data = {"vocal_activity": [0.9 if i >= 2 else 0.05 for i in range(1800)]}
+    planner = RequestedTransitionPlanner(
+        logging.getLogger(), TransitionRequest(style, "n", 0, 224.0)
+    )
+    fade = SmartCrossFade(logging.getLogger(), out, inc, planner)
+    fade.build(fade_out.nbytes, fade_in.nbytes, PCM)
+    chunks = [chunk async for chunk in fade.apply(fade_out.tobytes(), fade_in.tobytes(), PCM)]
+    mix = np.frombuffer(b"".join(chunks), dtype=np.float32)
+    timing = fade.timing_info
+    cut = timing.pre_crossfade_duration + timing.crossfade_duration
+
+    assert planner.outcome == "applied"
+    assert cut == pytest.approx(223.2 - 195.0, abs=0.001)
+    # from A's exit on, B's voice: never a 10 ms stretch under -50 dBFS (the tone is -17 dBFS)
+    assert _quietest_after(mix, cut, 1.0) > -50.0
+
+
+@pytest.mark.asyncio
+async def test_a_requested_cut_reads_where_b_starts_from_the_head_the_mixer_holds() -> None:
+    """
+    B's grid starts 0.1 s in and its analysis reads loud from there; its audio starts 0.3 s in.
+
+    Only the PCM head in B's buffer tells: the mixer reads it, the cut lands B's next one.
+    """
+    fade_out = _tone(440.0, 45.0)
+    fade_in = _tone(1760.0, 45.0)
+    fade_in[: int(0.3 * SR) * 2] = 0.0
+    out, inc = _analysis(120.0, 240.0), _analysis(120.0, 240.0)
+    assert inc.beats is not None
+    inc.beats = [beat + 0.1 for beat in inc.beats]
+    inc.downbeats = inc.beats[::4]
+    streams = MagicMock()
+    streams.logger = logging.getLogger()
+    streams.audio_analysis.get_audio_analysis = AsyncMock(
+        side_effect=lambda item_id, *_, **__: out if item_id == "a" else inc
+    )
+    details = {
+        item_id: StreamDetails(
+            provider="test",
+            item_id=item_id,
+            audio_format=PCM,
+            media_type=MediaType.TRACK,
+            stream_type=StreamType.HTTP,
+        )
+        for item_id in ("a", "b")
+    }
+    buffer = AudioBuffer(PCM)
+    for second in range(4):
+        await buffer._put(fade_in.tobytes()[second * PCM.pcm_sample_size :][: PCM.pcm_sample_size])
+    details["b"].buffer = buffer
+    fade = await SmartFadesMixer(streams).build(
+        fade_in_streamdetails=details["b"],
+        fade_out_streamdetails=details["a"],
+        pcm_format=PCM,
+        standard_crossfade_duration=10,
+        mode=CrossfadeMode.SMART_CROSSFADE,
+        fade_out_data=fade_out.tobytes(),
+        fade_in_bytes_len=fade_in.nbytes,
+        request=TransitionRequest("cut", "n", 0, 224.0),
+    )
+    assert isinstance(fade, SmartCrossFade)
+    chunks = [chunk async for chunk in fade.apply(fade_out.tobytes(), fade_in.tobytes(), PCM)]
+    mix = np.frombuffer(b"".join(chunks), dtype=np.float32)
+    timing = fade.timing_info
+    cut = timing.pre_crossfade_duration + timing.crossfade_duration
+
+    assert fade.plan is not None
+    assert (fade.plan.fadein_trim_start or 0.0) + fade.plan.crossfade_duration == pytest.approx(2.1)
+    assert cut == pytest.approx(29.0, abs=0.001)
+    assert _quietest_after(mix, cut, 1.0) > -50.0
+
+
+@pytest.mark.asyncio
 async def test_a_requested_cut_never_lands_on_a_quiet_bar_that_falls_silent() -> None:
     """B's first bar plays 11 dB under its level and its last beat near silent: B's next one."""
     fade_out, fade_in = _tone(440.0, 45.0), _tone(1760.0, 45.0)
@@ -633,3 +727,23 @@ async def test_a_requested_cut_never_lands_on_a_quiet_bar_that_falls_silent() ->
     assert planner.outcome == "applied"
     assert cut == pytest.approx(29.0, abs=0.001)
     assert _quietest_after(mix, cut, 2.0) > -50.0
+
+
+@pytest.mark.asyncio
+async def test_the_mixer_reads_no_head_from_a_buffer_that_starts_later() -> None:
+    """A buffer from a seek holds no track start: the planner keeps to its analysis."""
+    streams = MagicMock()
+    streams.logger = logging.getLogger()
+    buffer = AudioBuffer(PCM)
+    buffer._discarded_chunks = 1
+    await buffer._put(_tone(1760.0, 1.0).tobytes())
+    details = StreamDetails(
+        provider="test",
+        item_id="b",
+        audio_format=PCM,
+        media_type=MediaType.TRACK,
+        stream_type=StreamType.HTTP,
+    )
+    details.buffer = buffer
+
+    assert await SmartFadesMixer(streams)._audible_from(details) is None

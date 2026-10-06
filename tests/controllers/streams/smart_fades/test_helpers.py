@@ -6,8 +6,11 @@ import itertools
 
 import numpy as np
 import pytest
+from music_assistant_models.enums import ContentType
+from music_assistant_models.media_items import AudioFormat
 
 from music_assistant.controllers.streams.smart_fades.helpers import (
+    audible_start,
     camelot_affinity,
     db_ramp,
     detect_effective_audio_end,
@@ -154,3 +157,46 @@ class TestDbRamp:
         steps = db_ramp(0.0, 0.05, -26.0, 0.0)
         assert len(steps) >= 2
         assert steps[-1][1] == pytest.approx(0.0)
+
+
+def _pcm_head(content_type: ContentType, bit_depth: int, onset: float, noise_db: float) -> bytes:
+    """Return 2 s of stereo PCM: noise at ``noise_db`` dBFS, then a -20 dBFS tone from ``onset``."""
+    rate = 48000
+    t = np.arange(2 * rate) / rate
+    rng = np.random.default_rng(1)
+    mono = 10 ** (noise_db / 20) * rng.standard_normal(len(t))
+    mono += np.where(t >= onset, 0.1 * np.sqrt(2) * np.sin(2 * np.pi * 440.0 * t), 0.0)
+    frames = np.repeat(mono, 2)
+    if content_type is ContentType.PCM_F32LE:
+        return frames.astype("<f4").tobytes()
+    ints = np.round(frames * 2 ** (bit_depth - 1)).astype("<i4")
+    if bit_depth == 16:
+        return ints.astype("<i2").tobytes()
+    # packed 24-bit: the low three bytes of each int32
+    return ints.view(np.uint8).reshape(-1, 4)[:, :3].tobytes()
+
+
+@pytest.mark.parametrize(
+    ("content_type", "bit_depth"),
+    [(ContentType.PCM_S16LE, 16), (ContentType.PCM_S24LE, 24), (ContentType.PCM_F32LE, 32)],
+)
+@pytest.mark.parametrize("noise_db", [-200.0, -70.0])
+def test_audible_start_finds_the_onset_to_the_10ms_window(
+    content_type: ContentType, bit_depth: int, noise_db: float
+) -> None:
+    """A tone from 0.383 s over silence, or a -70 dBFS noise floor, is heard from its window."""
+    fmt = AudioFormat(content_type=content_type, sample_rate=48000, bit_depth=bit_depth, channels=2)
+
+    assert audible_start(_pcm_head(content_type, bit_depth, 0.383, noise_db), fmt) == (
+        pytest.approx(0.38)
+    )
+
+
+def test_audible_start_of_a_head_that_never_sounds_is_its_length() -> None:
+    """Nothing audible in the head: B is not heard for at least as long as the head lasts."""
+    fmt = AudioFormat(
+        content_type=ContentType.PCM_F32LE, sample_rate=48000, bit_depth=32, channels=2
+    )
+    head = _pcm_head(ContentType.PCM_F32LE, 32, 5.0, -75.0)
+
+    assert audible_start(head, fmt) == pytest.approx(2.0)

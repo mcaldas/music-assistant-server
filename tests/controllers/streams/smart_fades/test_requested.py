@@ -32,10 +32,14 @@ def _plan(
     exit_at: float = 0.0,
     fade_in_seconds: float = 45.0,
     buffer: float = 45.0,
+    audible_from: float | None = None,
 ) -> tuple[RequestedTransitionPlanner, TransitionPlan]:
     """Plan a requested transition over a held tail of ``buffer`` seconds."""
     planner = RequestedTransitionPlanner(
-        LOGGER, TransitionRequest(style, "next", bars, exit_at), fade_in_seconds
+        LOGGER,
+        TransitionRequest(style, "next", bars, exit_at),
+        fade_in_seconds,
+        incoming_audible_from=audible_from,
     )
     return planner, planner.plan(out, inc, buffer)
 
@@ -483,6 +487,77 @@ def test_a_sung_pickup_whose_beats_would_drift_never_plays_a_break_alone(style: 
     planner, _ = _plan(_analysis(100.0), inc, style, exit_at=224.0)
 
     assert (planner.outcome, planner.reason) == ("fallback", "vocal")
+
+
+def _pepas(bin_one_db: float = -25.0) -> AudioAnalysisData:
+    """
+    Return Pepas' head: silent, sung from 0.32 s, its one at 1.1 s at 130 bpm.
+
+    The beat grid runs back over the silence to 0.18 s and 0.64 s; the analysis bin after the
+    silent first one reads ``bin_one_db`` under the track's level (the onset's smear).
+    """
+    rms = np.full(1800, 0.5, dtype=np.float32)
+    rms[0] = 0.0
+    rms[1] = 0.5 * 10 ** (bin_one_db / 20)
+    inc = _with_pickup(_shifted(_analysis(130.0, rms_energy=rms), 0.18), 2)
+    return _with_vocal_activity(inc, [(0.32, 30.0)])
+
+
+@pytest.mark.parametrize("style", ["cut", "quick_fade"])
+@pytest.mark.parametrize(
+    ("bin_one_db", "audible_from", "entry"),
+    [(-25.0, None, BIN), (0.0, 0.38, 0.38)],
+    ids=["heard-in-the-analysis", "heard-in-the-pcm-head"],
+)
+def test_a_lead_in_lands_its_first_beat_b_is_heard_on(
+    style: str, bin_one_db: float, audible_from: float | None, entry: float
+) -> None:
+    """
+    Pepas' grid beat at 0.18 s is before B is heard: A's exit takes its next beat, 0.64 s.
+
+    Landed on 0.18 s, the room heard 0.2 s of near silence between PROVENZA and Pepas.
+    """
+    planner, plan = _plan(
+        _analysis(100.0), _pepas(bin_one_db), style, exit_at=224.0, audible_from=audible_from
+    )
+
+    assert planner.outcome == "applied"
+    assert TAIL_START + plan.fade_out_window == pytest.approx(223.2)
+    assert plan.fadein_trim_start == pytest.approx(entry)
+    assert plan.fadein_trim_start + plan.crossfade_duration == pytest.approx(0.18 + 60.0 / 130.0)
+    # both decks at full over the pickup until B's beat lands on A's exit
+    assert plan.fade_seconds == CUT_SECONDS
+
+
+@pytest.mark.parametrize(
+    ("audible_from", "one"),
+    [(None, 0.1), (0.11, 0.1), (0.3, 2.1)],
+    ids=["no-head", "heard-on-the-one", "heard-after-the-one"],
+)
+def test_a_cut_never_lands_before_the_pcm_head_says_b_starts(
+    audible_from: float | None, one: float
+) -> None:
+    """B's grid starts on 0.1 s and every bin reads loud; its audio starts 0.3 s in: B's next one."""
+    inc = _shifted(_analysis(120.0), 0.1)
+    planner, plan = _plan(_analysis(120.0), inc, "cut", exit_at=224.0, audible_from=audible_from)
+
+    assert (planner.outcome, planner.reason) == ("applied", None)
+    assert plan.fadein_trim_start == pytest.approx(one - CUT_SECONDS)
+    assert plan.crossfade_duration == CUT_SECONDS
+
+
+@pytest.mark.parametrize("style", ["cut", "quick_fade"])
+def test_a_quick_fade_under_a_bar_fades_only_over_b_heard(style: str) -> None:
+    """At 100 vs 128 BPM the fade before B's one starts no earlier than B is heard (0.25 s)."""
+    inc = _shifted(_analysis(128.0), 0.1)
+    planner, plan = _plan(_analysis(100.0), inc, style, exit_at=224.0, audible_from=0.27)
+
+    assert planner.outcome == "applied"
+    # B's one at 0.1 s is before it is heard: A's exit lands B's next one, 1.975 s
+    assert (plan.fadein_trim_start or 0.0) + plan.crossfade_duration == pytest.approx(
+        0.1 + 4 * 60 / 128
+    )
+    assert plan.fadein_trim_start >= 0.25
 
 
 def _quiet_first_bar() -> AudioAnalysisData:

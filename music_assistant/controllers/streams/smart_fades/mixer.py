@@ -17,7 +17,10 @@ from music_assistant.controllers.streams.smart_fades.fades import (
     SmartFadeNotApplicable,
     StandardCrossFade,
 )
-from music_assistant.controllers.streams.smart_fades.helpers import detect_effective_audio_end
+from music_assistant.controllers.streams.smart_fades.helpers import (
+    audible_start,
+    detect_effective_audio_end,
+)
 from music_assistant.controllers.streams.smart_fades.planner.requested import (
     RequestedTransitionPlanner,
 )
@@ -34,6 +37,7 @@ if TYPE_CHECKING:
     from music_assistant_models.media_items import AudioFormat
     from music_assistant_models.streamdetails import StreamDetails
 
+    from music_assistant.controllers.streams.audio_buffer import AudioBuffer
     from music_assistant.controllers.streams.controller import StreamsController
     from music_assistant.controllers.streams.smart_fades.planner.requested import (
         TransitionRequest,
@@ -41,6 +45,8 @@ if TYPE_CHECKING:
 
 # marks the end of the mix stream on the pump queue (a chunk is always bytes)
 _MIX_DONE = object()
+# how much of the incoming track's head is read for where its audio starts
+_AUDIBLE_HEAD_SECONDS = 3
 
 
 class SmartFadesMixer:
@@ -247,6 +253,9 @@ class SmartFadesMixer:
                 fade_in_analysis.beats is not None if fade_in_analysis else None,
             )
             return None, fade_out_analysis
+        audible_from = (
+            await self._audible_from(fade_in_streamdetails) if request is not None else None
+        )
         try:
             smart_fade = SmartCrossFade(
                 logger=self.logger,
@@ -254,7 +263,10 @@ class SmartFadesMixer:
                 fade_in_analysis=fade_in_analysis,
                 planner=(
                     RequestedTransitionPlanner(
-                        self.logger, request, fade_in_bytes_len / pcm_format.pcm_sample_size
+                        self.logger,
+                        request,
+                        fade_in_bytes_len / pcm_format.pcm_sample_size,
+                        incoming_audible_from=audible_from,
                     )
                     if request is not None
                     else None
@@ -270,6 +282,31 @@ class SmartFadesMixer:
             )
             return None, fade_out_analysis
         return smart_fade, fade_out_analysis
+
+    async def _audible_from(self, streamdetails: StreamDetails) -> float | None:
+        """
+        Return where the incoming track's audio starts, read from the head its buffer holds.
+
+        None when the buffer no longer holds the track's start, or a read fails: the planner
+        then judges from its analysis alone.
+
+        :param streamdetails: Stream details of the incoming track.
+        """
+        audio_buffer = cast("AudioBuffer | None", streamdetails.buffer)
+        try:
+            if audio_buffer is None or audio_buffer.first_buffered_chunk != 0:
+                return None
+            # whole seconds already resident: nothing here waits on the source
+            seconds = min(_AUDIBLE_HEAD_SECONDS, audio_buffer.seconds_available)
+            head = [await audio_buffer.read_chunk_for_analysis(n) for n in range(seconds)]
+            if not head:
+                return None
+            audible_from = audible_start(b"".join(head), audio_buffer.pcm_format)
+        except Exception as err:
+            self.logger.debug("Reading where the incoming track starts failed: %s", err)
+            return None
+        self.logger.debug("Incoming track audible from %.3fs", audible_from)
+        return audible_from
 
     async def _load_analyses(
         self,
