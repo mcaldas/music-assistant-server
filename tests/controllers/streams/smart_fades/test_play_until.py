@@ -163,6 +163,32 @@ def test_an_end_on_a_downbeat_leaves_on_it(style: str, bars: int, exit_at: float
     assert exit_s == pytest.approx(FRAMED_DOWNBEAT)
 
 
+@pytest.mark.parametrize("bars", [2, 4, 8])
+@pytest.mark.parametrize("held", [45.0, 44.99, 44.98])
+def test_a_blend_into_an_end_on_a_downbeat_keeps_its_bars(held: float, bars: int) -> None:
+    """
+    A blend into an end on any downbeat lasts its bars and starts on A's downbeat.
+
+    The held tail is often a little under 45 s; the end's downbeat, read as float32 in the
+    tail's own seconds, then can land a few microseconds past the end and is still A's last
+    one (without it the blend starts a bar off A's grid, or ships a bar short).
+    """
+    track = _framed(124.0)
+    assert track.downbeats is not None
+    for end in [downbeat for downbeat in track.downbeats if 100.0 < downbeat < 160.0]:
+        out = analysis_until(track, end)
+        request = TransitionRequest("blend", "n", bars, end)
+        planner = RequestedTransitionPlanner(LOGGER, request, 45.0, cut_at_end=True)
+        plan = planner.plan(out, _analysis(126.0), held)
+
+        assert (planner.outcome, planner.reason) == ("applied", None), end
+        steps = plan.tempo_plan.steps
+        # the overlap plays A at the ramp's last tempo: its seconds of A start on a downbeat
+        a_from = end - plan.crossfade_duration * (steps[-1][1] if steps else 1.0)
+        assert out.downbeats is not None
+        assert a_from == pytest.approx(out.downbeats[-1 - bars], abs=0.002), end
+
+
 @pytest.mark.parametrize(("style", "bars"), STYLES)
 def test_an_end_just_before_a_downbeat_takes_the_one_before(style: str, bars: int) -> None:
     """3 ms before a downbeat closing a bar a frame longer than the bpm's: A leaves at 101.24 s."""

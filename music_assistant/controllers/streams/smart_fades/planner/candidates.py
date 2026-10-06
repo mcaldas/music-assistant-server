@@ -89,6 +89,10 @@ _TRIM_CLOSING_MIN_GAP_S: float = 8.0
 _LAZY_OVERLAY_SECONDS: float = 16.0
 # both decks at or under this in-window vocal duty qualify as ambient
 _LAZY_DUTY_MAX: float = 0.10
+# a beat grid sits on the analysis' 20 ms frames and is read as float32: a downbeat on an end
+# position can read just past it, and a bar of the grid can run up to a frame longer than the
+# bpm's
+_GRID_FRAME_S: float = 0.02
 
 
 @dataclass(frozen=True, slots=True)
@@ -539,14 +543,19 @@ class CandidateFactory:
                 trimmed_seconds=ctx.buffer_duration - effective_end,
             )
         protective = np.asarray(ctx.protective_downbeats, dtype=np.float32)
+
+        def up_to_end(grid: npt.NDArray[np.float32]) -> npt.NDArray[np.float32]:
+            # a beat less than a frame past the end is on it (an end position on a bar line)
+            return np.minimum(grid[grid <= effective_end + _GRID_FRAME_S], effective_end)
+
         return _AnchoredTail(
             effective_end=effective_end,
             fadeout_trim=fadeout_trim,
-            beats=ctx.outgoing.beats[ctx.outgoing.beats <= effective_end],
-            downbeats=ctx.outgoing.downbeats[ctx.outgoing.downbeats <= effective_end],
+            beats=up_to_end(ctx.outgoing.beats),
+            downbeats=up_to_end(ctx.outgoing.downbeats),
             # protective downbeats reach all the way to audio_end, so they cover
             # any position an anchor could have chosen
-            extrapolated_downbeats=protective[protective <= effective_end],
+            extrapolated_downbeats=up_to_end(protective),
         )
 
     def _choose_fadein_entry(self, tail: _AnchoredTail, crossfade_bars: int) -> float | None:

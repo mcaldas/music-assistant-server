@@ -35,6 +35,7 @@ from music_assistant.controllers.streams.smart_fades.vocal import VOCAL_LEFT_PAD
 
 from .assembly import PlanAssembler
 from .candidates import (
+    _GRID_FRAME_S,
     _MAX_UNHEARD_INTRO_S,
     RUNG_LADDER,
     Candidate,
@@ -109,10 +110,6 @@ _FADED_FRACTION = 0.1
 # a gap in the incoming PCM head: this long under its audible line, as a room hears one; the
 # head shows gaps the analysis' ~0.1-0.2 s bins blur
 _GAP_S = 0.03
-# a beat grid sits on the analysis' 20 ms frames and is read as float32: a downbeat on an end
-# position can read just past it, and a bar of the grid can run up to a frame longer than the
-# bpm's
-_GRID_FRAME_S = 0.02
 # filter_sweep: the outgoing high-pass rises from 10 Hz over the whole overlap; the incoming
 # low-pass opens over its first 3/4 and fades to dry by 9/10 of it, ahead of asendcmd's frame
 # granularity (~0.1s), so the incoming track plays on untouched
