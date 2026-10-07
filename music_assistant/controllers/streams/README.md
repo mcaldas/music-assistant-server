@@ -105,7 +105,9 @@ Supporting modules in `helpers/`:
 3. Analysis (loudness, smart fades) reads the same buffer in parallel, at lower priority
 4. Player requests stream -> get_queue_item_stream() calls buffer.get_stream()
 5. prepare_next_audio_buffer() pre-fills the item after the streamed one: 60s before the end of
-   its stream, or for a realtime source once its audio has fully arrived
+   its stream, or for a realtime source once its audio has fully arrived. Behind an item that
+   plays only a part (a start or an end position) the next one is pre-filled as soon as that
+   part's audio has arrived, while the part is at most one item ahead of the player
 6. _cleanup_stale_queue_buffers() clears old buffers to free memory
 ```
 
