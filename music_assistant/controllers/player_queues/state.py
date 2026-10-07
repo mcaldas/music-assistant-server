@@ -85,6 +85,9 @@ class PlayerQueueData:
     # which the crossfade preload raises to a track the player was never given, this only
     # moves when audio actually goes out
     last_served_item_id: str | None = None
+    # the item most recently prepared behind a part, two ahead of the player at most: the one
+    # prepared buffer the queue's cleanups do not reach once its item leaves the queue
+    prepared_ahead: QueueItem | None = None
     # set when the queue items changed since the last cache write; the debounced saver writes the
     # (heavier) items payload only when this is set
     items_cache_dirty: bool = False

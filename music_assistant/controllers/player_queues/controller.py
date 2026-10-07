@@ -668,6 +668,8 @@ class PlayerQueuesController(QueueLoaderMixin, PlaybackTrackerMixin, StreamFeede
         elif attributes.pop("end_position", None) is None:
             return
         TransitionRequest.drop(attributes)
+        # an item that now plays a part may need its successor prepared early
+        self.schedule_prepare_after_parts(queue_id)
         self.signal_update(queue_id, items_changed=True)
 
     @api_command("player_queues/set_start_position", required_scope=Scope.QUEUES_CONTROL)
@@ -723,6 +725,8 @@ class PlayerQueuesController(QueueLoaderMixin, PlaybackTrackerMixin, StreamFeede
                 streamdetails.buffer = None
                 await prepared.clear()
         TransitionRequest.drop(attributes)
+        # the item is prepared again from its start, and what follows a part early
+        self.schedule_prepare_after_parts(queue_id)
         self.signal_update(queue_id, items_changed=True)
 
     @api_command(
