@@ -39,6 +39,11 @@ if TYPE_CHECKING:
     from music_assistant_models.queue_item import QueueItem
 
 
+# a client adds an item and then sets its start, its end and the transition into it: what is
+# prepared behind a part is looked at again once the queue has been quiet for this long
+PREPARE_AFTER_PART_DELAY = 2.0
+
+
 class StreamFeederMixin(_PlayerQueuesBase):
     """Feed the player's stream: enqueue the next item, preload/prepare its audio, clean up."""
 
@@ -195,7 +200,8 @@ class StreamFeederMixin(_PlayerQueuesBase):
         held tail, and all of it is buffered. Its successor would then be prepared with only
         FADE_SOURCE_WAIT to deliver, and the transition would play as a hard edit. Only the
         item the player is fetching and the one after it chain this way, so the fills stay at
-        most two items ahead of the player.
+        most two items ahead of the player. A part of a track longer than its buffer never
+        has all its audio here, so its successor is prepared as before.
 
         :param queue_id: The queue the item belongs to.
         :param item: The item whose successor may need preparing.
@@ -218,7 +224,57 @@ class StreamFeederMixin(_PlayerQueuesBase):
             after_served = self.get_next_item(queue_id, served)
             if after_served is None or after_served.queue_item_id != item.queue_item_id:
                 return
+        successor = self.get_next_item(queue_id, item.queue_item_id)
+        # as for the stream's own trigger: a live source opened this early would sit idle
+        if successor is None or successor.media_type not in (
+            MediaType.TRACK,
+            MediaType.SOUND_EFFECT,
+        ):
+            return
+        queue_data.prepared_ahead = successor
         self.prepare_next_audio_buffer(queue_id, item.queue_item_id, chain=False)
+
+    def schedule_prepare_after_parts(self, queue_id: str) -> None:
+        """
+        Look again, shortly, at what is prepared behind the parts next to the player.
+
+        Call when the queue's items or an item's start or end changed. Debounced, so an item
+        that is added and then given its positions is prepared once, from where it starts.
+
+        :param queue_id: The queue that changed.
+        """
+        self.mass.call_later(
+            PREPARE_AFTER_PART_DELAY,
+            self._prepare_after_parts,
+            queue_id,
+            task_id=f"prepare_after_parts_{queue_id}",
+        )
+
+    def _prepare_after_parts(self, queue_id: str) -> None:
+        """
+        Prepare what follows the parts next to the player, and let go of what no longer does.
+
+        :param queue_id: The queue to look at.
+        """
+        if (queue_data := self._queue_data.get(queue_id)) is None:
+            return
+        ahead = queue_data.prepared_ahead
+        if ahead is not None and self.get_item(queue_id, ahead.queue_item_id) is None:
+            # prepared further ahead than the queue's own cleanups look, then taken off it
+            queue_data.prepared_ahead = None
+            if (details := ahead.streamdetails) and (orphan := details.buffer):
+                details.buffer = None
+                self.mass.create_task(orphan.clear())
+        served = queue_data.last_served_item_id
+        if (
+            queue_data.queue.state != PlaybackState.PLAYING
+            or queue_data.transitioning
+            or served is None
+        ):
+            return
+        for part in (self.get_item(queue_id, served), self.get_next_item(queue_id, served)):
+            if part is not None:
+                self._prepare_after_part(queue_id, part)
 
     def has_paused_stream_slot_holder(self, provider_instance: str, queue_id: str) -> bool:
         """
@@ -279,11 +335,8 @@ class StreamFeederMixin(_PlayerQueuesBase):
         queue = queue_data.queue
         if queue.state != PlaybackState.PLAYING or queue.current_index is None:
             return
-        if (served := queue_data.last_served_item_id) is not None and not queue_data.transitioning:
-            # the change may have put a new item behind a part whose audio is already here
-            for part in (self.get_item(queue_id, served), self.get_next_item(queue_id, served)):
-                if part is not None:
-                    self._prepare_after_part(queue_id, part)
+        # the change may have put a new item behind a part whose audio is already here
+        self.schedule_prepare_after_parts(queue_id)
         if queue.index_in_buffer is None or queue_data.transitioning:
             # no settled position to follow: a replace clears the buffered index while it swaps
             # the items, and a starting track moves the two indexes one after the other

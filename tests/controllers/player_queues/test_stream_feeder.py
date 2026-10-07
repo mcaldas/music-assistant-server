@@ -17,6 +17,7 @@ from music_assistant_models.queue_item import QueueItem
 
 from music_assistant.controllers.player_queues import PlayerQueuesController
 from music_assistant.controllers.player_queues.state import PlayerQueueData
+from music_assistant.controllers.player_queues.stream_feeder import PREPARE_AFTER_PART_DELAY
 from music_assistant.controllers.streams.constants import STREAM_SLOT_WAIT_TIMEOUT
 from music_assistant.models.music_provider import MusicProvider, ProviderStreamLimitError
 
@@ -153,6 +154,8 @@ def _controller_with_next_item() -> tuple[PlayerQueuesController, SimpleNamespac
                 session_id="session-1",
                 next_item_id_preparing=None,
                 last_served_item_id=None,
+                prepared_ahead=None,
+                transitioning=False,
             ),
         )
     }
@@ -183,9 +186,12 @@ async def test_reusing_a_warm_buffer_claims_it_for_the_current_session() -> None
     controller, next_item, mass = _controller_with_next_item()
     warm = MagicMock()
     warm.is_valid.return_value = True
+    warm.eof = True
+    warm.has_error = False
     next_item.streamdetails = SimpleNamespace(
         buffer=warm, queue_session_id="session-0", media_type=MediaType.TRACK, seek_position=0
     )
+    controller._queue_data["queue-1"].last_served_item_id = "current"
 
     controller.prepare_next_audio_buffer("queue-1", "current")
 
@@ -710,12 +716,15 @@ async def test_a_repeated_prepare_joins_a_preparation_that_skipped_ahead() -> No
         await preparation
 
 
-def _part(item_id: str, *, eof: bool = True) -> SimpleNamespace:
+def _part(
+    item_id: str, *, eof: bool = True, positions: dict[str, float] | None = None
+) -> SimpleNamespace:
     """
     Build a track that plays only a part (it ends early), with its audio buffered.
 
     :param item_id: The queue item id.
     :param eof: Whether the part's source has delivered all of its audio.
+    :param positions: The item's start and end attributes, instead of an end at 90 s.
     """
     buffer = MagicMock()
     buffer.is_valid.return_value = True
@@ -735,7 +744,7 @@ def _part(item_id: str, *, eof: bool = True) -> SimpleNamespace:
         ),
         name=item_id,
         available=True,
-        extra_attributes={"end_position": 90.0},
+        extra_attributes={"end_position": 90.0} if positions is None else positions,
     )
 
 
@@ -827,6 +836,43 @@ async def test_a_part_that_is_still_filling_prepares_nothing() -> None:
     mass.create_task.assert_not_called()
 
 
+async def test_a_part_that_only_starts_late_prepares_its_successor() -> None:
+    """A start position alone makes an item a part."""
+    controller, mass = _controller_with_parts("part", "after", served="current")
+    part = controller._queue_data["queue-1"].items[1]
+    part.extra_attributes = {"start_position": 30.0}
+
+    controller.track_fully_buffered("queue-1", "part")
+
+    assert _prepared_for(mass) == ["part"]
+
+
+@pytest.mark.parametrize("media_type", [MediaType.RADIO, MediaType.PODCAST_EPISODE])
+async def test_a_live_or_spoken_item_behind_a_part_is_not_prepared_early(
+    media_type: MediaType,
+) -> None:
+    """Only a track is prepared early behind a part: a source opened this soon would sit idle."""
+    controller, mass = _controller_with_parts("part", "after", served="current")
+    controller._queue_data["queue-1"].items[2].media_type = media_type
+
+    controller.track_fully_buffered("queue-1", "part")
+
+    mass.create_task.assert_not_called()
+
+
+async def test_two_ready_parts_on_repeat_do_not_prepare_each_other_for_ever() -> None:
+    """Two buffered parts that follow each other (repeat all) end the chain after one step."""
+    controller, mass = _controller_with_parts("part", served="current", last_ready=True)
+    queue_data = controller._queue_data["queue-1"]
+    queue_data.items[:] = [cast("Any", _part("a")), cast("Any", _part("b"))]
+    cast("Any", queue_data.queue).repeat_mode = RepeatMode.ALL
+    queue_data.last_served_item_id = "a"
+
+    assert controller.prepare_next_audio_buffer("queue-1", "a") is None
+
+    mass.create_task.assert_not_called()
+
+
 async def test_ready_parts_chain_one_item_only() -> None:
     """Parts that are all ready do not walk the queue: one step past the next item."""
     controller, mass = _controller_with_parts(
@@ -866,4 +912,42 @@ async def test_a_queue_change_prepares_the_new_item_behind_a_buffered_part() -> 
 
     controller.update_next_item_on_player("queue-1")
 
+    # not at once: the client that added the item may still set its start and end
+    mass.create_task.assert_not_called()
+    delay, look_again, queue_id = mass.call_later.call_args.args
+    assert delay == PREPARE_AFTER_PART_DELAY
+    assert mass.call_later.call_args.kwargs == {"task_id": "prepare_after_parts_queue-1"}
+    look_again(queue_id)
     assert _prepared_for(mass) == ["part"]
+
+
+async def test_an_item_prepared_behind_a_part_is_released_when_it_leaves_the_queue() -> None:
+    """The queue's cleanups walk its items, so audio prepared two ahead is let go here."""
+    controller, _mass = _controller_with_parts("part", "after", served="current", last_ready=True)
+    queue_data = controller._queue_data["queue-1"]
+    cast("Any", queue_data.queue).state = PlaybackState.PLAYING
+    queue_data.transitioning = False
+    controller.track_fully_buffered("queue-1", "part")
+    after = queue_data.items.pop(2)
+    buffer = after.streamdetails.buffer
+
+    controller._prepare_after_parts("queue-1")
+
+    assert after.streamdetails.buffer is None
+    buffer.clear.assert_called_once_with()
+    assert queue_data.prepared_ahead is None
+
+
+async def test_an_item_prepared_behind_a_part_keeps_its_audio_while_it_is_queued() -> None:
+    """Looking again leaves the audio of an item that is still on the queue alone."""
+    controller, _mass = _controller_with_parts("part", "after", served="current", last_ready=True)
+    queue_data = controller._queue_data["queue-1"]
+    cast("Any", queue_data.queue).state = PlaybackState.PLAYING
+    queue_data.transitioning = False
+    controller.track_fully_buffered("queue-1", "part")
+    after = queue_data.items[2]
+
+    controller._prepare_after_parts("queue-1")
+
+    after.streamdetails.buffer.clear.assert_not_called()
+    assert queue_data.prepared_ahead is after
