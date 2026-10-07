@@ -724,6 +724,11 @@ class PlayerQueuesController(QueueLoaderMixin, PlaybackTrackerMixin, StreamFeede
             ):
                 streamdetails.buffer = None
                 await prepared.clear()
+                queue_data = self._queue_data[queue_id]
+                if queue_data.next_item_id_preparing == queue_item_id:
+                    # a preparation still waiting for that audio would sit out its timeout,
+                    # and a new one for the same item would join it: let the next replace it
+                    queue_data.next_item_id_preparing = None
         TransitionRequest.drop(attributes)
         # the item is prepared again from its start, and what follows a part early
         self.schedule_prepare_after_parts(queue_id)

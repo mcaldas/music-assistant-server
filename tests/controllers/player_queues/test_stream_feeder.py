@@ -873,6 +873,38 @@ async def test_two_ready_parts_on_repeat_do_not_prepare_each_other_for_ever() ->
     mass.create_task.assert_not_called()
 
 
+async def test_an_item_a_fade_is_being_mixed_into_is_not_prepared_again() -> None:
+    """
+    The next item is left alone once the boundary into it is being mixed.
+
+    A long track's buffer drops what was read, so it no longer looks prepared from its start,
+    and preparing it again would fetch it a second time under the fade that reads it.
+    """
+    controller, mass = _controller_with_parts("part", "after", served="part")
+    queue_data = controller._queue_data["queue-1"]
+    cast("Any", queue_data.queue).index_in_buffer = 2
+    queue_data.items[2].streamdetails = SimpleNamespace(buffer=MagicMock())
+    queue_data.items[2].streamdetails.buffer.is_valid.return_value = False
+
+    controller.track_fully_buffered("queue-1", "part")
+
+    mass.create_task.assert_not_called()
+
+
+async def test_the_served_item_coming_round_on_repeat_is_not_prepared_again() -> None:
+    """With two items on repeat, the part's successor is the item the player is fetching."""
+    controller, mass = _controller_with_parts("part", served="current", last_ready=True)
+    queue_data = controller._queue_data["queue-1"]
+    cast("Any", queue_data.queue).repeat_mode = RepeatMode.ALL
+    read_past = MagicMock()
+    read_past.is_valid.return_value = False
+    _streamed_item(controller).streamdetails = SimpleNamespace(buffer=read_past)
+
+    controller.track_fully_buffered("queue-1", "part")
+
+    mass.create_task.assert_not_called()
+
+
 async def test_ready_parts_chain_one_item_only() -> None:
     """Parts that are all ready do not walk the queue: one step past the next item."""
     controller, mass = _controller_with_parts(

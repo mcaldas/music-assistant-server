@@ -231,6 +231,13 @@ class StreamFeederMixin(_PlayerQueuesBase):
             MediaType.SOUND_EFFECT,
         ):
             return
+        # an item a reader already has is not prepared again: the served item coming round on
+        # repeat, or the one a fade is being mixed into. A long track's buffer drops what was
+        # read, so it would look unprepared and be fetched a second time under its reader
+        if successor.queue_item_id == served or (
+            self.index_by_id(queue_id, successor.queue_item_id) == queue_data.queue.index_in_buffer
+        ):
+            return
         queue_data.prepared_ahead = successor
         self.prepare_next_audio_buffer(queue_id, item.queue_item_id, chain=False)
 
