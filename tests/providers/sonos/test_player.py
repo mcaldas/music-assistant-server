@@ -26,6 +26,7 @@ from music_assistant.providers.sonos.const import (
     SOURCE_SPOTIFY,
 )
 from music_assistant.providers.sonos.player import SonosPlayer, _is_wakeable
+from tests.common import MockPlayer, MockProvider
 
 
 def _bind_player(mass: MusicAssistant | MagicMock) -> tuple[SonosPlayer, MagicMock]:
@@ -43,6 +44,10 @@ def _bind_player(mass: MusicAssistant | MagicMock) -> tuple[SonosPlayer, MagicMo
     player._wol_mac = None
     player._marked_asleep = False
     player._woken_from_sleep = False
+    # a loaded cloud queue, whose items are served as <queue item id>@3
+    player.cloud_queue_id = "queue"
+    player.cloud_queue_item_generation = 3
+    player._extra_attributes = {}
     player.client = client
     player._on_unload_callbacks = []
     player.update_state = MagicMock()  # type: ignore[misc, method-assign]
@@ -568,6 +573,7 @@ def test_an_item_refused_by_our_stream_server_is_not_logged_as_an_error(
 
     assert not [record for record in caplog.records if record.levelno >= logging.WARNING]
     assert "was refused abc@3 by the stream server" in caplog.text
+    assert not player.extra_attributes
 
 
 def test_a_404_from_another_service_is_logged_as_a_warning(
@@ -615,6 +621,93 @@ def test_a_group_member_leaves_reporting_playback_errors_to_the_coordinator(
         player._on_playback_error(event)
 
     assert not caplog.records
+    assert not player.extra_attributes
+
+
+def test_a_playback_error_from_the_speaker_is_published(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Test an API client can read which item failed and what the speaker said about it."""
+    player = _make_named_player("Kantoor")
+    event = _playback_error(reason="ERROR_LOST_CONNECTION", httpStatus=200)
+
+    with caplog.at_level(logging.DEBUG, logger="test.sonos.player"):
+        player._on_playback_error(event)
+
+    published = dict(player.extra_attributes)
+    assert isinstance(published.pop("playback_error_at"), float)
+    assert published == {
+        "playback_error_queue_item_id": "abc",
+        "playback_error_code": "ERROR_PLAYBACK_FAILED",
+        "playback_error_reason": "ERROR_LOST_CONNECTION",
+        "playback_error_http_status": 200,
+    }
+    player.update_state.assert_called_once()  # type: ignore[attr-defined]
+    assert (
+        "could not play Long Run 11 and reported ERROR_PLAYBACK_FAILED (ERROR_LOST_CONNECTION)"
+        in caplog.text
+    )
+
+
+@pytest.mark.parametrize(
+    "item_id", ["abc@2", None, "abc"], ids=["replaced_load", "no_item", "bare_id"]
+)
+def test_a_playback_error_that_is_not_of_the_current_load_is_not_published(
+    caplog: pytest.LogCaptureFixture, item_id: str | None
+) -> None:
+    """Test a failure that names no item of the current load is logged and nothing more."""
+    player = _make_named_player("Kantoor")
+    event = _playback_error(itemId=item_id)
+
+    with caplog.at_level(logging.DEBUG, logger="test.sonos.player"):
+        player._on_playback_error(event)
+
+    assert len([record for record in caplog.records if record.levelno >= logging.WARNING]) == 1
+    assert "Not publishing the playback error" in caplog.text
+    assert player.extra_attributes == {}
+    player.update_state.assert_not_called()  # type: ignore[attr-defined]
+
+
+def test_a_playback_error_after_a_stop_is_not_published(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Test what a stopped speaker still reports is not presented as a track failing to start."""
+    player = _make_named_player("Kantoor")
+    # as a stop leaves it
+    player.cloud_queue_id = None
+    event = _playback_error()
+
+    with caplog.at_level(logging.DEBUG, logger="test.sonos.player"):
+        player._on_playback_error(event)
+
+    assert len([record for record in caplog.records if record.levelno >= logging.WARNING]) == 1
+    assert "Not publishing the playback error" in caplog.text
+    assert player.extra_attributes == {}
+
+
+def test_an_extra_attribute_change_reaches_api_clients() -> None:
+    """Test an extra attribute is announced when it is set and when it is removed again."""
+    provider = MockProvider("test_players", instance_id="test_players--1")
+    provider.mass.players.get_audio_source_session.return_value = None
+    player = MockPlayer(provider, "attribute_player", "Attribute Player")
+    player.update_state(force_update=True)
+    signal = cast("MagicMock", provider.mass.players.signal_player_state_update)
+
+    player.extra_attributes["playback_error_http_status"] = 200
+    player.update_state()
+
+    assert "extra_attributes.playback_error_http_status" in signal.call_args[0][1]
+    # as the API serves it, under both names the model gives the attributes
+    state = player.state.to_dict()
+    assert state["extra_attributes"]["playback_error_http_status"] == 200
+    assert state["extra_data"]["playback_error_http_status"] == 200
+
+    signal.reset_mock()
+    del player.extra_attributes["playback_error_http_status"]
+    player.update_state()
+
+    assert "extra_attributes.playback_error_http_status" in signal.call_args[0][1]
+    assert "playback_error_http_status" not in player.state.to_dict()["extra_attributes"]
 
 
 def _report_paused_qobuz(group: MagicMock) -> None:

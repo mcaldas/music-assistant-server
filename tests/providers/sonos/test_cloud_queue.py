@@ -96,6 +96,7 @@ def _make_player(items: list[QueueItem], current_index: int = 0) -> tuple[SonosP
     player.cloud_queue_item_generation = 0
     player._announcement_media = None
     player._woken_from_sleep = False
+    player._extra_attributes = {}
     return player, queues
 
 
@@ -268,7 +269,7 @@ async def test_refresh_without_a_session_only_bumps_the_version() -> None:
 
 
 async def test_stop_forgets_the_cloud_queue() -> None:
-    """Test a stopped speaker is no longer signalled about that queue."""
+    """Test a stopped speaker is no longer signalled about that queue, nor shown failing on it."""
     player, _ = _make_player([_make_queue_item("track0")])
     client = MagicMock()
     client.player.is_passive = False
@@ -279,11 +280,17 @@ async def test_stop_forgets_the_cloud_queue() -> None:
     player._announcement_media = PlayerMedia(
         uri="http://announcement", media_type=MediaType.ANNOUNCEMENT
     )
+    player.publish_playback_error("track0@0", code="ERROR_PLAYBACK_FAILED")
+    assert player.extra_attributes
 
     await player.stop()
 
     assert player.cloud_queue_id is None
     assert player._announcement_media is None
+    assert not player.extra_attributes
+    # nor does what the speaker still reports for that queue bring the failure back
+    player.publish_playback_error("track0@0", code="ERROR_PLAYBACK_FAILED")
+    assert not player.extra_attributes
 
 
 async def test_refresh_survives_a_session_the_speaker_forgot() -> None:
@@ -941,6 +948,7 @@ async def test_a_track_our_stream_server_refused_is_not_reported_as_a_failure(
     assert "refused track1@3" in caplog.text
     # nor may it take a place in the history that holds back repeats of real failures
     assert not player.reported_playback_errors
+    player.publish_playback_error.assert_not_called()
 
 
 async def test_another_http_error_is_still_reported(caplog: pytest.LogCaptureFixture) -> None:
@@ -955,6 +963,182 @@ async def test_another_http_error_is_still_reported(caplog: pytest.LogCaptureFix
         await cloud_queue._handle_sonos_queue_time_played(player, request)
 
     assert "reported 500 (http)" in caplog.text
+
+
+@pytest.mark.parametrize(
+    ("error", "published"),
+    [
+        ({"type": "playback", "status": "ERROR_LSE"}, {"code": "ERROR_LSE", "http_status": None}),
+        ({"type": "http", "status": 200}, {"code": None, "http_status": 200}),
+        ({"type": "http", "status": "200"}, {"code": None, "http_status": 200}),
+    ],
+    ids=["playback", "http_int", "http_str"],
+)
+async def test_a_reported_failure_is_published(
+    error: dict[str, object], published: dict[str, object]
+) -> None:
+    """A failure is published under the id its item was served under, and its resend is not."""
+    player = _player_for_error_reports()
+    cloud_queue = _make_cloud_queue()
+    request = MagicMock()
+    request.json = AsyncMock(return_value={"items": [{**_error_report(), "error": error}]})
+
+    await cloud_queue._handle_sonos_queue_time_played(player, request)
+    await cloud_queue._handle_sonos_queue_time_played(player, request)
+
+    player.publish_playback_error.assert_called_once_with("track0@3", **published)
+
+
+def _make_reporting_player() -> SonosPlayer:
+    """Create a speaker with a cloud queue loaded that can log and publish what it reports."""
+    player, _ = _make_player([_make_queue_item("track0"), _make_queue_item("track1")])
+    player.client = MagicMock()
+    player.update_state = MagicMock()  # type: ignore[misc, method-assign]
+    player.reported_playback_errors = deque(maxlen=16)
+    player._cache = {}
+    player._attr_name = "Huiskamer"
+    # the display name prefers the name set in the player config, which has none here
+    player._config = MagicMock()
+    player._config.name = None
+    player.mass.streams.base_url = "http://192.168.1.10:9097"
+    return player
+
+
+def _report_at(patch: pytest.MonkeyPatch, *times: float) -> None:
+    """Let what the speaker reports next arrive at the given times."""
+    clock = MagicMock(time=MagicMock(side_effect=times))
+    patch.setattr("music_assistant.providers.sonos.player.time", clock)
+
+
+@pytest.mark.parametrize("event_first", [True, False], ids=["event_first", "report_first"])
+async def test_the_event_and_the_report_of_one_failure_are_published_as_one(
+    event_first: bool,
+) -> None:
+    """A speaker says one failure twice, in either order: both add up to one, at its first word."""
+    player = _make_reporting_player()
+    cloud_queue = _make_cloud_queue()
+    event = MagicMock()
+    event.data = {
+        "errorCode": "ERROR_PLAYBACK_FAILED",
+        "reason": "ERROR_LOST_CONNECTION",
+        "itemId": "track0@0",
+    }
+    report = {**_error_report(), "error": {"type": "http", "status": 200}, "id": "track0@0"}
+    request = MagicMock()
+    request.json = AsyncMock(return_value={"items": [report]})
+
+    with pytest.MonkeyPatch.context() as patch:
+        _report_at(patch, 100.0, 100.07)
+        if event_first:
+            player._on_playback_error(event)
+        await cloud_queue._handle_sonos_queue_time_played(player, request)
+        if not event_first:
+            player._on_playback_error(event)
+
+    assert player.extra_attributes == {
+        "playback_error_queue_item_id": "track0",
+        "playback_error_at": 100.0,
+        "playback_error_code": "ERROR_PLAYBACK_FAILED",
+        "playback_error_reason": "ERROR_LOST_CONNECTION",
+        "playback_error_http_status": 200,
+    }
+
+
+def test_a_later_failure_of_the_same_item_is_a_new_one() -> None:
+    """An item that fails again later is not read as the failure it already had."""
+    player = _make_reporting_player()
+
+    with pytest.MonkeyPatch.context() as patch:
+        _report_at(patch, 100.0, 200.0)
+        player.publish_playback_error("track0@0", code="ERROR_LSE", http_status=200)
+        player.publish_playback_error(
+            "track0@0", code="ERROR_PLAYBACK_FAILED", reason="ERROR_LOST_CONNECTION"
+        )
+
+    assert player.extra_attributes == {
+        "playback_error_queue_item_id": "track0",
+        "playback_error_at": 200.0,
+        "playback_error_code": "ERROR_PLAYBACK_FAILED",
+        "playback_error_reason": "ERROR_LOST_CONNECTION",
+    }
+
+
+def test_a_failure_of_another_item_replaces_the_published_one() -> None:
+    """Nothing the speaker said about one item is left standing as said about the next."""
+    player = _make_reporting_player()
+
+    with pytest.MonkeyPatch.context() as patch:
+        _report_at(patch, 100.0, 100.5)
+        player.publish_playback_error(
+            "track0@0",
+            code="ERROR_PLAYBACK_FAILED",
+            reason="ERROR_LOST_CONNECTION",
+            http_status=200,
+        )
+        player.publish_playback_error("track1@0", code="ERROR_LSE")
+
+    assert player.extra_attributes == {
+        "playback_error_queue_item_id": "track1",
+        "playback_error_at": 100.5,
+        "playback_error_code": "ERROR_LSE",
+    }
+
+
+async def test_a_new_load_withdraws_the_failure_and_refuses_its_late_reports() -> None:
+    """
+    A load replaces whatever the speaker could not play before it.
+
+    What the speaker still reports for the replaced load names the same queue item when
+    that item is loaded again: published, it would read as the new load failing as well.
+    """
+    player = _make_reporting_player()
+    client = cast("MagicMock", player.client)
+    client.player.is_passive = False
+    client.player.group.play_cloud_queue = AsyncMock()
+    player.publish_playback_error("track0@0", code="ERROR_PLAYBACK_FAILED")
+    assert player.extra_attributes
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(SonosPlayer, "flow_mode", property(lambda _self: False))
+        await player.play_media(
+            PlayerMedia(
+                uri="library://track/1",
+                media_type=MediaType.TRACK,
+                source_id=QUEUE_ID,
+                queue_item_id="track0",
+            )
+        )
+
+    assert player.cloud_queue_item_generation == 1
+    assert not player.extra_attributes
+    player.publish_playback_error("track0@0", code="ERROR_PLAYBACK_FAILED")
+    assert not player.extra_attributes
+    player.publish_playback_error("track0@1", code="ERROR_PLAYBACK_FAILED")
+    assert player.extra_attributes["playback_error_queue_item_id"] == "track0"
+
+
+async def test_a_position_report_leaves_the_published_failure_alone() -> None:
+    """
+    A position reported for the failed item does not withdraw the failure.
+
+    What a speaker reports around a failure, and in which order, has not been seen yet:
+    a withdrawal here could take a real failure away before a client has read it.
+    """
+    player = _make_reporting_player()
+    player._attr_current_media = PlayerMedia(uri="library://track/1", queue_item_id="track0")
+    player.publish_playback_error("track0@0", code="ERROR_PLAYBACK_FAILED")
+    published = dict(player.extra_attributes)
+    cloud_queue = _make_cloud_queue()
+    request = MagicMock()
+    request.json = AsyncMock(
+        return_value={"items": [{"type": "update", "id": "track0@0", "positionMillis": 5000}]}
+    )
+
+    await cloud_queue._handle_sonos_queue_time_played(player, request)
+
+    assert player._attr_elapsed_time == 5.0
+    assert published
+    assert player.extra_attributes == published
 
 
 @pytest.mark.parametrize(

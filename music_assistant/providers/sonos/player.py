@@ -90,6 +90,12 @@ class SonosQueueWindow:
 # Failures remembered per speaker. One report can carry several, and the speaker resends
 # the whole batch until it gives up on the item.
 REPORTED_ERROR_HISTORY = 16
+# Prefix of the player extra attributes holding the playback failure the speaker last
+# reported under the current load, for API clients. Flat scalars; absent while there is none.
+PLAYBACK_ERROR_PREFIX = "playback_error_"
+# The speaker reports one failure as an event and as a cloud queue report, in either order
+# and within a second. A report on the same item later than this is a new failure.
+PLAYBACK_ERROR_MERGE_WINDOW = 5
 
 # seconds for a woken speaker's radio to come up, and for a queue load to start it playing
 WAKE_TIMEOUT = 15
@@ -355,6 +361,7 @@ class SonosPlayer(Player):
         await self.group_controller.stop()
         self.cloud_queue_id = None
         self._announcement_media = None
+        self._clear_playback_error()
         self.update_state()
 
     async def pause(self) -> None:
@@ -471,6 +478,8 @@ class SonosPlayer(Player):
         self._announcement_media = None
         self.cloud_queue_item_generation += 1
         self.bump_cloud_queue_version()
+        # what the speaker could not play belongs to the load this one replaces
+        self._clear_playback_error()
 
         if media.media_type == MediaType.ANNOUNCEMENT:
             # We cannot use play_stream_url for announcements because Sonos treats those
@@ -1016,6 +1025,55 @@ class SonosPlayer(Player):
         self._attr_elapsed_time_last_updated = last_updated
         self.update_state()
 
+    def publish_playback_error(
+        self,
+        wire_item_id: str | None,
+        code: str | None = None,
+        reason: str | None = None,
+        http_status: int | None = None,
+    ) -> None:
+        """
+        Publish a playback failure the speaker reported, as extra attributes of the player.
+
+        Nothing else lets an API client tell a track that failed to start from a pause. It
+        stays until the next load or stop: the speaker does not say when it recovers.
+
+        :param wire_item_id: The id the failed item was served under.
+        :param code: The speaker's error code, such as ERROR_PLAYBACK_FAILED.
+        :param reason: The reason given with it, such as ERROR_LOST_CONNECTION.
+        :param http_status: The HTTP status the speaker got for the item, if it reported one.
+        """
+        item_id = self.bare_item_id(wire_item_id) if wire_item_id else None
+        if not self.cloud_queue_id or not item_id or wire_item_id != self.wire_item_id(item_id):
+            # a speaker we stopped, no item named, or an item of a load play_media has
+            # replaced since: none of these says what should be playing now
+            self.logger.debug(
+                "Not publishing the playback error for %s: not an item of the current load",
+                wire_item_id,
+            )
+            return
+        attributes = self.extra_attributes
+        now = time.time()
+        reported_at = attributes.get(f"{PLAYBACK_ERROR_PREFIX}at")
+        if (
+            attributes.get(f"{PLAYBACK_ERROR_PREFIX}queue_item_id") != item_id
+            or not isinstance(reported_at, float)
+            or now - reported_at > PLAYBACK_ERROR_MERGE_WINDOW
+        ):
+            self._clear_playback_error()
+            attributes[f"{PLAYBACK_ERROR_PREFIX}queue_item_id"] = item_id
+            attributes[f"{PLAYBACK_ERROR_PREFIX}at"] = now
+        for key, value in (("code", code), ("reason", reason), ("http_status", http_status)):
+            if value is not None:
+                attributes.setdefault(f"{PLAYBACK_ERROR_PREFIX}{key}", value)
+        self.update_state()
+
+    def _clear_playback_error(self) -> None:
+        """Withdraw the published playback failure; the next update_state publishes that."""
+        attributes = self.extra_attributes
+        for key in [key for key in attributes if key.startswith(PLAYBACK_ERROR_PREFIX)]:
+            del attributes[key]
+
     def reconnect(self, delay: float = 1) -> None:
         """Reconnect the player."""
         if self.mass.closing:
@@ -1177,7 +1235,7 @@ class SonosPlayer(Player):
         )
 
     def _on_playback_error(self, event: SonosEvent) -> None:
-        """Log a playback failure the speaker reported for the item it tried to play."""
+        """Log and publish a playback failure the speaker reported for the item it tried to play."""
         if self.synced_to:
             # the coordinator plays for the whole group and reports for it
             return
@@ -1199,6 +1257,12 @@ class SonosPlayer(Player):
             error.get("trackName") or error.get("itemId"),
             error["errorCode"],
             error.get("reason", "no reason given"),
+        )
+        self.publish_playback_error(
+            error.get("itemId"),
+            code=error["errorCode"],
+            reason=error.get("reason"),
+            http_status=error.get("httpStatus"),
         )
 
     async def _player_media_for_speaker(self, queue_item: QueueItem) -> PlayerMedia:
