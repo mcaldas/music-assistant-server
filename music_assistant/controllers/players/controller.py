@@ -4824,6 +4824,7 @@ class PlayerController(AnnouncementsMixin, AudioSourceMixin, ProtocolLinkingMixi
                 await protocol_player.stop()
                 if len(protocol_player.group_members) <= 1:
                     self.schedule_active_output_protocol_clear(player)
+            player.on_stop_while_idle()
             return
         player.mark_stop_called()
         # Delegate to active protocol player if one is active
@@ -4926,6 +4927,7 @@ class PlayerController(AnnouncementsMixin, AudioSourceMixin, ProtocolLinkingMixi
         player = self.get_player(player_id, raise_unavailable=True)
         assert player is not None
         if player.state.playback_state == PlaybackState.IDLE:
+            player.on_stop_while_idle()
             return
         # If an AudioSource is the active queue item, proxy pause to the plugin
         if active := self._get_active_audio_source(player):

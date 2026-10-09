@@ -364,6 +364,14 @@ class SonosPlayer(Player):
         self._clear_playback_error()
         self.update_state()
 
+    def on_stop_while_idle(self) -> None:
+        """Handle callback when a STOP or PAUSE command is not passed on to an idle player."""
+        # a speaker whose start failed reads idle as well: as after stop(), what it could
+        # not play is withdrawn, and nothing it still reports about that load is published
+        self.cloud_queue_id = None
+        self._clear_playback_error()
+        self.update_state()
+
     async def pause(self) -> None:
         """
         Handle PAUSE command on the player.

@@ -335,6 +335,34 @@ class TestCmdStopWithPinnedProtocol:
         player.stop.assert_not_awaited()
         controller.schedule_active_output_protocol_clear.assert_not_called()
 
+    @pytest.mark.parametrize("command", ["stop", "pause"])
+    async def test_an_idle_player_hears_of_a_stop_that_is_not_passed_on(
+        self, mock_mass: MagicMock, controller: PlayerController, command: str
+    ) -> None:
+        """
+        A stop or pause for a player that reads idle is not sent to it, but it is told.
+
+        A player that keeps track of what it was last told to play (a speaker whose start
+        failed reads idle too) would otherwise never learn that it was stopped.
+        """
+        player, _protocol_player = _make_player_with_protocol(
+            mock_mass, controller, PlaybackState.IDLE
+        )
+        player.set_active_output_protocol(None)
+        player.refresh_state(signal_event=False)
+        player.stop = AsyncMock()  # type: ignore[method-assign]
+        player.pause = AsyncMock()  # type: ignore[method-assign]
+        player.on_stop_while_idle = MagicMock()  # type: ignore[method-assign]
+
+        if command == "stop":
+            await controller._handle_cmd_stop("player_1")
+        else:
+            await controller._handle_cmd_pause("player_1")
+
+        player.on_stop_while_idle.assert_called_once_with()
+        player.stop.assert_not_awaited()
+        player.pause.assert_not_awaited()
+
     async def test_idle_stop_grouped_protocol_keeps_pin(
         self, mock_mass: MagicMock, controller: PlayerController
     ) -> None:

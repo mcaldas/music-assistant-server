@@ -989,6 +989,27 @@ async def test_a_reported_failure_is_published(
     player.publish_playback_error.assert_called_once_with("track0@3", **published)
 
 
+@pytest.mark.parametrize("position_first", [False, True], ids=["failure_first", "position_first"])
+async def test_a_failure_reported_beside_a_position_is_published(position_first: bool) -> None:
+    """One report can carry the playing item's position and a failure, in either order."""
+    player = _player_for_error_reports()
+    cloud_queue = _make_cloud_queue()
+    position = {"type": "update", "id": "track0@3", "positionMillis": 5000}
+    failure = {**_error_report(), "id": "track1@3"}
+    items = [position, failure] if position_first else [failure, position]
+    # of several positions the first is the one that counts, as before
+    items.append({"type": "update", "id": "track0@3", "positionMillis": 9000})
+    request = MagicMock()
+    request.json = AsyncMock(return_value={"items": items})
+
+    await cloud_queue._handle_sonos_queue_time_played(player, request)
+
+    player.update_elapsed_time.assert_called_once_with(5.0)
+    player.publish_playback_error.assert_called_once_with(
+        "track1@3", code="ERROR_LSE", http_status=None
+    )
+
+
 def _make_reporting_player() -> SonosPlayer:
     """Create a speaker with a cloud queue loaded that can log and publish what it reports."""
     player, _ = _make_player([_make_queue_item("track0"), _make_queue_item("track1")])
@@ -1115,6 +1136,29 @@ async def test_a_new_load_withdraws_the_failure_and_refuses_its_late_reports() -
     assert not player.extra_attributes
     player.publish_playback_error("track0@1", code="ERROR_PLAYBACK_FAILED")
     assert player.extra_attributes["playback_error_queue_item_id"] == "track0"
+
+
+def test_a_stop_that_is_not_passed_on_withdraws_the_failure_too() -> None:
+    """
+    A speaker whose start failed reads idle, and a player that reads idle is sent no stop.
+
+    The failure is withdrawn and the cloud queue forgotten all the same, as by stop(): a
+    client would read the stopped speaker as one that still fails to start, and what the
+    speaker goes on to report about that load would be published again.
+    """
+    player = _make_reporting_player()
+    player.publish_playback_error("track0@0", code="ERROR_PLAYBACK_FAILED")
+    assert player.extra_attributes
+    update_state = cast("MagicMock", player.update_state)
+    update_state.reset_mock()
+
+    player.on_stop_while_idle()
+
+    assert player.cloud_queue_id is None
+    assert not player.extra_attributes
+    update_state.assert_called_once_with()
+    player.publish_playback_error("track0@0", code="ERROR_PLAYBACK_FAILED")
+    assert not player.extra_attributes
 
 
 async def test_a_position_report_leaves_the_published_failure_alone() -> None:
