@@ -330,5 +330,5 @@ class SonosCloudQueue:
         player.publish_playback_error(
             wire_id,
             code=None if is_http or status is None else str(status),
-            http_status=int(status) if is_http and str(status).isdigit() else None,
+            http_status=int(str(status)) if is_http and str(status).isdigit() else None,
         )

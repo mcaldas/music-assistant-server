@@ -1076,12 +1076,6 @@ class SonosPlayer(Player):
                 attributes.setdefault(f"{PLAYBACK_ERROR_PREFIX}{key}", value)
         self.update_state()
 
-    def _clear_playback_error(self) -> None:
-        """Withdraw the published playback failure; the next update_state publishes that."""
-        attributes = self.extra_attributes
-        for key in [key for key in attributes if key.startswith(PLAYBACK_ERROR_PREFIX)]:
-            del attributes[key]
-
     def reconnect(self, delay: float = 1) -> None:
         """Reconnect the player."""
         if self.mass.closing:
@@ -1089,6 +1083,12 @@ class SonosPlayer(Player):
         # use a task_id to prevent multiple reconnects
         task_id = f"sonos_reconnect_{self.player_id}"
         self.mass.call_later(delay, self._connect, delay, task_id=task_id)
+
+    def _clear_playback_error(self) -> None:
+        """Withdraw the published playback failure; the next update_state publishes that."""
+        attributes = self.extra_attributes
+        for key in [key for key in attributes if key.startswith(PLAYBACK_ERROR_PREFIX)]:
+            del attributes[key]
 
     async def _connect(self, retry_on_fail: int = 0) -> None:
         """Connect to the Sonos player."""

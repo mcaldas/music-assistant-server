@@ -192,56 +192,6 @@ class StreamFeederMixin(_PlayerQueuesBase):
             return
         self.prepare_next_audio_buffer(queue_id, item_id)
 
-    def _prepare_after_part(self, queue_id: str, item: QueueItem) -> None:
-        """
-        Prepare the item after one that plays only a part, once that part's audio is here.
-
-        A player that fetches each track moments before it plays reads an item with a start
-        or an end position to its fade-out within a second: little of it is left before the
-        held tail, and all of it is buffered. Its successor would then be prepared with only
-        FADE_SOURCE_WAIT to deliver, and the transition would play as a hard edit. Only the
-        item the player is fetching and the one after it chain this way, so the fills stay at
-        most two items ahead of the player. A part of a track longer than its buffer never
-        has all its audio here, so its successor is prepared as before.
-
-        :param queue_id: The queue the item belongs to.
-        :param item: The item whose successor may need preparing.
-        """
-        queue_data = self._queue_data.get(queue_id)
-        details = item.streamdetails
-        if (
-            queue_data is None
-            or details is None
-            or details.media_type != MediaType.TRACK
-            or not (get_start_position(item) or get_end_position(item) is not None)
-            or (buffer := details.buffer) is None
-            or not buffer.eof
-            or buffer.has_error
-        ):
-            return
-        if (served := queue_data.last_served_item_id) is None:
-            return
-        if served != item.queue_item_id:
-            after_served = self.get_next_item(queue_id, served)
-            if after_served is None or after_served.queue_item_id != item.queue_item_id:
-                return
-        successor = self.get_next_item(queue_id, item.queue_item_id)
-        # as for the stream's own trigger: a live source opened this early would sit idle
-        if successor is None or successor.media_type not in (
-            MediaType.TRACK,
-            MediaType.SOUND_EFFECT,
-        ):
-            return
-        # an item a reader already has is not prepared again: the served item coming round on
-        # repeat, or the one a fade is being mixed into. A long track's buffer drops what was
-        # read, so it would look unprepared and be fetched a second time under its reader
-        if successor.queue_item_id == served or (
-            self.index_by_id(queue_id, successor.queue_item_id) == queue_data.queue.index_in_buffer
-        ):
-            return
-        queue_data.prepared_ahead = successor
-        self.prepare_next_audio_buffer(queue_id, item.queue_item_id, chain=False)
-
     def schedule_prepare_after_parts(self, queue_id: str) -> None:
         """
         Look again, shortly, at what is prepared behind the parts next to the player.
@@ -257,32 +207,6 @@ class StreamFeederMixin(_PlayerQueuesBase):
             queue_id,
             task_id=f"prepare_after_parts_{queue_id}",
         )
-
-    def _prepare_after_parts(self, queue_id: str) -> None:
-        """
-        Prepare what follows the parts next to the player, and let go of what no longer does.
-
-        :param queue_id: The queue to look at.
-        """
-        if (queue_data := self._queue_data.get(queue_id)) is None:
-            return
-        ahead = queue_data.prepared_ahead
-        if ahead is not None and self.get_item(queue_id, ahead.queue_item_id) is None:
-            # prepared further ahead than the queue's own cleanups look, then taken off it
-            queue_data.prepared_ahead = None
-            if (details := ahead.streamdetails) and (orphan := details.buffer):
-                details.buffer = None
-                self.mass.create_task(orphan.clear())
-        served = queue_data.last_served_item_id
-        if (
-            queue_data.queue.state != PlaybackState.PLAYING
-            or queue_data.transitioning
-            or served is None
-        ):
-            return
-        for part in (self.get_item(queue_id, served), self.get_next_item(queue_id, served)):
-            if part is not None:
-                self._prepare_after_part(queue_id, part)
 
     def has_paused_stream_slot_holder(self, provider_instance: str, queue_id: str) -> bool:
         """
@@ -375,6 +299,82 @@ class StreamFeederMixin(_PlayerQueuesBase):
         if not force and next_item.queue_item_id == queue_data.next_item_id_enqueued:
             return
         self._enqueue_next_item(queue_id, next_item)
+
+    def _prepare_after_part(self, queue_id: str, item: QueueItem) -> None:
+        """
+        Prepare the item after one that plays only a part, once that part's audio is here.
+
+        A player that fetches each track moments before it plays reads an item with a start
+        or an end position to its fade-out within a second: little of it is left before the
+        held tail, and all of it is buffered. Its successor would then be prepared with only
+        FADE_SOURCE_WAIT to deliver, and the transition would play as a hard edit. Only the
+        item the player is fetching and the one after it chain this way, so the fills stay at
+        most two items ahead of the player. A part of a track longer than its buffer never
+        has all its audio here, so its successor is prepared as before.
+
+        :param queue_id: The queue the item belongs to.
+        :param item: The item whose successor may need preparing.
+        """
+        queue_data = self._queue_data.get(queue_id)
+        details = item.streamdetails
+        if (
+            queue_data is None
+            or details is None
+            or details.media_type != MediaType.TRACK
+            or not (get_start_position(item) or get_end_position(item) is not None)
+            or (buffer := details.buffer) is None
+            or not buffer.eof
+            or buffer.has_error
+        ):
+            return
+        if (served := queue_data.last_served_item_id) is None:
+            return
+        if served != item.queue_item_id:
+            after_served = self.get_next_item(queue_id, served)
+            if after_served is None or after_served.queue_item_id != item.queue_item_id:
+                return
+        successor = self.get_next_item(queue_id, item.queue_item_id)
+        # as for the stream's own trigger: a live source opened this early would sit idle
+        if successor is None or successor.media_type not in (
+            MediaType.TRACK,
+            MediaType.SOUND_EFFECT,
+        ):
+            return
+        # an item a reader already has is not prepared again: the served item coming round on
+        # repeat, or the one a fade is being mixed into. A long track's buffer drops what was
+        # read, so it would look unprepared and be fetched a second time under its reader
+        if successor.queue_item_id == served or (
+            self.index_by_id(queue_id, successor.queue_item_id) == queue_data.queue.index_in_buffer
+        ):
+            return
+        queue_data.prepared_ahead = successor
+        self.prepare_next_audio_buffer(queue_id, item.queue_item_id, chain=False)
+
+    def _prepare_after_parts(self, queue_id: str) -> None:
+        """
+        Prepare what follows the parts next to the player, and let go of what no longer does.
+
+        :param queue_id: The queue to look at.
+        """
+        if (queue_data := self._queue_data.get(queue_id)) is None:
+            return
+        ahead = queue_data.prepared_ahead
+        if ahead is not None and self.get_item(queue_id, ahead.queue_item_id) is None:
+            # prepared further ahead than the queue's own cleanups look, then taken off it
+            queue_data.prepared_ahead = None
+            if (details := ahead.streamdetails) and (orphan := details.buffer):
+                details.buffer = None
+                self.mass.create_task(orphan.clear())
+        served = queue_data.last_served_item_id
+        if (
+            queue_data.queue.state != PlaybackState.PLAYING
+            or queue_data.transitioning
+            or served is None
+        ):
+            return
+        for part in (self.get_item(queue_id, served), self.get_next_item(queue_id, served)):
+            if part is not None:
+                self._prepare_after_part(queue_id, part)
 
     def _enqueue_next_item(self, queue_id: str, next_item: QueueItem | None) -> None:
         """Enqueue the next item on the player."""
