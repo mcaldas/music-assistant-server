@@ -2086,6 +2086,11 @@ class StreamsAudio:
         else:
             discard_position = float(streamdetails.seek_position)
 
+        # timed for two debug lines, each written at the next slice of the item's own
+        # audio handed on: when the fade into it ended, and when a tail was first held
+        # back (0 once that is written)
+        fade_ended_at = asyncio.get_event_loop().time() if exact_buffer_seek else None
+        hold_began_at: float | None = None
         total_chunks_received = 0
         # the source's bytes, which place the held tail in song seconds
         received_bytes = 0
@@ -2104,9 +2109,28 @@ class StreamsAudio:
             tail_window.extend(chunk)
             del chunk
             hold_target = tail_hold_target(queue_item, crossfade_buffer_size, pcm_format)
+            if hold_target and hold_began_at is None:
+                hold_began_at = asyncio.get_event_loop().time()
             if len(tail_window) <= hold_target:
                 await asyncio.sleep(0)
                 continue
+            if fade_ended_at is not None or hold_began_at:
+                now = asyncio.get_event_loop().time()
+                if fade_ended_at is not None:
+                    self.logger.debug(
+                        "First audio of %s after its fade came %.2fs after the fade ended",
+                        queue_item.name,
+                        now - fade_ended_at,
+                    )
+                    fade_ended_at = None
+                if hold_began_at:
+                    self.logger.debug(
+                        "Held back %.1fs of %s for its fade: %.2fs without output",
+                        hold_target / pcm_format.pcm_sample_size,
+                        queue_item.name,
+                        now - hold_began_at,
+                    )
+                    hold_began_at = 0.0
             # yield everything above the window; the slice can run short of a
             # whole second when the window is small, so credit what is actually
             # yielded - a nominal full-second credit inflates the play log and

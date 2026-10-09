@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import logging
+import re
 import struct
 import time
 from collections.abc import AsyncGenerator
@@ -17,6 +19,7 @@ from music_assistant_models.streamdetails import StreamDetails
 
 from music_assistant.controllers.streams.audio import (
     MIN_CROSSFADE_DURATION,
+    CrossfadeHandover,
     StreamsAudio,
 )
 from music_assistant.controllers.streams.audio_buffer import AudioBuffer
@@ -433,6 +436,32 @@ def _single_boundary(
     return audio, current_item
 
 
+def _plain_mix(audio: StreamsAudio) -> AsyncMock:
+    """
+    Stand in for the mixer: the mix is the outgoing tail as it is, without the next item.
+
+    :param audio: The StreamsAudio whose mixer is replaced.
+    :return: The mock that was handed the tail (``fade_out_data``).
+    """
+    build = AsyncMock(
+        return_value=SimpleNamespace(
+            timing_info=SimpleNamespace(
+                pre_crossfade_duration=0,
+                post_crossfade_duration=0,
+                crossfade_duration=8,
+                fadein_trimmed_duration=0,
+            )
+        )
+    )
+
+    async def _mix(*_args: object, **kwargs: Any) -> AsyncGenerator[bytes]:
+        yield kwargs["fade_out_part"]
+
+    audio.smart_fades_mixer.build = build  # type: ignore[method-assign]
+    audio.smart_fades_mixer.mix = _mix  # type: ignore[method-assign]
+    return build
+
+
 def _single_stream(audio: StreamsAudio, current_item: SimpleNamespace) -> AsyncGenerator[bytes]:
     """Open the outgoing track's single-item stream with an 8 s standard crossfade."""
     return audio.get_queue_item_stream_with_smartfade(
@@ -498,3 +527,32 @@ async def test_single_item_places_the_reported_fade_on_the_song() -> None:
     assert attributes["transition_mix_start"] == pytest.approx(
         15.5 - attributes["transition_overlap"], abs=0.01
     )
+
+
+async def test_the_time_without_output_at_a_seam_is_logged(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A stream says at debug level how long it sent nothing behind a fade and for its tail."""
+    audio, current_item = _single_boundary([1.0] * 16)
+    _plain_mix(audio)
+
+    async def _rest_of_the_mix() -> AsyncGenerator[bytes]:
+        yield _audio(_SINGLE_PCM, 1)
+
+    # the item is faded into: its request first plays out the mix the item before it left
+    audio._crossfade_handover["queue-1"] = CrossfadeHandover(
+        stream=_rest_of_the_mix(),
+        fade_in_media_duration=0.0,
+        pcm_format=_SINGLE_PCM,
+        queue_item_id="current",
+    )
+
+    with caplog.at_level(logging.DEBUG, logger="music_assistant.streams.audio"):
+        _ = [chunk async for chunk in _single_stream(audio, current_item)]
+
+    text = "\n".join(record.getMessage() for record in caplog.records)
+    seam = r"First audio of Current after its fade came \d+\.\d\ds after the fade ended"
+    assert len(re.findall(seam, text)) == 1
+    # the source is complete, so the whole 8 s window is read before the item's own audio leaves
+    hold = r"Held back 8\.0s of Current for its fade: \d+\.\d\ds without output"
+    assert len(re.findall(hold, text)) == 1
