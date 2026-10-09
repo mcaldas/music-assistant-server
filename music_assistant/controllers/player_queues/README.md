@@ -202,6 +202,14 @@ source stream. Preparing the next track ahead of time never stops a paused queue
 could not be told to stop still shows paused on a stream its queue has ended, so play starts the
 queue again there rather than unpausing the player.
 
+A player that asks for each item on its own can leave one while its source still fills: the source
+of a track longer than its buffer only goes on while the buffer is read, and keeps its provider's
+stream slot until it has delivered everything. When the item the player asks for next finds no free
+slot on a provider that allows one stream, the source of an item of the same queue that no open
+response reads and no fade is mixed into is aborted, and the asked item takes its slot instead of
+waiting behind it. Preparing the next track ahead of time never takes a slot this way, and neither
+another queue's sources nor a flow stream's are touched.
+
 Data flow: current index → next-item computation → stream-detail resolution → player enqueue-next.
 (Next-track audio-buffer warming is driven separately by the streams pipeline, relative to the
 streamed item.)

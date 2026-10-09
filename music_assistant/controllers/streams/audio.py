@@ -785,6 +785,18 @@ class StreamsAudio:
         # resolve the exact owning instance (even when flagged unavailable) so the
         # slot is charged to the account that issued the streamdetails
         provider = self.mass.get_provider(streamdetails.provider, return_unavailable=True)
+        if (
+            isinstance(provider, MusicProvider)
+            and provider.max_concurrent_streams == 1
+            and not provider.has_available_stream_slot
+            and streamdetails.queue_id
+        ):
+            # the slot may be held by a source of this queue that nothing reads; a release
+            # that fails leaves this start waiting for the slot as before
+            with suppress(Exception):
+                await asyncio.shield(
+                    self.mass.player_queues.release_abandoned_stream_slot(streamdetails.queue_id)
+                )
         stream_slot = (
             provider.acquire_stream_slot(source_wait_timeout)
             if isinstance(provider, MusicProvider)
@@ -3443,6 +3455,19 @@ class StreamsAudio:
         if pending := self._crossfade_pending.pop(queue_id, None):
             pending[1].set()
 
+    def crossfade_targets(self, queue_id: str) -> set[str]:
+        """
+        Return the items a fade of this queue reads before their own stream has started.
+
+        :param queue_id: The queue whose fades to look at.
+        """
+        targets: set[str] = set()
+        if pending := self._crossfade_pending.get(queue_id):
+            targets.add(pending[0])
+        if handover := self._crossfade_handover.get(queue_id):
+            targets.add(handover.queue_item_id)
+        return targets
+
     async def get_shoutcast_stream(
         self, url: str, streamdetails: StreamDetails
     ) -> AsyncGenerator[bytes]:
@@ -3991,6 +4016,10 @@ class StreamsAudio:
                     continue
                 busy_instances.add(err.provider_instance)
                 if final_pass or loop.time() >= deadline:
+                    if reason == "streaming":
+                        # the response this was for can be gone by now, and then nothing
+                        # else says why the item never started
+                        self.logger.warning("%s could not start: %s", queue_item.name, err)
                     raise
                 if all_candidate_instances.issubset(busy_instances):
                     discovered: set[str] = set()

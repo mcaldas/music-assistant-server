@@ -704,6 +704,21 @@ class StreamsController(CoreController):
             if (transport := request.transport) is not None:
                 transport.abort()
 
+    def open_item_stream_ids(self, queue_id: str, session_id: str | None) -> set[str]:
+        """
+        Return the queue items a player is being served over an open per-item response.
+
+        :param queue_id: The queue whose open responses to list.
+        :param session_id: The session that owns playback now; a response of another
+            session is one the player has left.
+        """
+        return {
+            cast("web.Request", request).match_info["queue_item_id"]
+            for stream_session, request in self._open_item_streams.get(queue_id) or []
+            # a HEAD probe is answered without audio
+            if stream_session == session_id and request.method == "GET"
+        }
+
     async def serve_queue_item_stream(self, request: web.Request) -> web.StreamResponse:  # noqa: PLR0915
         """Stream single queueitem audio to a player."""
         self._log_request(request)
@@ -1150,6 +1165,9 @@ class StreamsController(CoreController):
                         queue_id,
                         exc_info=True,
                     )
+            # the player may have left this item for another one, whose source then waits
+            # for the slot that this item's source, which nothing reads any more, still holds
+            self.mass.player_queues.release_abandoned_stream_slot(queue_id)
 
     async def serve_audio_source_stream(self, request: web.Request) -> web.StreamResponse:
         """Stream a live AudioSource playing on a player."""

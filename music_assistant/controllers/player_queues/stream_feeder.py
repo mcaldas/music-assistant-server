@@ -327,6 +327,26 @@ class StreamFeederMixin(_PlayerQueuesBase):
             # a failed device stop still ends the session, and ending it is what frees the slot
             return holder.session_id is None
 
+    def release_abandoned_stream_slot(self, queue_id: str) -> asyncio.Task[bool]:
+        """
+        Hand the slot of a source nothing reads to the item the queue's player asks for.
+
+        A provider that allows one stream keeps its slot with a source until that source has
+        delivered everything, and the source of a track longer than its buffer only goes on
+        while the buffer is read. When the player leaves such a track for another item, that
+        item's source would wait for the slot behind a source nothing reads. Call where a
+        source is about to wait for a slot, and where a per-item response has ended.
+
+        :param queue_id: The queue whose player may have left an item; no other queue's
+            sources are looked at.
+        :return: The release, which a call made while it runs joins. Its result says whether
+            a source was aborted, which frees its slot.
+        """
+        task_id = f"release_abandoned_stream_slot_{queue_id}"
+        return self.mass.create_task(
+            self._release_abandoned_stream_slot(queue_id), task_id=task_id, task_name=task_id
+        )
+
     def update_next_item_on_player(self, queue_id: str, force: bool = False) -> None:
         """
         Hand the player the track that now follows the one it is playing.
@@ -642,3 +662,65 @@ class StreamFeederMixin(_PlayerQueuesBase):
             and player.state.active_source == queue_id
             and not player.extra_data.get(ATTR_ANNOUNCEMENT_IN_PROGRESS)
         )
+
+    async def _release_abandoned_stream_slot(self, queue_id: str) -> bool:
+        """
+        Abort the source of an item nothing reads, when an item the player asks for needs its slot.
+
+        :param queue_id: The queue whose items to look at.
+        :return: Whether a source was aborted.
+        """
+        queue_data = self._queue_data.get(queue_id)
+        # one flow response reads every item in turn, so none of them is ever left
+        if queue_data is None or queue_data.session_id is None or queue_data.queue.flow_mode:
+            return False
+        requested = self.mass.streams.open_item_stream_ids(queue_id, queue_data.session_id)
+        fade_targets = self.mass.streams.audio.crossfade_targets(queue_id)
+        for waiting in queue_data.items:
+            details = waiting.streamdetails
+            # the player asks for this item and its source has no audio yet: it waits for a
+            # slot, or it holds the slot itself, and then no other source passes for a holder
+            if (
+                waiting.queue_item_id not in requested
+                or details is None
+                or (source := details.buffer) is None
+                or not source.is_buffering
+                or source.ready.is_set()
+            ):
+                continue
+            # the exact instance: a lookup by domain may land on a sibling instance's budget
+            provider = self.mass.get_provider(details.provider, return_unavailable=True)
+            if (
+                not isinstance(provider, MusicProvider)
+                or provider.max_concurrent_streams != 1
+                or provider.has_available_stream_slot
+            ):
+                continue
+            for holder in queue_data.items:
+                held = holder.streamdetails
+                # what makes the abort safe is all here: no open response reads the item, no
+                # fade is mixed into it, and with one slot a source that is filling with its
+                # first audio in is the one that holds it. A holder still short of that
+                # audio (8 s of it with a crossfade) is not seen, and nothing looks again
+                # once it has it: the start then waits for the slot as before
+                if (
+                    holder.queue_item_id in requested
+                    or holder.queue_item_id in fade_targets
+                    or held is None
+                    or held.provider != details.provider
+                    or (buffer := held.buffer) is None
+                    or not buffer.is_buffering
+                    or not buffer.ready.is_set()
+                ):
+                    continue
+                self.logger.info(
+                    "Aborting the unread source of %s on queue %s, %s needs its %s stream slot",
+                    holder.name,
+                    queue_data.queue.display_name,
+                    waiting.name,
+                    provider.name,
+                )
+                # the cancelled buffer stays attached, as in _abort_source_buffer
+                await buffer.clear()
+                return True
+        return False

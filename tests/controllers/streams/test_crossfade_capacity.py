@@ -674,6 +674,25 @@ async def test_a_fade_into_a_track_longer_than_its_buffer_leaves_its_resume_poin
     await incoming.clear()
 
 
+def test_crossfade_targets_names_the_pending_and_the_published_item() -> None:
+    """An item is named from the start of the fade into it until its own request takes over."""
+    audio = StreamsAudio(MagicMock())
+    audio._crossfade_pending["queue-1"] = ("pending", asyncio.Event())
+    audio._crossfade_handover["queue-1"] = CrossfadeHandover(
+        stream=None,
+        fade_in_media_duration=0.0,
+        pcm_format=_SINGLE_PCM,
+        queue_item_id="published",
+    )
+
+    assert audio.crossfade_targets("queue-1") == {"pending", "published"}
+    assert audio.crossfade_targets("queue-2") == set()
+
+    audio.clear_crossfade_handover("queue-1")
+
+    assert audio.crossfade_targets("queue-1") == set()
+
+
 def _ramp(seconds: int, chunk_seconds: float = 1.0) -> list[bytes]:
     """
     Return a track's audio in chunks that are told apart by their bytes.

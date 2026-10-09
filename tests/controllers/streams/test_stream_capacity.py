@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from collections.abc import AsyncGenerator
 from functools import partial
 from unittest.mock import AsyncMock, MagicMock
@@ -385,6 +386,33 @@ async def test_a_speculative_preparation_never_stops_a_paused_queue(
     mass.player_queues.release_paused_stream_slot.assert_not_awaited()
     assert get_buffer.await_args is not None
     assert get_buffer.await_args.kwargs["source_wait_timeout"] > 0
+
+
+async def test_a_start_that_gets_no_slot_says_so(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A playback start that ends without a source slot leaves its cause in the log."""
+    audio, mass, queue_item = _single_source_audio()
+    mass.player_queues.has_paused_stream_slot_holder.return_value = False
+    monkeypatch.setattr(
+        AudioBuffer, "get_buffer", AsyncMock(side_effect=_limit_error(BUSY_INSTANCE))
+    )
+
+    with caplog.at_level(logging.WARNING, logger="music_assistant.streams.audio"):
+        # preparing ahead gives up softly, and tries again by itself
+        with pytest.raises(ProviderStreamLimitError):
+            await audio.get_audio_buffer(queue_item, reason="prepare_next", capacity_wait_timeout=0)
+        assert not caplog.records
+        with pytest.raises(ProviderStreamLimitError):
+            await audio.get_audio_buffer(queue_item, reason="streaming", capacity_wait_timeout=0)
+
+    assert [(record.levelno, record.getMessage()) for record in caplog.records] == [
+        (
+            logging.WARNING,
+            "Effect could not start: Limited has reached its limit of 1 concurrent source "
+            "streams after waiting 0 seconds.",
+        )
+    ]
 
 
 async def test_all_candidates_busy_ends_in_one_blocking_pass_on_the_best_one(
