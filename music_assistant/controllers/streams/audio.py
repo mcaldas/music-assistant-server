@@ -2225,6 +2225,13 @@ class StreamsAudio:
         crossfade_start_time = asyncio.get_event_loop().time()
         next_queue_item: QueueItem | None
         try:
+            if superseded():
+                # The queue has moved on to another session, which this stream's audio does
+                # not reach. The next item is that session's: loaded here it could get other
+                # stream details under its reader, and the queue's buffered index, the item's
+                # read mark, its prepared audio and a transition a client asked for would be
+                # left as a fade nobody heard had them. The stream only plays out its tail.
+                raise QueueEmpty("The queue has moved on to another session")
             self.logger.debug(
                 "Preloading NEXT track for crossfade for queue %s", queue.display_name
             )
@@ -2242,7 +2249,7 @@ class StreamsAudio:
             # clients learn at once that the next item is locked and can no longer change
             self.mass.player_queues.signal_update(queue.queue_id)
         except QueueEmpty:
-            # end of queue reached, no next item
+            # end of queue reached (or a stream the queue has left behind), no next item
             next_queue_item = None
 
         crossfade_allowed = False
@@ -2259,6 +2266,7 @@ class StreamsAudio:
         # marker registered afterwards would arrive too late to be waited for.
         # A stream of a session the queue has moved past claims nothing: its audio reaches no
         # player, and the item the new session starts would wait for a fade nobody hears.
+        # (Checked again here for a session that changed while the next item was loaded.)
         handoff: asyncio.Event | None = None
         if next_queue_item is not None and not superseded():
             handoff = asyncio.Event()

@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import struct
-from collections.abc import AsyncGenerator
+from collections.abc import AsyncGenerator, Callable
 from types import SimpleNamespace
 from typing import Any, cast
 from unittest.mock import AsyncMock, MagicMock
@@ -730,12 +730,14 @@ async def _run_smartfade_boundary(
     pcm_format: AudioFormat,
     session_id: str | None = None,
     opened: list[str] | None = None,
+    on_next_loaded: Callable[[], None] | None = None,
 ) -> None:
     """
     Stream one item through a boundary with the mixer and next item stubbed out.
 
     :param session_id: The queue session the stream is of, if any.
     :param opened: Receives the id of each item whose audio is read, in order.
+    :param on_next_loaded: Called while the stream loads the next item.
     """
     next_details = SimpleNamespace(
         audio_format=pcm_format,
@@ -780,7 +782,13 @@ async def _run_smartfade_boundary(
     mass.player_queues.get.return_value = SimpleNamespace(
         queue_id="queue-1", display_name="Queue", index_in_buffer=0
     )
-    mass.player_queues.load_next_queue_item = AsyncMock(return_value=next_item)
+
+    async def _load_next(*_args: object) -> SimpleNamespace:
+        if on_next_loaded is not None:
+            on_next_loaded()
+        return next_item
+
+    mass.player_queues.load_next_queue_item = AsyncMock(side_effect=_load_next)
     mass.player_queues.index_by_id.return_value = 1
     audio.select_pcm_format = AsyncMock(return_value=pcm_format)  # type: ignore[method-assign]
     audio.crossfade_allowed = MagicMock(return_value=True)  # type: ignore[method-assign]
@@ -1106,42 +1114,60 @@ async def test_a_boundary_cleared_while_its_fade_is_sized_reads_nothing_of_the_n
     assert "queue-1" not in audio._crossfade_pending
 
 
-@pytest.mark.parametrize(("playing", "claims"), [("old", True), ("new", False)])
+@pytest.mark.parametrize("replaced", ["never", "while the next item loads", "before its end"])
 async def test_a_stream_of_a_replaced_session_claims_no_handoff(
-    monkeypatch: pytest.MonkeyPatch, playing: str, claims: bool
+    monkeypatch: pytest.MonkeyPatch, replaced: str
 ) -> None:
     """
     A stream claims the fade into the next item only while its session is the queue's.
 
     The item a new session starts must find no fade to wait for, and nothing of an older
-    session may read that item beside it.
+    session may read that item beside it. A stream whose session was replaced before it
+    came to its end leaves the next item to the new session altogether.
+
+    :param replaced: When the queue moved on to another session than the stream's.
     """
     pcm_format = AudioFormat(
         content_type=ContentType.PCM_S16LE, sample_rate=8000, bit_depth=16, channels=2
     )
     audio = StreamsAudio(MagicMock())
     audio.setup()
-    cast("Any", audio.mass).player_queues.queue_data_or_none.return_value = SimpleNamespace(
-        session_id=playing
-    )
+    queues = cast("Any", audio.mass).player_queues
+    queue_data = SimpleNamespace(session_id="new" if replaced == "before its end" else "old")
+    queues.queue_data_or_none.return_value = queue_data
     claimed: list[bool] = []
 
     async def _sizing(_queue_item: object, _preparation: object) -> None:
         claimed.append("queue-1" in audio._crossfade_pending)
 
+    def _next_loaded() -> None:
+        if replaced == "while the next item loads":
+            queue_data.session_id = "new"
+
     monkeypatch.setattr(audio, "_await_fade_source", _sizing)
     opened: list[str] = []
-    boundary = _run_smartfade_boundary(monkeypatch, audio, pcm_format, "old", opened)
-    if claims:
+    boundary = _run_smartfade_boundary(monkeypatch, audio, pcm_format, "old", opened, _next_loaded)
+    if replaced == "never":
         await boundary
         assert audio._crossfade_handover["queue-1"].queue_item_id == "next"
         assert opened == ["current", "next"]
-    else:
+        assert claimed == [True]
+        return
+    if replaced == "while the next item loads":
         with pytest.raises(AudioError, match="cleared during its mix"):
             await boundary
-        assert "queue-1" not in audio._crossfade_handover
-        assert opened == ["current"]
-    assert claimed == [claims]
+        assert claimed == [False]
+    else:
+        # it plays out its own tail, and nothing it would do for a fade is done
+        await boundary
+        assert claimed == []
+        queues.load_next_queue_item.assert_not_awaited()
+        queues.prepare_next_audio_buffer.assert_not_called()
+        assert queues.get.return_value.index_in_buffer == 0
+        assert not audio.read_positions
+    assert "queue-1" not in audio._crossfade_handover
+    assert "queue-1" not in audio._crossfade_pending
+    assert opened == ["current"]
 
 
 async def test_smartfade_a_source_still_delivering_hands_over_gapless(
