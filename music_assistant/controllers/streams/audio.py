@@ -3970,6 +3970,11 @@ class StreamsAudio:
                         raise
                     if final_pass:
                         # capacity was the root cause, surface the typed (actionable) error
+                        if reason == "streaming":
+                            # as where the last wait for a slot ends, further down
+                            self.logger.warning(
+                                "%s could not start: %s", queue_item.name, last_capacity_error
+                            )
                         raise last_capacity_error from err
                     # no usable alternative mapping: restore the capacity-blocked details
                     # and spend the remaining budget blocking on that provider's slot
@@ -4816,7 +4821,9 @@ class StreamsAudio:
             audio_buffer = cast(
                 "AudioBuffer | None", streamdetails.buffer if streamdetails else None
             )
-            if audio_buffer is not None:
+            # an aborted buffer that was left attached is as good as none: nothing fills it
+            # any more, and a preparation attaches the one to wait for
+            if audio_buffer is not None and not audio_buffer.cancelled:
                 if audio_buffer.has_error:
                     return
                 with suppress(TimeoutError):

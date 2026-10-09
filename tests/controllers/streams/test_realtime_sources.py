@@ -160,6 +160,7 @@ def _buffer(duration_available: float, ready: bool, eof: bool = False) -> AudioB
     """Build a valid buffer with the requested resident duration."""
     audio_buffer = MagicMock(spec=AudioBuffer)
     audio_buffer.has_error = False
+    audio_buffer.cancelled = False
     audio_buffer.is_valid.return_value = True
     audio_buffer.duration_available = duration_available
     audio_buffer.eof = eof
@@ -559,6 +560,29 @@ async def test_the_fade_finds_audio_attached_to_replaced_details() -> None:
     )
 
     assert incoming.streamdetails.buffer is late_buffer
+    await preparation
+
+
+async def test_the_fade_waits_for_what_replaces_an_aborted_buffer() -> None:
+    """A buffer that was aborted and left attached is not waited on: nothing fills it any more."""
+    audio = StreamsAudio(MagicMock())
+    aborted = _buffer(0, ready=False)
+    cast("Any", aborted).cancelled = True
+    streamdetails = _streamdetails_for_crossfade(aborted)
+    fresh_buffer = _buffer(20, ready=True)
+
+    async def _prepare_again() -> None:
+        await asyncio.sleep(0.2)
+        streamdetails.buffer = fresh_buffer
+
+    preparation = asyncio.create_task(_prepare_again())
+    # the whole wait would be spent on the aborted buffer, whose audio never comes
+    await asyncio.wait_for(
+        audio._await_fade_source(cast("Any", _incoming_item(streamdetails)), preparation),
+        FADE_SOURCE_WAIT / 5,
+    )
+
+    assert streamdetails.buffer is fresh_buffer
     await preparation
 
 

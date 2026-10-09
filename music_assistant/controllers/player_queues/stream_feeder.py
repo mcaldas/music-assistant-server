@@ -715,6 +715,9 @@ class StreamFeederMixin(_PlayerQueuesBase):
         if queue_data is None or queue_data.session_id is None or queue_data.queue.flow_mode:
             return False
         requested = self.mass.streams.open_item_stream_ids(queue_id, queue_data.session_id)
+        if not requested:
+            # the player asks for no item, so none waits for a slot
+            return False
         fade_targets = self.mass.streams.audio.crossfade_targets(queue_id)
         for waiting in queue_data.items:
             details = waiting.streamdetails

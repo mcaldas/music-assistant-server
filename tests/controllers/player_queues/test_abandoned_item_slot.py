@@ -9,7 +9,8 @@ read it, and the other item's source then waited out its whole budget behind it.
 from __future__ import annotations
 
 import asyncio
-from typing import TYPE_CHECKING
+from collections.abc import AsyncGenerator
+from typing import TYPE_CHECKING, Any
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -18,7 +19,7 @@ from music_assistant_models.enums import PlaybackState
 import music_assistant.controllers.streams.audio as audio_mod
 from music_assistant.controllers.streams.audio_buffer import AudioBuffer
 from music_assistant.models.music_provider import MusicProvider, ProviderStreamLimitError
-from tests.controllers.player_queues.test_paused_queue_slot import _queue_item, _Rig
+from tests.controllers.player_queues.test_paused_queue_slot import PCM_FORMAT, _queue_item, _Rig
 
 if TYPE_CHECKING:
     from music_assistant_models.queue_item import QueueItem
@@ -168,6 +169,66 @@ async def test_a_release_that_fails_leaves_the_start_waiting(rig: _Rig) -> None:
 
     failing_abort.assert_awaited_once()
     await abort()
+
+
+async def test_a_start_that_is_given_up_leaves_the_release_to_finish(rig: _Rig) -> None:
+    """
+    A start that is cancelled while the release it asked for runs ends alone.
+
+    The release is shared by every start of the queue that finds no slot. Cancelled with
+    one of them it would stop in the middle of the abort, or take the cancel for itself
+    and leave the start running that was given up.
+    """
+    aborting, closing = asyncio.Event(), asyncio.Event()
+
+    async def _slow_to_close(*_args: Any, **_kwargs: Any) -> AsyncGenerator[bytes]:
+        try:
+            for _ in range(3):
+                yield b"\x00" * PCM_FORMAT.pcm_sample_size
+            await asyncio.Event().wait()
+        finally:
+            # a source takes a moment to close, and the abort waits for it
+            aborting.set()
+            await closing.wait()
+
+    rig.audio._get_media_stream = _slow_to_close  # type: ignore[method-assign]
+    left = rig.add_queue(QUEUE, PlaybackState.PLAYING)
+    left_buffer = await rig.fill(left)
+    asked = _add_item(rig, "asked")
+    _asks_for(rig, asked)
+    assert asked.streamdetails is not None
+    try:
+        asked_buffer = await AudioBuffer.get_buffer(rig.mass, asked.streamdetails)
+        # the start waits for the release, and the release for the source it aborts
+        await asyncio.wait_for(aborting.wait(), 1)
+        release = rig.tasks[0]
+
+        # the player gave up on the item: its start ends at once, the release goes on
+        given_up = asyncio.ensure_future(asked_buffer.clear())
+        await asyncio.wait({given_up}, timeout=1)
+        assert given_up.done()
+        assert not release.done()
+    finally:
+        closing.set()
+
+    assert await release
+    assert left_buffer.cancelled
+    assert rig.provider.has_available_stream_slot
+
+
+async def test_a_response_that_ends_with_nothing_asked_looks_no_further(rig: _Rig) -> None:
+    """With no item asked for there is no start to hand a slot to: the look ends there."""
+    left = rig.add_queue(QUEUE, PlaybackState.PLAYING)
+    left_buffer = await rig.fill(left)
+    _asks_for(rig)
+    fade_targets = MagicMock(wraps=rig.audio.crossfade_targets)
+    rig.audio.crossfade_targets = fade_targets  # type: ignore[method-assign]
+
+    assert not await rig.queues.release_abandoned_stream_slot(QUEUE)
+
+    fade_targets.assert_not_called()
+    assert left_buffer.is_buffering
+    await left_buffer.clear()
 
 
 async def test_a_read_outside_the_queues_keeps_the_slot(rig: _Rig) -> None:
