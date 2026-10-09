@@ -1595,6 +1595,7 @@ class StreamsAudio:
         session_id: str | None = None,
         prepared_buffer: AudioBuffer | None = None,
         exact_seek: bool = False,
+        keep_from: float | None = None,
     ) -> AsyncGenerator[bytes]:
         """
         Get the (PCM) audio stream for a single queue item.
@@ -1612,6 +1613,9 @@ class StreamsAudio:
         :param session_id: Queue session that owns processing-detail updates.
         :param prepared_buffer: Existing buffer that must be used without opening a new source.
         :param exact_seek: Preserve millisecond precision instead of user-seek quantization.
+        :param keep_from: Media second the item's own request resumes at after this read (the
+            fade into an item reads ahead of it): this read leaves the buffer's audio from
+            there on in place.
         """
         streamdetails = queue_item.streamdetails
         assert streamdetails
@@ -1796,6 +1800,7 @@ class StreamsAudio:
             seek_position_ms=seek_position_ms,
             filter_params=filter_params or None,
             exact_seek=exact_seek,
+            keep_from_ms=None if keep_from is None else int(keep_from * 1000),
         )
 
         first_chunk_received = False
@@ -2325,6 +2330,12 @@ class StreamsAudio:
                             session_id=session_id,
                             prepared_buffer=fade_in_audio_buffer,
                             exact_seek=True,
+                            # where the item's own request goes on once the mix is played
+                            # out: a full buffer keeps that audio through these reads
+                            keep_from=fade_in_start
+                            + fade_in_buffer_size
+                            / pcm_format.pcm_sample_size
+                            * fade_in_playback_speed,
                         )
                         async with aclosing(fade_in_stream):
                             async for chunk in fade_in_stream:

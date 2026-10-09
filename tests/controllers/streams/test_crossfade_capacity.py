@@ -23,6 +23,7 @@ from music_assistant.controllers.streams.audio import (
     StreamsAudio,
 )
 from music_assistant.controllers.streams.audio_buffer import AudioBuffer
+from music_assistant.controllers.streams.constants import BufferSize
 from music_assistant.controllers.streams.smart_fades.fades import StandardCrossFade
 from music_assistant.controllers.streams.smart_fades.helpers import SMART_CROSSFADE_DURATION
 from music_assistant.controllers.streams.smart_fades.planner.requested import TransitionRequest
@@ -337,7 +338,7 @@ async def test_crossfade_reads_its_window_past_the_resident_buffer(
             incoming_seconds_read += 1
             yield _audio(pcm_format, 1)
 
-    monkeypatch.setattr(audio, "get_queue_item_stream", _item_stream)
+    monkeypatch.setattr(audio, "get_queue_item_stream", MagicMock(side_effect=_item_stream))
     stream = audio.get_queue_item_stream_with_smartfade(
         cast("Any", player),
         cast("Any", current_item),
@@ -357,6 +358,12 @@ async def test_crossfade_reads_its_window_past_the_resident_buffer(
     # the next track resumes at the media time the blend already played
     assert crossfade_data.fade_in_media_duration == pytest.approx(expected_window * playback_speed)
     assert crossfade_data.fade_in_media_duration <= next_details.duration / 2
+    # the outgoing item's own request names no point to keep; the fade says where the next
+    # item's own request resumes, so its reads leave that audio in the buffer
+    assert [
+        item_call.kwargs.get("keep_from")
+        for item_call in cast("MagicMock", audio.get_queue_item_stream).call_args_list
+    ] == [None, pytest.approx(expected_window * playback_speed)]
     # the request reached the mixer and was used up by the boundary's report; the fade
     # built here is no smart one, so nothing planned it
     assert build.await_args is not None
@@ -556,3 +563,97 @@ async def test_the_time_without_output_at_a_seam_is_logged(
     # the source is complete, so the whole 8 s window is read before the item's own audio leaves
     hold = r"Held back 8\.0s of Current for its fade: \d+\.\d\ds without output"
     assert len(re.findall(hold, text)) == 1
+
+
+async def test_a_fade_into_a_track_longer_than_its_buffer_leaves_its_resume_point() -> None:
+    """The fade's reads free a full buffer up to where the item's own request resumes."""
+    # a 7.5 s tail, so the fade ends inside the next item's eighth second
+    audio, current_item = _single_boundary([4.0, 3.5])
+
+    async def _source() -> AsyncGenerator[bytes]:
+        for _ in range(100):
+            yield _audio(_SINGLE_PCM, 1)
+
+    # the next item is longer than its buffer: the source is parked on a full one
+    incoming = AudioBuffer(_SINGLE_PCM, buffer_size=BufferSize.MINIMAL)
+    incoming.fill(_source(), source_name="next")
+
+    async def _refilled() -> None:
+        async with asyncio.timeout(5):
+            while incoming.size_seconds < incoming.max_size_seconds:
+                await asyncio.sleep(0)
+
+    await _refilled()
+    next_details = SimpleNamespace(
+        audio_format=_SINGLE_PCM,
+        buffer=incoming,
+        fade_in=False,
+        stream_error=False,
+        uri="test://next",
+        seek_position=0,
+        seconds_streamed=0,
+        duration=200,
+        is_realtime=False,
+        # nothing to filter, so the buffer is read as it is
+        volume_normalization_mode=None,
+        loudness=0.0,
+        queue_id=None,
+        provider="test",
+        item_id="next",
+        media_type=MediaType.TRACK,
+    )
+    next_item = SimpleNamespace(
+        queue_id="queue-1",
+        queue_item_id="next",
+        name="Next",
+        media_type=MediaType.TRACK,
+        media_item=None,
+        streamdetails=next_details,
+        duration=200,
+        available=True,
+        extra_attributes={},
+    )
+    mass = cast("MagicMock", audio.mass)
+    mass.player_queues.load_next_queue_item = AsyncMock(return_value=next_item)
+    outgoing_stream = audio.get_queue_item_stream
+
+    def _item_stream(queue_item: Any, *args: Any, **kwargs: Any) -> AsyncGenerator[bytes]:
+        if queue_item is current_item:
+            return outgoing_stream(queue_item, *args, **kwargs)
+        # the next item is read by the real reader, from its real buffer
+        return StreamsAudio.get_queue_item_stream(audio, queue_item, *args, **kwargs)
+
+    audio.get_queue_item_stream = _item_stream  # type: ignore[method-assign]
+    audio.smart_fades_mixer.build = AsyncMock(  # type: ignore[method-assign]
+        return_value=SimpleNamespace(
+            timing_info=SimpleNamespace(
+                pre_crossfade_duration=0,
+                post_crossfade_duration=0,
+                crossfade_duration=7.5,
+                fadein_trimmed_duration=0,
+            )
+        )
+    )
+
+    async def _mix(
+        _smart_fade: object, *, fade_in_part: AsyncGenerator[bytes], **_kwargs: object
+    ) -> AsyncGenerator[bytes]:
+        async for chunk in fade_in_part:
+            # a mix is taken at the player's pace: the source fills the space a read made
+            await _refilled()
+            yield chunk
+
+    audio.smart_fades_mixer.mix = _mix  # type: ignore[method-assign]
+
+    _ = [chunk async for chunk in _single_stream(audio, current_item)]
+
+    handover = audio._crossfade_handover["queue-1"]
+    assert handover.fade_in_media_duration == 7.5
+    # the fade made room up to the second the next item's own request resumes in, and
+    # left that one: the request finds its audio and the source is not fetched again
+    assert incoming.first_buffered_chunk == 7
+    assert incoming.is_valid(7500)
+    assert next_details.buffer is incoming
+    assert not incoming.cancelled
+    await handover.close()
+    await incoming.clear()

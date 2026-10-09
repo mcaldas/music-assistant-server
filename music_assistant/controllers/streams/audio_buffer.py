@@ -221,13 +221,19 @@ class AudioBuffer:
         return chunks_ahead <= (0 if self.is_realtime else SEEK_WAIT_THRESHOLD)
 
     async def get_raw_stream(
-        self, seek_position_ms: int = 0, exact_seek: bool = False
+        self,
+        seek_position_ms: int = 0,
+        exact_seek: bool = False,
+        keep_from_ms: int | None = None,
     ) -> AsyncGenerator[bytes]:
         """
         Get raw (unprocessed) PCM audio from the buffer.
 
         :param seek_position_ms: Starting position in milliseconds.
         :param exact_seek: Preserve millisecond precision instead of quantizing to 100 ms.
+        :param keep_from_ms: Where the item's own reader resumes after this one (the fade
+            into an item reads ahead of it): this reader never drops audio from that
+            position on.
         """
         if not exact_seek:
             # align regular user seeks to 100ms steps to avoid rounding issues
@@ -240,11 +246,12 @@ class AudioBuffer:
             samples_to_trim = self.pcm_format.sample_rate * fractional_ms // 1000
             bytes_per_sample = (self.pcm_format.bit_depth // 8) * self.pcm_format.channels
             trim_bytes = samples_to_trim * bytes_per_sample
+        keep_from = None if keep_from_ms is None else keep_from_ms // 1000
 
         while True:
             try:
                 self._last_access_time = time.time()
-                chunk = await self._get(chunk_number=chunk_number)
+                chunk = await self._get(chunk_number=chunk_number, keep_from=keep_from)
                 if trim_bytes > 0:
                     chunk = chunk[trim_bytes:]
                     trim_bytes = 0
@@ -287,6 +294,7 @@ class AudioBuffer:
         seek_position_ms: int = 0,
         filter_params: list[str] | None = None,
         exact_seek: bool = False,
+        keep_from_ms: int | None = None,
     ) -> AsyncGenerator[bytes]:
         """
         Get processed audio from the buffer.
@@ -298,19 +306,22 @@ class AudioBuffer:
         :param seek_position_ms: Starting position in milliseconds.
         :param filter_params: FFmpeg filter parameters to apply.
         :param exact_seek: Preserve millisecond precision for the input buffer position.
+        :param keep_from_ms: Where the item's own reader resumes after this one (the fade
+            into an item reads ahead of it): this reader never drops audio from that
+            position on.
         """
         needs_ffmpeg = bool(filter_params) or self.pcm_format != output_format
 
         if not needs_ffmpeg:
             async for chunk in self.get_raw_stream(
-                seek_position_ms=seek_position_ms, exact_seek=exact_seek
+                seek_position_ms=seek_position_ms, exact_seek=exact_seek, keep_from_ms=keep_from_ms
             ):
                 yield chunk
             return
 
         async for chunk in get_ffmpeg_stream(
             audio_input=self.get_raw_stream(
-                seek_position_ms=seek_position_ms, exact_seek=exact_seek
+                seek_position_ms=seek_position_ms, exact_seek=exact_seek, keep_from_ms=keep_from_ms
             ),
             input_format=self.pcm_format,
             output_format=output_format,
@@ -647,12 +658,14 @@ class AudioBuffer:
                 time.monotonic() - self._fill_started,
             )
 
-    async def _get(self, chunk_number: int = 0) -> bytes:
+    async def _get(self, chunk_number: int = 0, keep_from: int | None = None) -> bytes:
         """
         Get one second of audio at the given chunk position.
 
         Waits until the chunk is available. Discards old chunks when full.
 
+        :param chunk_number: The chunk to get (ignored by a rolling buffer).
+        :param keep_from: Chunk this read leaves in a seekable buffer, with all after it.
         :raises AudioBufferEOF: If EOF is reached or the buffer was cleared.
         :raises AudioError: If the chunk has been discarded or the producer failed.
         """
@@ -669,7 +682,7 @@ class AudioBuffer:
             if self.mode == BufferMode.ROLLING:
                 return await self._get_rolling()
 
-            return await self._get_seekable(chunk_number)
+            return await self._get_seekable(chunk_number, keep_from)
 
     async def _get_rolling(self) -> bytes:
         """
@@ -689,11 +702,15 @@ class AudioBuffer:
         self._space_available.notify_all()
         return result
 
-    async def _get_seekable(self, chunk_number: int) -> bytes:
+    async def _get_seekable(self, chunk_number: int, keep_from: int | None = None) -> bytes:
         """
         Get a specific chunk by number from the buffer.
 
         Must be called while holding _data_available lock.
+
+        :param chunk_number: The chunk to get.
+        :param keep_from: Chunk this read leaves in the buffer, with all after it, unless
+            the chunk asked for can only arrive once the buffer has room for it.
         """
         if chunk_number < self._discarded_chunks:
             msg = (
@@ -723,12 +740,14 @@ class AudioBuffer:
         result = self._chunks[buffer_index]
 
         # free space for the producer when buffer is at capacity,
-        # but only if the producer is still running and needs space
+        # but only if the producer is still running and needs space,
+        # and never the audio another reader resumes at (keep_from)
         if (
             len(self._chunks) >= self.max_size_seconds
             and not self._eof_received
             and self._producer_task
             and not self._producer_task.done()
+            and (keep_from is None or self._discarded_chunks < keep_from)
         ):
             self._chunks.popleft()
             self._discarded_chunks += 1
