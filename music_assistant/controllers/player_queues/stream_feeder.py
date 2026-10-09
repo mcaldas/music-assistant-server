@@ -127,11 +127,12 @@ class StreamFeederMixin(_PlayerQueuesBase):
                     allow_provider_match=False,
                     stop_paused_queues=False,
                 )
-                # removal paths that do not cancel this task (replace_next, delete) can take
-                # the item off the queue while the buffer fills; the stale-buffer sweep walks
-                # only current items, so a buffer left here would sit until its inactivity
-                # timeout. The same goes for a queue whose session ended meanwhile. A session
-                # that rotated (a skip) owns the audio, and its stop releases it.
+                # a removal ends this task unless a reader has the item (see
+                # _release_removed_audio), so the item can still leave the queue while the
+                # buffer fills; the stale-buffer sweep walks only current items, so a buffer
+                # left here would sit until its inactivity timeout. The same goes for a queue
+                # whose session ended meanwhile. A session that rotated (a skip) owns the
+                # audio, and its stop releases it.
                 # Detached before releasing, as everywhere a buffer is cleared.
                 if (
                     self.get_item(queue_id, prepared_item.queue_item_id) is None
@@ -537,6 +538,45 @@ class StreamFeederMixin(_PlayerQueuesBase):
                 queue_id,
                 cleanup_threshold + 1,
             )
+
+    def _release_removed_audio(self, queue_id: str, removed: list[QueueItem]) -> None:
+        """
+        Let go of the audio prepared for items that were taken off the queue.
+
+        The queue's cleanups walk its items, so nothing reaches a removed item again: a source
+        still filling for it, or parked on a full buffer, would hold its provider's stream slot
+        until the buffer's inactivity timeout. An item a reader has keeps its audio: one a
+        stream has read from in this session, or one the player has a response open for.
+
+        :param queue_id: The queue the items were taken off.
+        :param removed: The items that are no longer on it.
+        """
+        if not removed:
+            return
+        queue_data = self._queue_data[queue_id]
+        read = self.mass.streams.audio.read_positions
+        requested = self.mass.streams.open_item_stream_ids(queue_id, queue_data.session_id)
+        for item in removed:
+            item_id = item.queue_item_id
+            if item_id in read or item_id in requested:
+                continue
+            preparing = queue_data.next_item_id_preparing == item_id
+            if preparing:
+                # still resolving it, or waiting for its first audio: ended like a
+                # preparation that another one replaces
+                queue_data.next_item_id_preparing = None
+                self.mass.cancel_task(f"prepare_next_audio_buffer_{queue_id}")
+            if not (details := item.streamdetails) or not (orphan := details.buffer):
+                continue
+            if not preparing and not orphan.ready.is_set():
+                # someone else waits for its first audio, and clearing would not wake them
+                continue
+            self.logger.debug(
+                "Releasing the audio prepared for %s: it left queue %s", item.name, queue_id
+            )
+            # detached before releasing, as everywhere a buffer is cleared
+            details.buffer = None
+            self.mass.create_task(orphan.clear())
 
     async def _cleanup_queue_audio_data(self, queue_id: str, session_id: str | None = None) -> None:
         """

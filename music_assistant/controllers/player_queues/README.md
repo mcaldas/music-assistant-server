@@ -195,6 +195,13 @@ else goes, including what sessions that ended earlier left behind: sessions rota
 so a claim that is no longer current marks audio nobody will come back for. A clear or a replace
 drops the items themselves, so all of their audio goes with them.
 
+An item that is taken off a queue any other way (a delete, a replace of the upcoming items, a
+dynamic rebuild) leaves its prepared audio with it, and a preparation still running for it is
+ended. The cleanups above walk the queue's items and never reach it again, so its source would keep
+its provider's stream slot until the buffer's inactivity timeout: for a track longer than its buffer
+that starves the item that follows on a provider that allows one stream. An item a reader has keeps
+its audio: one a stream has read from in this session, or one the player has a response open for.
+
 A paused queue keeps its session and its buffers until the pause watcher stops it after 30 seconds.
 When playback on another queue finds no free provider stream slot and one of those buffers holds
 one, the paused queue is stopped right away. It resumes later from where it was paused, with a new

@@ -5,15 +5,22 @@ A stop tears down the audio of the session it was issued for. When playback rest
 before that teardown gets to run - only possible once the playback lock gives up on a
 wedged holder - the replacement session's producers must survive it, while the stopped
 session's producers still have to be killed.
+
+An item that is taken off the queue leaves its prepared audio with it, unless a reader has
+it: no cleanup of the queue reaches an item that is no longer one of its items.
 """
 
 from __future__ import annotations
 
-from typing import cast
-from unittest.mock import AsyncMock, MagicMock
+import asyncio
+from collections.abc import AsyncGenerator
+from typing import Any, cast
+from unittest.mock import AsyncMock, MagicMock, Mock
 
-from music_assistant_models.enums import ContentType, MediaType, StreamType
+import pytest
+from music_assistant_models.enums import ContentType, MediaType, PlaybackState, StreamType
 from music_assistant_models.media_items import AudioFormat
+from music_assistant_models.player_queue import PlayerQueue
 from music_assistant_models.queue_item import QueueItem
 from music_assistant_models.streamdetails import StreamDetails
 
@@ -34,6 +41,9 @@ def _item(item_id: str, session_id: str | None) -> QueueItem:
     queue_item = QueueItem(queue_id=QUEUE_ID, queue_item_id=item_id, name=item_id, duration=180)
     audio_buffer = MagicMock(spec=AudioBuffer)
     audio_buffer.clear = AsyncMock()
+    # its first audio is in
+    audio_buffer.ready = asyncio.Event()
+    audio_buffer.ready.set()
     queue_item.streamdetails = StreamDetails(
         provider="local--1",
         item_id=item_id,
@@ -62,6 +72,47 @@ def _controller(items: list[QueueItem], playing: str | None = None) -> PlayerQue
     }
     ctrl.mass = MagicMock()
     return ctrl
+
+
+def _playing_controller(
+    items: list[QueueItem], read: tuple[str, ...] = (), asked: tuple[str, ...] = ()
+) -> PlayerQueuesController:
+    """
+    Build a bare controller whose queue plays, for taking items off it.
+
+    :param items: The queue's items.
+    :param read: The items a stream has read from in this session.
+    :param asked: The items the player has a response open for.
+    """
+    ctrl = _controller(items, playing="sess-1")
+    ctrl.signal_update = Mock()  # type: ignore[method-assign]
+    ctrl.update_next_item_on_player = Mock()  # type: ignore[method-assign]
+    ctrl.mass.streams.audio.read_positions = dict.fromkeys(read, 0.0)
+    ctrl.mass.streams.open_item_stream_ids.return_value = set(asked)
+    return ctrl
+
+
+def _details(item: QueueItem) -> Any:
+    """Return the item's stream details, untyped so a test can reach its buffer."""
+    return cast("Any", item.streamdetails)
+
+
+def _run_tasks(ctrl: PlayerQueuesController) -> list[asyncio.Task[Any]]:
+    """
+    Let the controller's tasks run, started at once as MusicAssistant.create_task starts them.
+
+    :param ctrl: The controller whose tasks to run.
+    :return: The tasks it creates from here on.
+    """
+    tasks: list[asyncio.Task[Any]] = []
+
+    def _create_task(coro: Any, **_kwargs: Any) -> asyncio.Task[Any]:
+        task = asyncio.Task(coro, loop=asyncio.get_running_loop(), eager_start=True)
+        tasks.append(task)
+        return task
+
+    cast("MagicMock", ctrl.mass).create_task = Mock(side_effect=_create_task)
+    return tasks
 
 
 async def test_a_stop_leaves_a_newer_sessions_buffers_alone() -> None:
@@ -198,3 +249,192 @@ async def test_a_pending_crossfade_handover_is_always_dropped() -> None:
 
     clear_crossfade_handover = cast("MagicMock", ctrl.mass.streams.audio.clear_crossfade_handover)
     clear_crossfade_handover.assert_called_once_with(QUEUE_ID)
+
+
+async def test_an_item_taken_off_the_queue_releases_its_prepared_audio() -> None:
+    """
+    A removed item's audio is let go at the removal, not at its inactivity timeout.
+
+    The queue's cleanups walk its items, so nothing reaches the item again, and its source
+    would keep its provider's stream slot until then.
+    """
+    playing, nxt, later = (_item(item_id, "sess-1") for item_id in ("playing", "nxt", "later"))
+    ctrl = _playing_controller([playing, nxt, later], read=("playing",))
+    buffer = _details(nxt).buffer
+
+    ctrl.update_items(QUEUE_ID, [playing, later])
+
+    assert _details(nxt).buffer is None
+    buffer.clear.assert_called_once_with()
+    cast("MagicMock", ctrl.mass.create_task).assert_called_once()
+    for kept in (playing, later):
+        assert _details(kept).buffer is not None
+        _details(kept).buffer.clear.assert_not_called()
+
+
+async def test_a_reorder_releases_nothing() -> None:
+    """Items that only change places are all still on the queue."""
+    playing, nxt, later = (_item(item_id, "sess-1") for item_id in ("playing", "nxt", "later"))
+    ctrl = _playing_controller([playing, nxt, later], read=("playing",))
+
+    ctrl.update_items(QUEUE_ID, [playing, later, nxt])
+
+    for item in (playing, nxt, later):
+        assert _details(item).buffer is not None
+    cast("MagicMock", ctrl.mass.create_task).assert_not_called()
+
+
+@pytest.mark.parametrize("reader", ["read", "response open"])
+async def test_a_removed_item_a_reader_has_keeps_its_audio(reader: str) -> None:
+    """
+    An item a stream has read from, or the player has asked for, plays on from its audio.
+
+    :param reader: Who has the removed item.
+    """
+    playing, nxt = _item("playing", "sess-1"), _item("nxt", "sess-1")
+    ctrl = _playing_controller(
+        [playing, nxt],
+        read=("playing", "nxt") if reader == "read" else ("playing",),
+        asked=("nxt",) if reader == "response open" else (),
+    )
+    queue_data = ctrl._queue_data[QUEUE_ID]
+    queue_data.next_item_id_preparing = "nxt"
+    buffer = _details(nxt).buffer
+
+    ctrl.update_items(QUEUE_ID, [playing])
+
+    assert _details(nxt).buffer is buffer
+    buffer.clear.assert_not_called()
+    cast("MagicMock", ctrl.mass.cancel_task).assert_not_called()
+    assert queue_data.next_item_id_preparing == "nxt"
+    # a response of a session the queue has moved past is one the player has left
+    open_responses = cast("MagicMock", ctrl.mass.streams.open_item_stream_ids)
+    open_responses.assert_called_once_with(QUEUE_ID, "sess-1")
+
+
+async def test_removing_the_item_being_prepared_ends_its_preparation() -> None:
+    """A preparation still waiting for a removed item's first audio ends with the item."""
+    playing, nxt, later = (_item(item_id, "sess-1") for item_id in ("playing", "nxt", "later"))
+    ctrl = _playing_controller([playing, nxt, later], read=("playing",))
+    queue_data = ctrl._queue_data[QUEUE_ID]
+    queue_data.next_item_id_preparing = "nxt"
+    buffer = _details(nxt).buffer
+    buffer.ready.clear()
+    cancel_task = cast("MagicMock", ctrl.mass.cancel_task)
+
+    # another item leaves: the preparation is not its own
+    ctrl.update_items(QUEUE_ID, [playing, nxt])
+
+    cancel_task.assert_not_called()
+    assert queue_data.next_item_id_preparing == "nxt"
+    assert _details(nxt).buffer is buffer
+
+    ctrl.update_items(QUEUE_ID, [playing])
+
+    cancel_task.assert_called_once_with(f"prepare_next_audio_buffer_{QUEUE_ID}")
+    assert queue_data.next_item_id_preparing is None
+    assert _details(nxt).buffer is None
+    buffer.clear.assert_called_once_with()
+
+
+async def test_a_removed_item_whose_first_audio_someone_else_awaits_is_left() -> None:
+    """
+    A source without its first audio that no preparation of the queue started is left alone.
+
+    Whoever started it waits for that audio, and releasing the buffer would not wake them: a
+    player that reads an item as raw PCM is in no list of open responses.
+    """
+    playing, nxt = _item("playing", "sess-1"), _item("nxt", "sess-1")
+    ctrl = _playing_controller([playing, nxt], read=("playing",))
+    buffer = _details(nxt).buffer
+    buffer.ready.clear()
+
+    ctrl.update_items(QUEUE_ID, [playing])
+
+    assert _details(nxt).buffer is buffer
+    buffer.clear.assert_not_called()
+
+
+async def test_a_source_parked_on_a_full_buffer_is_closed_when_its_item_is_deleted() -> None:
+    """
+    A deleted track longer than its buffer gives its provider's stream slot back at once.
+
+    Its source is parked on the full buffer with the slot held and only goes on while the
+    buffer is read, and nobody reads the audio of an item that left the queue.
+    """
+    playing, nxt = _item("playing", "sess-1"), _item("nxt", "sess-1")
+    ctrl = _playing_controller([playing, nxt], read=("playing",))
+    ctrl._queue_data[QUEUE_ID].queue = PlayerQueue(
+        queue_id=QUEUE_ID,
+        active=True,
+        display_name="Q1",
+        available=True,
+        items=2,
+        state=PlaybackState.PLAYING,
+        current_index=0,
+        index_in_buffer=0,
+    )
+    _run_tasks(ctrl)
+    pcm_format = AudioFormat(
+        content_type=ContentType.PCM_S16LE, sample_rate=8000, bit_depth=16, channels=2
+    )
+    slot_released = asyncio.Event()
+
+    async def _source() -> AsyncGenerator[bytes]:
+        try:
+            for _ in range(10):
+                yield bytes(pcm_format.pcm_sample_size)
+        finally:
+            # stands for the provider's stream slot, held for as long as the source lives
+            slot_released.set()
+
+    buffer = AudioBuffer(pcm_format)
+    buffer.max_size_seconds = 3
+    buffer.fill(_source())
+    _details(nxt).buffer = buffer
+    try:
+        async with asyncio.timeout(1):
+            while buffer.seconds_available < 3:
+                await asyncio.sleep(0)
+        # a source that still had room would have gone on by now
+        for _ in range(5):
+            await asyncio.sleep(0)
+        assert buffer.seconds_available == 3
+        assert buffer.is_buffering
+        assert not slot_released.is_set()
+
+        ctrl.delete_item(QUEUE_ID, "nxt")
+
+        await asyncio.wait_for(slot_released.wait(), timeout=1)
+        assert buffer.cancelled
+        assert _details(nxt).buffer is None
+    finally:
+        await buffer.clear()
+
+
+async def test_a_clear_releases_every_buffer_once() -> None:
+    """
+    A clear's own cleanup and the release at the swap never take the same buffer twice.
+
+    The cleanup is a task that waits on the first buffer it releases, so the items are
+    swapped out while the others are still attached.
+    """
+    items = [_item(item_id, "sess-1") for item_id in ("playing", "nxt", "later")]
+    ctrl = _playing_controller(items, read=("playing",))
+    ctrl.store_sources = Mock()  # type: ignore[method-assign]
+    ctrl.is_smart_shuffle_active = Mock(return_value=False)  # type: ignore[method-assign]
+    buffers = [_details(item).buffer for item in items]
+
+    async def _wait_on_the_source() -> None:
+        await asyncio.sleep(0)
+
+    for buffer in buffers:
+        buffer.clear = AsyncMock(side_effect=_wait_on_the_source)
+    tasks = _run_tasks(ctrl)
+
+    ctrl._clear(QUEUE_ID, skip_stop=True)
+    await asyncio.gather(*tasks)
+
+    for item, buffer in zip(items, buffers, strict=True):
+        assert _details(item).buffer is None
+        buffer.clear.assert_awaited_once_with()

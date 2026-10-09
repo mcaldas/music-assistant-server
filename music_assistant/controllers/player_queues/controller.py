@@ -1846,9 +1846,13 @@ class PlayerQueuesController(QueueLoaderMixin, PlaybackTrackerMixin, StreamFeede
 
     def update_items(self, queue_id: str, queue_items: list[QueueItem]) -> None:
         """Update the existing queue items, mostly caused by reordering."""
+        kept = {item.queue_item_id for item in queue_items}
+        removed = [x for x in self._queue_data[queue_id].items if x.queue_item_id not in kept]
         self._queue_data[queue_id].items = queue_items
         queue = self._queue_data[queue_id].queue
         queue.items = len(self._queue_data[queue_id].items)
+        # an item that leaves the queue leaves its prepared audio, and its source's slot, too
+        self._release_removed_audio(queue_id, removed)
         self.signal_update(queue_id, True)
         self.update_next_item_on_player(queue_id)
 
