@@ -2238,8 +2238,14 @@ class StreamsAudio:
         # Claim the handoff the moment the next item is known, before the awaits that
         # size the fade: the speaker can ask for that item's url during them, and a
         # marker registered afterwards would arrive too late to be waited for.
+        # A stream of a session the queue has moved past claims nothing: its audio reaches no
+        # player, and the item the new session starts would wait for a fade nobody hears.
+        queue_data = (
+            self.mass.player_queues.queue_data_or_none(queue.queue_id) if session_id else None
+        )
+        superseded = queue_data is not None and queue_data.session_id != session_id
         handoff: asyncio.Event | None = None
-        if next_queue_item is not None:
+        if next_queue_item is not None and not superseded:
             handoff = asyncio.Event()
             self._crossfade_pending[queue.queue_id] = (
                 next_queue_item.queue_item_id,
@@ -2374,6 +2380,12 @@ class StreamsAudio:
                     # the resident fade-in size and records on the handover how much of
                     # the next item the mix consumed (final once the mix is exhausted)
                     async def _limited_fade_in() -> AsyncGenerator[bytes]:
+                        claim = self._crossfade_pending.get(queue.queue_id)
+                        if claim is None or claim[1] is not handoff:
+                            # the boundary was cleared before its mix read the next item (the
+                            # queue moved on): that item may be starting on its own, and a
+                            # second reader drops a still-filling buffer's audio under the first
+                            return
                         fade_in_bytes_consumed = 0
                         fade_in_stream = self.get_queue_item_stream(
                             _next_item,

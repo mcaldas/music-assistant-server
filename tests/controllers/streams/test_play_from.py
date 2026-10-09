@@ -11,7 +11,7 @@ from unittest.mock import AsyncMock, MagicMock
 import numpy as np
 import pytest
 from music_assistant_models.enums import CrossfadeMode, MediaType
-from music_assistant_models.errors import ActionUnavailable, QueueEmpty
+from music_assistant_models.errors import ActionUnavailable, AudioError, QueueEmpty
 
 from music_assistant.controllers.player_queues import PlayerQueuesController
 from music_assistant.controllers.streams.audio import (
@@ -389,6 +389,37 @@ async def test_single_a_new_session_plays_b_from_its_start_not_behind_the_old_mi
     # not from START + TRIM + CF, where the fade that A's stream mixed stopped
     _assert_runs(b_out, 2, START, 120, faded_in=True)
     assert "queue-1" not in audio._crossfade_handover
+
+
+async def test_a_cleared_boundary_leaves_a_next_item_longer_than_its_buffer_whole(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A fade let go while it is planned reads nothing of B, so B's own request finds B whole.
+
+    B is longer than its buffer: a read of the full buffer drops its oldest second, so a
+    mix that read B beside B's own request would take B's head from under it.
+    """
+    second = _item("b", 2, 90, BufferSize.MINIMAL)
+    first = _item("a", 1, 100, BufferSize.BALANCED)
+    await _filled(first, second)
+    audio, mass = _boundary_audio(monkeypatch, second)
+
+    async def _cleared_while_planned(**kw: Any) -> SimpleNamespace:
+        # a play_index lands while A's stream plans the fade
+        audio.clear_crossfade_handover("queue-1")
+        return await _timed_build(**kw)
+
+    monkeypatch.setattr(
+        audio.smart_fades_mixer, "build", AsyncMock(side_effect=_cleared_while_planned)
+    )
+    with pytest.raises(AudioError, match="cleared during its mix"):
+        await _run_single(audio, first, CrossfadeMode.SMART_CROSSFADE)
+    assert second.streamdetails.buffer.first_buffered_chunk == 0
+
+    mass.player_queues.load_next_queue_item = AsyncMock(side_effect=QueueEmpty)
+    b_out = await _run_single(audio, second, CrossfadeMode.SMART_CROSSFADE)
+    _assert_runs(b_out, 2, 0, 90)
 
 
 @pytest.mark.parametrize("case", ["slow", "realtime", "minimal", "moved"])
