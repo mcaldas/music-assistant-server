@@ -576,7 +576,7 @@ async def test_the_time_without_output_at_a_seam_is_logged(
     text = "\n".join(record.getMessage() for record in caplog.records)
     seam = r"First audio of Current after its fade came \d+\.\d\ds after the fade ended"
     assert len(re.findall(seam, text)) == 1
-    hold = r"Held back \d+\.\ds of Current for its fade: \d+\.\d\ds without output"
+    hold = r"Held back 8\.0s of Current for its fade: \d+\.\d\ds without output"
     assert len(re.findall(hold, text)) == 1
 
 
@@ -868,3 +868,33 @@ async def test_an_end_moved_close_while_the_tail_builds_up_holds_what_is_in_hand
     assert read_at[-1] == 40
     assert len(tail) == 7 * _SINGLE_PCM.pcm_sample_size
     assert handed_on + tail == b"".join(ramp[:42])
+
+
+async def test_the_logged_time_without_output_is_the_last_stretch_the_tail_is_read_in(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """
+    The line times the reading that sends nothing: from the last slice handed on to the tail.
+
+    While the window builds up a slice leaves for every two seconds read. Once no more than
+    the window is left of the item all of it is held, and that is the stretch a player can
+    give up in.
+    """
+    # 12 s are left of it: slices leave up to the 8th second read, the last 4 are all tail
+    audio, current_item = _single_boundary([], duration=16)
+    current_item.streamdetails.seek_position = 4
+
+    def _source() -> Iterable[bytes]:
+        for second, chunk in enumerate(_ramp(12)):
+            # a slow filter: 0.4 s for the seconds read while audio leaves, 0.4 s for the rest
+            time.sleep(0.05 if second < 8 else 0.1)
+            yield chunk
+
+    with caplog.at_level(logging.DEBUG, logger="music_assistant.streams.audio"):
+        read_at, _handed_on, _tail = await _play_out(audio, current_item, _source())
+
+    assert read_at == [2, 4, 6, 8]
+    text = "\n".join(record.getMessage() for record in caplog.records)
+    held = re.findall(r"Held back 8\.0s of Current for its fade: (\d+\.\d\d)s without output", text)
+    assert len(held) == 1
+    assert 0.39 <= float(held[0]) < 0.6

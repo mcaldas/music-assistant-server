@@ -2109,17 +2109,25 @@ class StreamsAudio:
         else:
             discard_position = float(streamdetails.seek_position)
 
-        # timed for two debug lines, each written at the next slice of the item's own
-        # audio handed on: when the fade into it ended, and when a tail was first held
-        # back (0 once that is written)
+        # timed for two debug lines: when the fade into the item ended, written at the next
+        # slice of its own audio handed on, and when its audio last left since a tail is
+        # held back (the start of the hold until some did), written once the tail is read
         fade_ended_at = asyncio.get_event_loop().time() if exact_buffer_seek else None
-        hold_began_at: float | None = None
+        quiet_since: float | None = None
         total_chunks_received = 0
         # the source's bytes, which place the held tail in song seconds
         received_bytes = 0
         # how much of the tail's window is built up
         hold_built = 0
         playback_speed = cast("float", queue_item.extra_attributes.get("playback_speed", 1.0))
+
+        def superseded() -> bool:
+            """Return whether the queue has moved on from the session this stream is of."""
+            queue_data = (
+                self.mass.player_queues.queue_data_or_none(queue.queue_id) if session_id else None
+            )
+            return queue_data is not None and queue_data.session_id != session_id
+
         async for chunk in self.get_queue_item_stream(
             queue_item,
             pcm_format,
@@ -2163,32 +2171,31 @@ class StreamsAudio:
                         pcm_format.pcm_sample_size,
                     ),
                 )
+                # The rest of the window is the fade's as well, though it is not read yet:
+                # an end a client moves into it (set_end_position) is refused as one that
+                # was read past, which it was when the whole window was read at once.
+                if not superseded():
+                    self._mark_read(
+                        queue_item.queue_item_id,
+                        position
+                        + (hold_target - hold_built) / pcm_format.pcm_sample_size * playback_speed,
+                    )
             else:
                 # the window is full, or its target came down (a moved end, an error)
                 hold_built = hold_target
             hold_target = hold_built // frame_size * frame_size
-            if hold_target and hold_began_at is None:
-                hold_began_at = asyncio.get_event_loop().time()
+            if hold_target and quiet_since is None:
+                quiet_since = asyncio.get_event_loop().time()
             if len(tail_window) <= hold_target:
                 await asyncio.sleep(0)
                 continue
-            if fade_ended_at is not None or hold_began_at:
-                now = asyncio.get_event_loop().time()
-                if fade_ended_at is not None:
-                    self.logger.debug(
-                        "First audio of %s after its fade came %.2fs after the fade ended",
-                        queue_item.name,
-                        now - fade_ended_at,
-                    )
-                    fade_ended_at = None
-                if hold_began_at:
-                    self.logger.debug(
-                        "Held back %.1fs of %s for its fade: %.2fs without output",
-                        hold_target / pcm_format.pcm_sample_size,
-                        queue_item.name,
-                        now - hold_began_at,
-                    )
-                    hold_began_at = 0.0
+            if fade_ended_at is not None:
+                self.logger.debug(
+                    "First audio of %s after its fade came %.2fs after the fade ended",
+                    queue_item.name,
+                    asyncio.get_event_loop().time() - fade_ended_at,
+                )
+                fade_ended_at = None
             # yield everything above the window; the slice can run short of a
             # whole second when the window is small, so credit what is actually
             # yielded - a nominal full-second credit inflates the play log and
@@ -2199,6 +2206,18 @@ class StreamsAudio:
                 bytes_written += len(pcm_slice)
                 del tail_window[: len(pcm_slice)]
                 await asyncio.sleep(0)
+            if quiet_since is not None:
+                quiet_since = asyncio.get_event_loop().time()
+
+        if tail_window and quiet_since is not None:
+            # once no more than the window is left of the item all of it is held, so nothing
+            # leaves while the last of the tail is read: the stretch a player can give up in
+            self.logger.debug(
+                "Held back %.1fs of %s for its fade: %.2fs without output",
+                len(tail_window) / pcm_format.pcm_sample_size,
+                queue_item.name,
+                asyncio.get_event_loop().time() - quiet_since,
+            )
 
         #### HANDLE END OF TRACK
 
@@ -2240,12 +2259,8 @@ class StreamsAudio:
         # marker registered afterwards would arrive too late to be waited for.
         # A stream of a session the queue has moved past claims nothing: its audio reaches no
         # player, and the item the new session starts would wait for a fade nobody hears.
-        queue_data = (
-            self.mass.player_queues.queue_data_or_none(queue.queue_id) if session_id else None
-        )
-        superseded = queue_data is not None and queue_data.session_id != session_id
         handoff: asyncio.Event | None = None
-        if next_queue_item is not None and not superseded:
+        if next_queue_item is not None and not superseded():
             handoff = asyncio.Event()
             self._crossfade_pending[queue.queue_id] = (
                 next_queue_item.queue_item_id,
