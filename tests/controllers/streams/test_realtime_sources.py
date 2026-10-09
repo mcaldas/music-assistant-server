@@ -1019,6 +1019,27 @@ async def test_the_incoming_item_waits_for_a_fade_still_being_mixed(
     assert asyncio.get_event_loop().time() - started >= 0.2
 
 
+async def test_a_cleared_boundary_releases_the_item_waiting_for_it(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """An item waiting for its fade goes on at once when the queue lets that fade go."""
+    audio = StreamsAudio(MagicMock())
+    queue = cast("Any", SimpleNamespace(queue_id="queue-1", display_name="Queue"))
+    item = cast("Any", SimpleNamespace(queue_item_id="next", name="Next"))
+    audio._crossfade_pending["queue-1"] = ("next", asyncio.Event())
+    # the wait keeps its real bound (30 s): only the release can end it this soon
+    waiting = asyncio.create_task(audio._await_pending_crossfade(queue, item))
+    await asyncio.sleep(0)
+
+    with caplog.at_level(logging.DEBUG, logger="music_assistant.streams.audio"):
+        audio.clear_crossfade_handover("queue-1")
+        assert await asyncio.wait_for(waiting, 0.5) is None
+
+    assert "queue-1" not in audio._crossfade_pending
+    # a replay shows that a fade was still being mixed when the queue moved on
+    assert "Releasing the fade being mixed for queue queue-1" in caplog.text
+
+
 async def test_smartfade_a_source_still_delivering_hands_over_gapless(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

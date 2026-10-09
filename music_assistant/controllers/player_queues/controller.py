@@ -1250,6 +1250,10 @@ class PlayerQueuesController(QueueLoaderMixin, PlaybackTrackerMixin, StreamFeede
             # the new session streams every item afresh: what older ones read holds no end back
             for item in queue_data.items:
                 self.mass.streams.audio.read_positions.pop(item.queue_item_id, None)
+            # nor does it take over a fade an older session mixed or is still mixing: that
+            # stream reaches no player any more, so the item started here plays from its own
+            # start instead of waiting for that mix or carrying on behind it
+            self.mass.streams.audio.clear_crossfade_handover(queue_id)
             self.mass.streams.audio_processing.start_session(
                 queue_id,
                 queue_data.session_id,

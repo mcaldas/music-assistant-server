@@ -151,3 +151,23 @@ async def test_play_index_stops_and_reports_a_source_capacity_failure() -> None:
     assert queue_item.available
     assert ctrl._load_item.await_count == 1
     ctrl.stop.assert_awaited_once_with(QUEUE_ID)
+
+
+async def test_play_index_releases_the_fade_of_the_session_it_replaces() -> None:
+    """A fade an older session mixed is let go with that session, before the item is loaded."""
+    ctrl, _queue, _signals = _controller_with_stale_queue()
+    queue_data = ctrl._queue_data[QUEUE_ID]
+    queue_data.session_id = "old"
+    steps: list[str] = []
+    release = ctrl.mass.streams.audio.clear_crossfade_handover
+    release.side_effect = lambda _queue_id: steps.append("released")
+    ctrl._load_item = AsyncMock(  # type: ignore[method-assign]
+        side_effect=lambda *_args, **_kwargs: steps.append("loaded")
+    )
+    ctrl.mass.players.play_media = AsyncMock(side_effect=lambda *_args: steps.append("player told"))
+
+    await ctrl.play_index(QUEUE_ID, 1)
+
+    release.assert_called_once_with(QUEUE_ID)
+    assert steps == ["released", "loaded", "player told"]
+    assert queue_data.session_id != "old"

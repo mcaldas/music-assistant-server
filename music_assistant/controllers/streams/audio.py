@@ -3453,6 +3453,7 @@ class StreamsAudio:
                 self.mass.create_task(stale.close())
         # and release anything waiting on a fade this queue will never finish mixing
         if pending := self._crossfade_pending.pop(queue_id, None):
+            self.logger.debug("Releasing the fade being mixed for queue %s", queue_id)
             pending[1].set()
 
     def crossfade_targets(self, queue_id: str) -> set[str]:

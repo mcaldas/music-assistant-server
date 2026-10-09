@@ -25,6 +25,10 @@ from music_assistant.controllers.streams.constants import (
     BufferMode,
     BufferSize,
 )
+from tests.controllers.player_queues.test_play_index_elapsed import (
+    QUEUE_ID,
+    _controller_with_stale_queue,
+)
 from tests.controllers.streams.test_audio_buffer import (
     _make_mass_for_get_buffer,
     _make_stream_details,
@@ -357,6 +361,34 @@ async def test_single_without_a_crossfade_b_starts_exactly_at_its_start(
     a_out, b_out, _audio, _ = await _a_then_b(monkeypatch, second, CrossfadeMode.DISABLED)
     _assert_runs(a_out, 1, 0, 100)
     _assert_runs(b_out, 2, START, 120, faded_in=True)
+
+
+async def test_single_a_new_session_plays_b_from_its_start_not_behind_the_old_mix(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A play_index to B, with A's fade into it mixed, plays B from its start, not past the fade."""
+    second = _started("b", 2, 120, START)
+    first = _item("a", 1, 100, BufferSize.BALANCED)
+    await _filled(first, second)
+    audio, mass = _boundary_audio(monkeypatch, second)
+    await _run_single(audio, first, CrossfadeMode.SMART_CROSSFADE)
+    assert audio._crossfade_handover["queue-1"].queue_item_id == "b"
+
+    # the queue's own play_index, on the stream engine that holds the fade
+    ctrl, _queue, _signals = _controller_with_stale_queue()
+    ctrl._queue_data = {"queue-1": ctrl._queue_data[QUEUE_ID]}
+    ctrl._queue_data["queue-1"].items = [first, second]
+    ctrl.mass.streams.audio = audio
+    closing: list[asyncio.Future[None]] = []
+    mass.create_task.side_effect = lambda coro: closing.append(asyncio.ensure_future(coro))
+    await ctrl.play_index("queue-1", "b")
+    await asyncio.gather(*closing)
+
+    mass.player_queues.load_next_queue_item = AsyncMock(side_effect=QueueEmpty)
+    b_out = await _run_single(audio, second, CrossfadeMode.SMART_CROSSFADE)
+    # not from START + TRIM + CF, where the fade that A's stream mixed stopped
+    _assert_runs(b_out, 2, START, 120, faded_in=True)
+    assert "queue-1" not in audio._crossfade_handover
 
 
 @pytest.mark.parametrize("case", ["slow", "realtime", "minimal", "moved"])
