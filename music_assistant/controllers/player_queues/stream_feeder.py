@@ -556,11 +556,17 @@ class StreamFeederMixin(_PlayerQueuesBase):
         queue_data = self._queue_data[queue_id]
         read = self.mass.streams.audio.read_positions
         requested = self.mass.streams.open_item_stream_ids(queue_id, queue_data.session_id)
+        # the marker of the item being prepared outlives its preparation
+        preparation = self.mass.get_task(f"prepare_next_audio_buffer_{queue_id}")
         for item in removed:
             item_id = item.queue_item_id
             if item_id in read or item_id in requested:
                 continue
-            preparing = queue_data.next_item_id_preparing == item_id
+            preparing = (
+                queue_data.next_item_id_preparing == item_id
+                and preparation is not None
+                and not preparation.done()
+            )
             if preparing:
                 # still resolving it, or waiting for its first audio: ended like a
                 # preparation that another one replaces

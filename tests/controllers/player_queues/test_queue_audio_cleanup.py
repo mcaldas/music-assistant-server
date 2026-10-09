@@ -89,6 +89,8 @@ def _playing_controller(
     ctrl.update_next_item_on_player = Mock()  # type: ignore[method-assign]
     ctrl.mass.streams.audio.read_positions = dict.fromkeys(read, 0.0)
     ctrl.mass.streams.open_item_stream_ids.return_value = set(asked)
+    # no preparation runs, until a test says one does
+    ctrl.mass.get_task.return_value = None
     return ctrl
 
 
@@ -318,6 +320,7 @@ async def test_removing_the_item_being_prepared_ends_its_preparation() -> None:
     ctrl = _playing_controller([playing, nxt, later], read=("playing",))
     queue_data = ctrl._queue_data[QUEUE_ID]
     queue_data.next_item_id_preparing = "nxt"
+    cast("MagicMock", ctrl.mass.get_task).return_value = Mock(done=Mock(return_value=False))
     buffer = _details(nxt).buffer
     buffer.ready.clear()
     cancel_task = cast("MagicMock", ctrl.mass.cancel_task)
@@ -337,15 +340,23 @@ async def test_removing_the_item_being_prepared_ends_its_preparation() -> None:
     buffer.clear.assert_called_once_with()
 
 
-async def test_a_removed_item_whose_first_audio_someone_else_awaits_is_left() -> None:
+@pytest.mark.parametrize("prepared_before", [False, True], ids=["never", "earlier"])
+async def test_a_removed_item_whose_first_audio_someone_else_awaits_is_left(
+    prepared_before: bool,
+) -> None:
     """
     A source without its first audio that no preparation of the queue started is left alone.
 
     Whoever started it waits for that audio, and releasing the buffer would not wake them: a
     player that reads an item as raw PCM is in no list of open responses.
+
+    :param prepared_before: Whether a preparation of the queue, over by now, was for the
+        item: its marker stays behind, and says nothing about the source that fills now.
     """
     playing, nxt = _item("playing", "sess-1"), _item("nxt", "sess-1")
     ctrl = _playing_controller([playing, nxt], read=("playing",))
+    if prepared_before:
+        ctrl._queue_data[QUEUE_ID].next_item_id_preparing = "nxt"
     buffer = _details(nxt).buffer
     buffer.ready.clear()
 
@@ -353,6 +364,7 @@ async def test_a_removed_item_whose_first_audio_someone_else_awaits_is_left() ->
 
     assert _details(nxt).buffer is buffer
     buffer.clear.assert_not_called()
+    cast("MagicMock", ctrl.mass.cancel_task).assert_not_called()
 
 
 async def test_a_source_parked_on_a_full_buffer_is_closed_when_its_item_is_deleted() -> None:

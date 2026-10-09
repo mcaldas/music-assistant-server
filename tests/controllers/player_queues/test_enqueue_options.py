@@ -285,15 +285,16 @@ async def test_replace_next_releases_the_audio_of_the_tail_it_swaps_out() -> Non
 
 
 async def test_replace_next_keeps_the_audio_of_the_item_being_faded_into() -> None:
-    """An item the player was already handed stays on the queue, and keeps its audio."""
+    """An item whose audio a fade already reads keeps it when the swap takes it off the queue."""
     ctrl = _controller()
-    _playing, fading_in, _last = _playing_queue(ctrl, index_in_buffer=1)
+    # the fade into it is read before the player's buffered index reaches it
+    _playing, fading_in, _last = _playing_queue(ctrl, index_in_buffer=0)
     ctrl.mass.streams.audio.read_positions = {"a": 0.0, "b": 0.0}
     buffer = _prepare(fading_in)
 
     await ctrl._enqueue_with_option("q1", _items("q1", ["new"]), QueueOption.REPLACE_NEXT)
 
-    assert [item.queue_item_id for item in ctrl._queue_data["q1"].items] == ["a", "b", "new"]
+    assert [item.queue_item_id for item in ctrl._queue_data["q1"].items] == ["a", "new"]
     assert cast("Any", fading_in.streamdetails).buffer is buffer
     buffer.clear.assert_not_called()
 
