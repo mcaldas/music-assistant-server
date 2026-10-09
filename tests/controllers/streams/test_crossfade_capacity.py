@@ -7,7 +7,8 @@ import logging
 import re
 import struct
 import time
-from collections.abc import AsyncGenerator
+from collections.abc import AsyncGenerator, Iterable
+from itertools import pairwise
 from types import SimpleNamespace
 from typing import Any, cast
 from unittest.mock import AsyncMock, MagicMock, call
@@ -69,9 +70,20 @@ def _buffer(duration_available: float, ready: bool, eof: bool = False) -> AudioB
     return audio_buffer
 
 
-def _delivered_buffer() -> SimpleNamespace:
-    """Build the outgoing track's buffer, with its source done delivering."""
-    return SimpleNamespace(eof=True, cancelled=False, has_error=False, max_size_seconds=300)
+def _delivered_buffer(seconds: float = 16.0) -> SimpleNamespace:
+    """
+    Build the outgoing track's buffer, with its source done delivering.
+
+    :param seconds: The audio it holds, from the track's beginning.
+    """
+    return SimpleNamespace(
+        eof=True,
+        cancelled=False,
+        has_error=False,
+        max_size_seconds=300,
+        first_buffered_chunk=0,
+        duration_available=seconds,
+    )
 
 
 def test_ready_incoming_buffer_keeps_smart_crossfade() -> None:
@@ -385,24 +397,28 @@ _SINGLE_PCM = AudioFormat(
 
 
 def _single_boundary(
-    chunk_seconds: list[float],
+    chunk_seconds: list[float], duration: int = 16
 ) -> tuple[StreamsAudio, SimpleNamespace]:
     """
-    Wire a single-item stream of an outgoing track into a next one, both 16 s long.
+    Wire a single-item stream of an outgoing track into a next one of 16 s.
 
-    :param chunk_seconds: The outgoing track's source chunks, in seconds.
+    :param chunk_seconds: The outgoing track's source chunks, in seconds; none when the
+        test streams its own (``_play_out``).
+    :param duration: The outgoing track's length in seconds.
     """
     current_item = SimpleNamespace(
         queue_id="queue-1",
         queue_item_id="current",
         name="Current",
         streamdetails=SimpleNamespace(
-            duration=16,
+            duration=duration,
             seek_position=0,
             seconds_streamed=0,
             uri="test://current",
-            buffer=_delivered_buffer(),
+            # the source delivered what its reader will get
+            buffer=_delivered_buffer(sum(chunk_seconds) or duration),
             is_realtime=False,
+            allow_seek=True,
         ),
         extra_attributes={},
     )
@@ -560,8 +576,7 @@ async def test_the_time_without_output_at_a_seam_is_logged(
     text = "\n".join(record.getMessage() for record in caplog.records)
     seam = r"First audio of Current after its fade came \d+\.\d\ds after the fade ended"
     assert len(re.findall(seam, text)) == 1
-    # the source is complete, so the whole 8 s window is read before the item's own audio leaves
-    hold = r"Held back 8\.0s of Current for its fade: \d+\.\d\ds without output"
+    hold = r"Held back \d+\.\ds of Current for its fade: \d+\.\d\ds without output"
     assert len(re.findall(hold, text)) == 1
 
 
@@ -657,3 +672,180 @@ async def test_a_fade_into_a_track_longer_than_its_buffer_leaves_its_resume_poin
     assert not incoming.cancelled
     await handover.close()
     await incoming.clear()
+
+
+def _ramp(seconds: int, chunk_seconds: float = 1.0) -> list[bytes]:
+    """
+    Return a track's audio in chunks that are told apart by their bytes.
+
+    :param seconds: The length of the audio.
+    :param chunk_seconds: The length of each chunk.
+    """
+    size = int(_SINGLE_PCM.pcm_sample_size * chunk_seconds)
+    return [bytes([index % 250 + 1]) * size for index in range(round(seconds / chunk_seconds))]
+
+
+async def _play_out(
+    audio: StreamsAudio, current_item: SimpleNamespace, source: Iterable[bytes]
+) -> tuple[list[int], bytes, bytes]:
+    """
+    Stream the outgoing track from its source chunks, up to and with a plain mix.
+
+    :param audio: The StreamsAudio from ``_single_boundary``.
+    :param current_item: The outgoing track.
+    :param source: The chunks its reader delivers; a generator can act between them.
+    :return: For each slice handed on before the mix how many seconds were read by then,
+        those slices joined, and the tail the mix was handed.
+    """
+    seconds_read = 0.0
+
+    async def _item_stream(
+        queue_item: object, *_args: object, **_kwargs: object
+    ) -> AsyncGenerator[bytes]:
+        nonlocal seconds_read
+        for chunk in source if queue_item is current_item else []:
+            seconds_read += len(chunk) / _SINGLE_PCM.pcm_sample_size
+            yield chunk
+
+    audio.get_queue_item_stream = _item_stream  # type: ignore[method-assign]
+    build = _plain_mix(audio)
+    read_at: list[float] = []
+    pieces: list[bytes] = []
+    async for piece in _single_stream(audio, current_item):
+        read_at.append(seconds_read)
+        pieces.append(piece)
+    assert build.await_args is not None
+    tail = build.await_args.kwargs["fade_out_data"]
+    # the plain mix is the tail, handed on in one piece after the track's own slices
+    assert pieces[-1] == tail
+    return read_at[:-1], b"".join(pieces[:-1]), tail
+
+
+def _assert_flows(read_at: list[float], chunk_seconds: float = 1.0) -> None:
+    """
+    Assert that no more than two seconds were read for each second that was handed on.
+
+    :param read_at: The seconds read when each one-second slice was handed on.
+    :param chunk_seconds: The length of the source's chunks: a slice leaves with the
+        chunk that completes it.
+    """
+    assert read_at
+    read_for_a_slice = max(later - earlier for earlier, later in pairwise([0.0, *read_at]))
+    assert read_for_a_slice < 2 + chunk_seconds
+
+
+@pytest.mark.parametrize(
+    ("seconds", "starts_at", "attributes", "source_seconds", "chunk_seconds", "tail_seconds"),
+    [
+        # a long track, faded out over the whole window
+        (200, 0, {}, 200, 1.0, 8),
+        # the same in pieces that are no whole seconds, as a filter hands them on
+        (200, 0, {}, 200, 0.4, 8),
+        # less than twice the window is left of it when its stream starts
+        (16, 4, {}, 12, 1.0, 8),
+        # an end position 8 s after its stream starts: half of the 12 s it plays is held
+        (200, 4, {"end_position": 12.0}, 8, 1.0, 6),
+        # a part, read from its start: it holds half of the 16 s it plays
+        (200, 30, {"start_position": 30.0, "end_position": 46.0}, 16, 1.0, 8),
+        # played at double speed: 24 s of the track are 12 s of the stream
+        (64, 40, {"playback_speed": 2.0}, 12, 1.0, 8),
+    ],
+    ids=["long", "pieces", "short", "end", "part", "fast"],
+)
+async def test_a_complete_item_keeps_audio_flowing_while_its_tail_is_collected(
+    seconds: int,
+    starts_at: int,
+    attributes: dict[str, float],
+    source_seconds: int,
+    chunk_seconds: float,
+    tail_seconds: int,
+) -> None:
+    """A complete source no longer has its whole window read before its audio goes on."""
+    audio, current_item = _single_boundary([], duration=seconds)
+    current_item.streamdetails.seek_position = starts_at
+    current_item.extra_attributes.update(attributes)
+    source = _ramp(source_seconds, chunk_seconds)
+
+    read_at, handed_on, tail = await _play_out(audio, current_item, source)
+
+    # audio leaves from the first seconds on, a second for every two that are read
+    _assert_flows(read_at, chunk_seconds)
+    # and at the end the mix gets the tail it got before, of the same audio in the same order
+    assert len(tail) == tail_seconds * _SINGLE_PCM.pcm_sample_size
+    assert handed_on + tail == b"".join(source)
+
+
+@pytest.mark.parametrize("part", [False, True], ids=["track", "part"])
+async def test_an_item_with_no_more_than_its_window_left_is_held_as_before(part: bool) -> None:
+    """What is left of an item when its stream starts is no more than its tail: all is held."""
+    if part:
+        # a part of 16 s that was faded into over its first 8 s
+        audio, current_item = _single_boundary([], duration=200)
+        current_item.streamdetails.seek_position = 30.0
+        current_item.extra_attributes.update(start_position=30.0, end_position=46.0)
+        audio._crossfade_handover["queue-1"] = CrossfadeHandover(
+            stream=None,
+            fade_in_media_duration=38.0,
+            pcm_format=_SINGLE_PCM,
+            queue_item_id="current",
+            fade_in_start=30.0,
+        )
+    else:
+        audio, current_item = _single_boundary([])
+        current_item.streamdetails.seek_position = 8
+    source = _ramp(8)
+
+    read_at, handed_on, tail = await _play_out(audio, current_item, source)
+
+    assert read_at == []
+    assert handed_on == b""
+    assert tail == b"".join(source)
+
+
+async def test_a_source_that_completes_while_its_item_plays_does_not_stop_the_stream() -> None:
+    """The tail of a source that completes mid-stream is collected while audio keeps leaving."""
+    audio, current_item = _single_boundary([], duration=200)
+    audio_buffer = current_item.streamdetails.buffer
+    audio_buffer.eof = False
+    ramp = _ramp(200)
+
+    def _source() -> Iterable[bytes]:
+        for second, chunk in enumerate(ramp):
+            if second == 30:
+                audio_buffer.eof = True
+            yield chunk
+
+    read_at, handed_on, tail = await _play_out(audio, current_item, _source())
+
+    # while the source was filling every second went straight on
+    assert read_at[:30] == list(range(1, 31))
+    # and from the moment it was complete never more than two were read for one handed on
+    _assert_flows(read_at)
+    assert len(tail) == 8 * _SINGLE_PCM.pcm_sample_size
+    assert handed_on + tail == b"".join(ramp)
+
+
+async def test_an_end_moved_close_while_the_tail_builds_up_holds_what_is_in_hand() -> None:
+    """Once no more than the window is left nothing more leaves, whatever was built up."""
+    audio, current_item = _single_boundary([], duration=200)
+    audio_buffer = current_item.streamdetails.buffer
+    audio_buffer.eof = False
+    ramp = _ramp(200)
+
+    def _source() -> Iterable[bytes]:
+        for second, chunk in enumerate(ramp):
+            if second == 30:
+                audio_buffer.eof = True
+            if second == 40:
+                # 40 s are read; the client moves the end to 2 s from there
+                current_item.extra_attributes["end_position"] = 42.0
+            if second >= current_item.extra_attributes.get("end_position", 200):
+                return
+            yield chunk
+
+    read_at, handed_on, tail = await _play_out(audio, current_item, _source())
+
+    # 10 s into building up the 8 s window: 5 s are held, 2 s are still to come
+    assert read_at[-1] == 40
+    assert len(tail) == 7 * _SINGLE_PCM.pcm_sample_size
+    assert handed_on + tail == b"".join(ramp[:42])

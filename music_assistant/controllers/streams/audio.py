@@ -218,6 +218,11 @@ CROSSFADE_HANDOFF_WAIT = 30.0
 # lead for the fade, and a source that never shows up loses only the fade.
 FADE_SOURCE_WAIT = 5.0
 
+# Share of the audio a single-item stream reads that it keeps back while the tail it
+# holds for its fade builds up; the rest is handed on. A tuning value: the higher, the
+# sooner the window is full and the slower audio leaves while it builds.
+TAIL_HOLD_BUILD_SHARE = 0.5
+
 # Chunk size for the realtime AudioSource path; small enough to keep ffmpeg→consumer
 # latency below ~50 ms while still amortising per-chunk overhead.
 AUDIO_SOURCE_CHUNK_SECONDS = 0.02
@@ -2026,7 +2031,8 @@ class StreamsAudio:
 
         # Passes chunks straight through until the source has delivered the whole
         # item (the hold target is zero until buffer EOF); from that moment it
-        # collects the item's last window once, as the boundary's fade material.
+        # collects the item's last window once, as the boundary's fade material,
+        # from a share of what it reads while the rest keeps leaving.
         tail_window = bytearray()
         bytes_written = 0
         # calculate crossfade buffer size (the ceiling; a slow source's boundary
@@ -2099,6 +2105,8 @@ class StreamsAudio:
         total_chunks_received = 0
         # the source's bytes, which place the held tail in song seconds
         received_bytes = 0
+        # how much of the tail's window is built up
+        hold_built = 0
         playback_speed = cast("float", queue_item.extra_attributes.get("playback_speed", 1.0))
         async for chunk in self.get_queue_item_stream(
             queue_item,
@@ -2112,8 +2120,41 @@ class StreamsAudio:
             total_chunks_received += 1
             received_bytes += len(chunk)
             tail_window.extend(chunk)
+            chunk_size = len(chunk)
             del chunk
             hold_target = tail_hold_target(queue_item, crossfade_buffer_size, pcm_format)
+            if hold_built < hold_target:
+                # Reading the whole window before any more audio leaves stops the stream
+                # for as long as that takes: seconds through a slow filter (loudnorm), and
+                # a player gives up on a response that stays silent that long. So the
+                # window is built up from a share of what arrives while the rest goes on,
+                # and from all of it once no more than the window is left of the item: at
+                # its end the tail is the one it would be with the whole window held at
+                # once. What is left counts in whole seconds, rounded down (holding a
+                # little early costs nothing), and at least a second is held, so that only
+                # whole slices leave below, as they do with a full window.
+                details = queue_item.streamdetails
+                assert details is not None  # for type checking: a hold needs a buffer
+                audio_buffer = cast("AudioBuffer", details.buffer)
+                stop = audio_buffer.first_buffered_chunk + audio_buffer.duration_available
+                if (end := get_end_position(queue_item)) is not None:
+                    stop = min(stop, end)
+                position = (
+                    discard_position + received_bytes / pcm_format.pcm_sample_size * playback_speed
+                )
+                left = int(max(0.0, stop - position) / playback_speed)
+                hold_built = min(
+                    hold_target,
+                    max(
+                        hold_built + int(chunk_size * TAIL_HOLD_BUILD_SHARE),
+                        hold_target - left * pcm_format.pcm_sample_size,
+                        pcm_format.pcm_sample_size,
+                    ),
+                )
+            else:
+                # the window is full, or its target came down (a moved end, an error)
+                hold_built = hold_target
+            hold_target = hold_built // frame_size * frame_size
             if hold_target and hold_began_at is None:
                 hold_began_at = asyncio.get_event_loop().time()
             if len(tail_window) <= hold_target:

@@ -600,7 +600,12 @@ async def test_smartfade_realtime_current_item_fades_once_its_source_is_done(
         seconds_streamed=0,
         uri="test://current",
         buffer=SimpleNamespace(
-            eof=True, cancelled=False, has_error=False, max_size_seconds=300, duration_available=0.0
+            eof=True,
+            cancelled=False,
+            has_error=False,
+            max_size_seconds=300,
+            first_buffered_chunk=0,
+            duration_available=16.0,
         ),
         is_realtime=True,
     )
@@ -724,7 +729,8 @@ async def _run_smartfade_boundary(
                 cancelled=False,
                 has_error=False,
                 max_size_seconds=300,
-                duration_available=0.0,
+                first_buffered_chunk=0,
+                duration_available=16.0,
             ),
             is_realtime=True,
         ),
@@ -814,7 +820,12 @@ async def test_the_live_post_handover_streams_into_the_next_request(
         seconds_streamed=0,
         uri="test://current",
         buffer=SimpleNamespace(
-            eof=True, cancelled=False, has_error=False, max_size_seconds=300, duration_available=0.0
+            eof=True,
+            cancelled=False,
+            has_error=False,
+            max_size_seconds=300,
+            first_buffered_chunk=0,
+            duration_available=16.0,
         ),
         is_realtime=True,
     )
@@ -1244,7 +1255,15 @@ async def test_smartfade_unaligned_chunks_still_crossfade(
         seek_position=0,
         seconds_streamed=0,
         uri="test://current",
-        buffer=SimpleNamespace(eof=True, cancelled=False, has_error=False, max_size_seconds=300),
+        # the source is done: it delivered 18 s
+        buffer=SimpleNamespace(
+            eof=True,
+            cancelled=False,
+            has_error=False,
+            max_size_seconds=300,
+            first_buffered_chunk=0,
+            duration_available=18.0,
+        ),
         is_realtime=False,
     )
     next_details = SimpleNamespace(
@@ -1333,7 +1352,15 @@ async def test_smartfade_short_remainder_still_crossfades(
         seek_position=146,
         seconds_streamed=0,
         uri="test://current",
-        buffer=SimpleNamespace(eof=True, cancelled=False, has_error=False, max_size_seconds=300),
+        # the source is done, with the whole track
+        buffer=SimpleNamespace(
+            eof=True,
+            cancelled=False,
+            has_error=False,
+            max_size_seconds=300,
+            first_buffered_chunk=0,
+            duration_available=180.0,
+        ),
         is_realtime=False,
     )
     next_details = SimpleNamespace(
@@ -1427,7 +1454,15 @@ async def test_smartfade_stub_remainder_does_not_crossfade(
         seek_position=176,
         seconds_streamed=0,
         uri="test://current",
-        buffer=SimpleNamespace(eof=True, cancelled=False, has_error=False, max_size_seconds=300),
+        # the source is done: its audio ends 2 s after the seek
+        buffer=SimpleNamespace(
+            eof=True,
+            cancelled=False,
+            has_error=False,
+            max_size_seconds=300,
+            first_buffered_chunk=0,
+            duration_available=178.0,
+        ),
         is_realtime=False,
     )
     next_details = SimpleNamespace(
