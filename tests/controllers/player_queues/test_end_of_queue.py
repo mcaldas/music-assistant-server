@@ -327,6 +327,7 @@ def _queue_stub() -> PlayerQueue:
             display_name="Q1",
             next_item=None,
             flow_mode=False,
+            active=True,
             extra_attributes={},
         ),
     )
@@ -550,6 +551,17 @@ def test_a_stop_music_assistant_made_is_not_published(ours: str) -> None:
     PlaybackTrackerMixin._handle_end_of_queue(tracker, queue, prev_state, new_state)
 
     assert "playback_stalled_at" not in queue.extra_attributes
+    tracker.logger.warning.assert_not_called()
+
+
+def test_a_player_taken_by_another_source_is_not_published() -> None:
+    """A queue that is no longer its player's source did not stall: something else plays."""
+    tracker, queue, prev_state, new_state = _item_end()
+    queue.active = False
+
+    PlaybackTrackerMixin._handle_end_of_queue(tracker, queue, prev_state, new_state)
+
+    assert not queue.extra_attributes
     tracker.logger.warning.assert_not_called()
 
 

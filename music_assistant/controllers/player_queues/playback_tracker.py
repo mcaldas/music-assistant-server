@@ -650,6 +650,8 @@ class PlaybackTrackerMixin(_PlayerQueuesBase):
         if (
             item is None
             or next_item is None
+            # the player was taken by another source, so the queue was left, not stuck
+            or not queue.active
             # a pause that ran out is somebody's pause, and a flow stream restarts by itself
             or prev_state["state"] != PlaybackState.PLAYING
             or queue.flow_mode
