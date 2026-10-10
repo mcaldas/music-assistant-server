@@ -100,6 +100,30 @@ async def test_relaxed_player_is_served_without_a_window_check() -> None:
     ctrl.mass.player_queues.is_current_window_item.assert_not_called()
 
 
+@pytest.mark.parametrize(
+    ("method", "available", "warnings"),
+    [("GET", False, 1), ("HEAD", False, 0), ("GET", True, 0)],
+    ids=["get_unavailable", "probe_unavailable", "get_available"],
+)
+async def test_a_get_for_an_unavailable_item_is_logged(
+    method: str, available: bool, warnings: int
+) -> None:
+    """A player fetching the audio of an item the queue steps over must not pass unseen."""
+    ctrl = _make_controller(strict_player=True, item_in_window=True)
+    queue_item = ctrl.mass.player_queues.get_item.return_value
+    queue_item.available = available
+    queue_item.name = "Track"
+    request = _make_request()
+    request.method = method
+
+    with pytest.raises(web.HTTPNotFound):
+        await StreamsController.serve_queue_item_stream(ctrl, request)
+
+    assert ctrl.logger.warning.call_count == warnings
+    if warnings:
+        assert "Track" in ctrl.logger.warning.call_args.args
+
+
 async def test_item_falling_out_of_the_window_during_setup_is_refused() -> None:
     """A queue edit landing while the stream is being set up must still deny the item."""
     ctrl = _make_controller(strict_player=True, item_in_window=True)

@@ -742,6 +742,14 @@ class StreamsController(CoreController):
         # (its refresh signal can get lost): refusing it makes the player re-read the
         # queue, where serving it would silently play a track the user moved away
         self._raise_if_stale_item_request(player, queue_id, queue_item)
+        if request.method == "GET" and not queue_item.available:
+            # the queue steps over this item while a player fetches its audio: the two
+            # disagree about what plays, and nothing else would show it
+            self.logger.warning(
+                "%s asked for the audio of %s, which the queue has marked unavailable",
+                player.display_name,
+                queue_item.name,
+            )
 
         is_audio_source = (
             queue_item.media_item is not None

@@ -958,6 +958,28 @@ async def test_a_later_failure_on_another_item_is_reported(
     assert caplog.text.count("ERROR_LSE") == 2
 
 
+async def test_another_failure_under_the_same_report_id_is_reported(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A report id stands for one playback, which can fail a second time in another way."""
+    player = _player_for_error_reports()
+    cloud_queue = _make_cloud_queue()
+    failed_again = {
+        **_error_report(),
+        "error": {"type": "playback", "status": "ERROR_PLAYBACK_FAILED"},
+    }
+    request = MagicMock()
+
+    with caplog.at_level(logging.WARNING, logger="test.sonos.cloud_queue"):
+        request.json = AsyncMock(return_value={"items": [_error_report()]})
+        await cloud_queue._handle_sonos_queue_time_played(player, request)
+        request.json = AsyncMock(return_value={"items": [failed_again]})
+        await cloud_queue._handle_sonos_queue_time_played(player, request)
+
+    assert caplog.text.count("could not play") == 2
+    assert "ERROR_PLAYBACK_FAILED" in caplog.text
+
+
 @pytest.mark.parametrize("status", [404, "404"], ids=["int", "str"])
 async def test_a_track_our_stream_server_refused_is_not_reported_as_a_failure(
     caplog: pytest.LogCaptureFixture, status: int | str
