@@ -6,6 +6,7 @@ import asyncio
 import logging
 from collections import deque
 from collections.abc import AsyncGenerator
+from itertools import pairwise
 from types import SimpleNamespace
 from typing import Any, cast
 from unittest.mock import AsyncMock, MagicMock
@@ -27,6 +28,7 @@ from music_assistant.controllers.streams.smart_fades.planner.requested import (
     RequestedTransitionPlanner,
     TransitionRequest,
 )
+from music_assistant.helpers.json import json_loads
 from music_assistant.models.audio_analysis import AudioAnalysisData
 
 TEST_PCM_FORMAT = AudioFormat(
@@ -775,6 +777,20 @@ def test_report_transition_publishes_the_smart_plan(monkeypatch: pytest.MonkeyPa
     assert report["transition_mix_start_elapsed"] == pytest.approx(
         report["transition_mix_start"] - ramp, abs=5e-3
     )
+    # the ramp itself: from the song's own clock to the mix start, a point per change of tempo
+    points = json_loads(report["transition_tempo_ramp"])
+    assert len(points) > 2
+    # the plan's last step is on the mix start itself: one point, not two
+    assert all(
+        later[0] > earlier[0] and later[1] > earlier[1] for earlier, later in pairwise(points)
+    )
+    assert points[0][0] == points[0][1]
+    assert points[-1][0] == pytest.approx(report["transition_mix_start"], abs=5e-3)
+    assert points[-1][1] == report["transition_mix_start_elapsed"]
+    for song, elapsed in points:
+        assert elapsed == pytest.approx(
+            song - plan.tempo_plan.savings_until(song - 195.0), abs=2e-3
+        )
     mass.player_queues.signal_update.assert_called_once_with("queue-1")
 
 
@@ -804,6 +820,7 @@ def test_report_transition_places_a_standard_fade_at_the_held_tail(
     assert report["transition_mix_start"] == pytest.approx(299.6 - STANDARD_CROSSFADE_DURATION)
     # nothing is stretched, so the stream reaches the mix when the song does
     assert report["transition_mix_start_elapsed"] == report["transition_mix_start"]
+    assert "transition_tempo_ramp" not in report
     assert report["transition_tempo_ratio"] == 1.0
     assert not {"transition_tier", "transition_strategy"} & report.keys()
 

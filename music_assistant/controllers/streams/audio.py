@@ -153,6 +153,7 @@ from music_assistant.helpers.ffmpeg import (
     get_ffmpeg_overlay_stream,
     get_ffmpeg_stream,
 )
+from music_assistant.helpers.json import json_dumps
 from music_assistant.helpers.named_pipe import read_named_pipe
 from music_assistant.helpers.playlists import (
     HLS_CONTENT_TYPES,
@@ -4680,7 +4681,10 @@ class StreamsAudio:
         outgoing deck's final tempo ratio. ``transition_mix_start_elapsed`` is the item's
         elapsed time at which the mix starts: a tempo ramp ahead of the overlap makes the
         stream reach the song's mix start earlier or later than the song's own clock, so a
-        client that times the incoming item needs this one.
+        client that times the incoming item needs this one. ``transition_tempo_ramp`` is
+        that ramp, for a client that follows the outgoing song through it: JSON text of
+        ``[song second, elapsed second]`` points from where the stretch starts to the mix
+        start, the song running straight between two points.
 
         A client's request for the boundary is used up here, and ``transition_request`` says
         what came of it: applied, fallback (with ``transition_request_reason``) or ignored.
@@ -4719,10 +4723,12 @@ class StreamsAudio:
             timing = smart_fade.timing_info
             ratio = 1.0
             mix_end: float | None = None
+            ramp: list[tuple[float, float]] = []
             if isinstance(smart_fade, SmartCrossFade) and smart_fade.plan is not None:
                 plan = smart_fade.plan
                 if plan.tempo_plan.steps:
                     ratio = plan.tempo_plan.steps[-1][1]
+                    ramp = plan.tempo_plan.ramp_points(timing.pre_crossfade_duration)
                 if tail_start is not None:
                     # the plan's exit is measured from the start of the held tail
                     mix_end = tail_start + plan.fade_out_window
@@ -4746,6 +4752,13 @@ class StreamsAudio:
                 attrs["transition_mix_start_elapsed"] = round(
                     tail_start + timing.pre_crossfade_duration, 3
                 )
+                if ramp:
+                    attrs["transition_tempo_ramp"] = json_dumps(
+                        [
+                            [round(tail_start + song, 3), round(tail_start + rendered, 3)]
+                            for song, rendered in ramp
+                        ]
+                    )
         self.mass.player_queues.signal_update(queue_id)
 
     def _drop_transition_report(self, queue_item: QueueItem) -> None:
