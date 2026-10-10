@@ -4995,6 +4995,15 @@ class StreamsAudio:
             return self.get_multi_file_stream(streamdetails, seek_position), 0, extra_input_args
         # regular single file/url stream
         assert isinstance(streamdetails.path, str)  # for type checking
+        if stream_type == StreamType.ENCRYPTED_HTTP and not seek_position:
+            # An encrypted track is a fragmented MP4. On a seekable connection ffmpeg reads
+            # every fragment's header before the first packet to build an index, each through
+            # a connection of its own: about 0.3 s per ten seconds of track with nothing to
+            # play, at every start that has no audio prepared. Read from its start the file
+            # needs no index, and the packets are the same. The connection stays seekable
+            # (unlike with -seekable 0), so a download that breaks is resumed where it broke
+            # instead of from the first byte.
+            extra_input_args += ["-fflags", "+ignidx"]
         return streamdetails.path, seek_position, extra_input_args
 
     async def _iter_audio_source_pcm(
