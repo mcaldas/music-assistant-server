@@ -234,6 +234,20 @@ async def test_an_unknown_item_is_answered_around_a_playing_item_that_is_unavail
     assert [x.queue_item_id for x in window.items] == ["track1", "track2", "track3", "track4"]
 
 
+async def test_an_unknown_item_is_not_answered_with_an_unavailable_item_nothing_plays() -> None:
+    """Test an answer built around the buffered item, for want of a playing one, checks its flag."""
+    items = [_make_queue_item(f"track{i}") for i in range(5)]
+    items[2].available = False
+    player, queues = _make_player(items)
+    # a start at track2 was asked for and nothing plays yet
+    queues.queue.current_index = None
+    queues.queue.index_in_buffer = 2
+
+    window = await player.build_cloud_queue_window("gone")
+
+    assert [x.queue_item_id for x in window.items] == ["track1", "track3", "track4"]
+
+
 @pytest.mark.parametrize("item_id", [None, ""], ids=["omitted", "empty"])
 async def test_an_unavailable_head_is_left_out_of_a_window_without_an_item_id(
     item_id: str | None,
