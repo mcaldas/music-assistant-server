@@ -2030,7 +2030,7 @@ class PlayerQueuesController(QueueLoaderMixin, PlaybackTrackerMixin, StreamFeede
 
         Players that play upcoming tracks from a cached copy of the queue use this to
         verify a requested item is still the previous, current, buffered or expected
-        next track.
+        next track. An unavailable item passes only while it is the current one.
 
         :param queue_id: The queue to check against.
         :param queue_item_id: The queue item id the player asked for.
@@ -2040,6 +2040,11 @@ class PlayerQueuesController(QueueLoaderMixin, PlaybackTrackerMixin, StreamFeede
             return False
         item_index = self.index_by_id(queue_id, queue_item_id)
         if item_index is None:
+            return False
+        item = self._queue_data[queue_id].items[item_index]
+        if not item.available and item_index != queue.current_index:
+            # the queue stepped over this item, so its place beside the playhead says
+            # nothing; only a player that is already on it may load it again
             return False
         for center in (queue.current_index, queue.index_in_buffer):
             if center is None:

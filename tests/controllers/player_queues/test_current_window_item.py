@@ -217,3 +217,28 @@ def test_restarting_at_another_item_drops_the_previous_look_ahead() -> None:
     ctrl._queue_data["q1"].last_served_item_id = None  # what play_index does on a new load
 
     assert not ctrl.is_current_window_item("q1", _item_id_at(ctrl, 3))
+
+
+def test_a_skipped_track_behind_the_fade_target_is_refused() -> None:
+    """
+    Refuse a track the queue stepped over, also when it sits right before the buffered one.
+
+    The fade out of the playing track was mixed into the first playable track after the
+    skipped one, so the buffered index ran past it; a player that cached the skipped
+    track as next and still asks for it must be sent back to the queue.
+    """
+    ctrl = _controller(current_index=1, index_in_buffer=3)
+    ctrl._queue_data["q1"].items[2].available = False
+    ctrl._queue_data["q1"].last_served_item_id = _item_id_at(ctrl, 1)
+
+    assert not ctrl.is_current_window_item("q1", _item_id_at(ctrl, 2))
+    assert ctrl.is_current_window_item("q1", _item_id_at(ctrl, 1))
+    assert ctrl.is_current_window_item("q1", _item_id_at(ctrl, 3))
+
+
+def test_an_unavailable_track_the_player_is_on_is_still_served() -> None:
+    """A track flagged while the player is on it may still be loaded again."""
+    ctrl = _controller(current_index=2, index_in_buffer=2)
+    ctrl._queue_data["q1"].items[2].available = False
+
+    assert ctrl.is_current_window_item("q1", _item_id_at(ctrl, 2))
