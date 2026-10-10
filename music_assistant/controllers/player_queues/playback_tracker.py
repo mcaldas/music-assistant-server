@@ -17,6 +17,7 @@ from contextlib import suppress
 from typing import TYPE_CHECKING
 
 from music_assistant_models.enums import (
+    CrossfadeMode,
     EventType,
     MediaType,
     PlaybackState,
@@ -674,7 +675,13 @@ class PlaybackTrackerMixin(_PlayerQueuesBase):
         if not end or prev_state["last_playing_elapsed_time"] < int(end) - 5:
             # it went idle part-way through the item: a pause or a stop on the device
             return
-        fade_mixed = attributes.get("transition_next_item_id") == next_item.queue_item_id
+        # an item names its next one at every boundary that was locked, fade or no fade
+        mode = attributes.get("transition_mode")
+        fade_mixed = (
+            attributes.get("transition_next_item_id") == next_item.queue_item_id
+            and mode is not None
+            and mode != CrossfadeMode.DISABLED
+        )
         self.logger.warning(
             "%s went idle at the end of %s without starting %s, the next item in its queue (%s)",
             queue.display_name,

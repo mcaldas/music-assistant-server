@@ -507,13 +507,33 @@ def test_an_item_that_ended_with_a_next_one_never_fetched_is_published() -> None
 def test_an_item_that_ends_in_its_fade_counts_as_ended() -> None:
     """An item mixed into the next one is over where that mix ends, short of its duration."""
     tracker, queue, prev_state, new_state = _item_end(
-        last_playing=198, transition_mix_end=200.0, transition_next_item_id="next"
+        last_playing=198,
+        transition_mix_end=200.0,
+        transition_next_item_id="next",
+        transition_mode="standard_crossfade",
     )
 
     PlaybackTrackerMixin._handle_end_of_queue(tracker, queue, prev_state, new_state)
 
     assert queue.extra_attributes["playback_stalled_next_item_id"] == "next"
     assert "already mixed" in _stall_warning(tracker)
+
+
+@pytest.mark.parametrize(
+    "report",
+    [{"transition_mode": "disabled"}, {}],
+    ids=["played_without_a_fade", "only_planned"],
+)
+def test_a_boundary_that_was_locked_without_a_fade_is_not_called_mixed(
+    report: dict[str, str],
+) -> None:
+    """An item names its next one at every locked boundary, with or without a fade into it."""
+    tracker, queue, prev_state, new_state = _item_end(transition_next_item_id="next", **report)
+
+    PlaybackTrackerMixin._handle_end_of_queue(tracker, queue, prev_state, new_state)
+
+    assert queue.extra_attributes["playback_stalled_next_item_id"] == "next"
+    assert "no fade" in _stall_warning(tracker)
 
 
 def test_a_stop_part_way_through_a_track_is_not_published() -> None:
