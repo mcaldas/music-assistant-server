@@ -565,6 +565,39 @@ def test_a_player_taken_by_another_source_is_not_published() -> None:
     tracker.logger.warning.assert_not_called()
 
 
+async def test_a_start_of_our_own_that_has_not_come_up_yet_is_not_published() -> None:
+    """A next in an item's last seconds is no stall while the player still starts the new item."""
+    ctrl, queue = _controller()
+    ctrl.on_player_update = MethodType(  # type: ignore[method-assign]
+        PlayerQueuesController.on_player_update, ctrl
+    )
+    ctrl._update_current_index_from_player = Mock(return_value=True)  # type: ignore[method-assign]
+    ctrl._get_output_player_ids = Mock(return_value=set())  # type: ignore[method-assign]
+    ctrl._handle_playback_progress_report = Mock()  # type: ignore[method-assign]
+    ctrl.is_smart_shuffle_active = Mock(return_value=False)  # type: ignore[method-assign]
+    ctrl._get_resume_position = AsyncMock(return_value=0)  # type: ignore[method-assign]
+    ctrl._load_item = AsyncMock()  # type: ignore[method-assign]
+    ctrl.player_media_from_queue_item = AsyncMock()  # type: ignore[method-assign]
+    player = ctrl.mass.players.get_player.return_value
+    player.player_id, player.extra_data, player.state.active_source = QUEUE_ID, {}, None
+    # the player is two seconds from the end of the first item, with the last one queued
+    queue_data = ctrl._queue_data[QUEUE_ID]
+    first, last = queue_data.items
+    queue.current_index, queue.current_item, queue.next_item = 0, first, last
+    queue.elapsed_time, queue.elapsed_time_last_updated = 98, time.time()
+    queue_data.session_id, queue_data.last_served_item_id = "session", "first"
+    player.state.playback_state = PlaybackState.PLAYING
+    ctrl.on_player_update(player, {})
+
+    # the old stream is gone and the new item has not started when the play action returns
+    player.state.playback_state = PlaybackState.IDLE
+    await PlayerQueuesController.play_index(ctrl, QUEUE_ID, 1)
+
+    assert queue.current_item is last
+    assert "playback_stalled_at" not in queue.extra_attributes
+    ctrl.logger.warning.assert_not_called()
+
+
 @pytest.mark.parametrize("was", ["paused", "a_flow"])
 def test_a_paused_queue_or_a_flow_going_idle_is_not_published(was: str) -> None:
     """A pause that ran out is somebody's pause, and a flow stream restarts by itself."""

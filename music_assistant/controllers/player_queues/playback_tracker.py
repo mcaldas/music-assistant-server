@@ -658,7 +658,10 @@ class PlaybackTrackerMixin(_PlayerQueuesBase):
             # a stop, a next or a play of our own (a stop that went through ended the session)
             or queue_data.session_id is None
             or queue.extra_attributes.get(ATTR_PLAY_ACTION_IN_PROGRESS)
-            # the player asked for the next item's audio, so it is changing tracks
+            # the player was last served something else than the item that ended: the next
+            # item, so it is changing tracks, or nothing yet since a play or next of our own
+            or queue_data.last_served_item_id != item.queue_item_id
+            # on repeat one the next item is the same one, served again or not
             or queue_data.last_served_item_id == next_item.queue_item_id
         ):
             return
