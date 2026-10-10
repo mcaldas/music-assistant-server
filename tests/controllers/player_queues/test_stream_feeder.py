@@ -832,6 +832,36 @@ async def test_a_preload_counts_the_seconds_a_failed_lookup_took(
     assert mass.call_later.call_args.args[2] is next_item
 
 
+async def test_a_preload_asks_again_for_a_provider_at_its_stream_limit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A provider at its stream limit is asked again, and with no time left the error stands."""
+    controller, _next_item, mass = _controller_with_playing_item()
+    queue = cast("Any", controller.get("queue-1"))
+    provider = MagicMock(spec=MusicProvider)
+    provider.max_concurrent_streams = 1
+    provider.name = "Limited"
+    provider.instance_id = "limited--1"
+    load = AsyncMock(side_effect=ProviderStreamLimitError(provider, STREAM_SLOT_WAIT_TIMEOUT))
+    controller.load_next_queue_item = load  # type: ignore[method-assign]
+
+    async def _play_on(seconds: float) -> None:
+        queue.corrected_elapsed_time += seconds
+
+    monkeypatch.setattr(asyncio, "sleep", _play_on)
+
+    controller._preload_next_item("queue-1", "current")
+    with pytest.raises(ProviderStreamLimitError):
+        await mass.create_task.call_args.args[0]
+
+    # a load that may step over leaves such an item alone too, so nothing is handed over
+    assert [awaited.kwargs for awaited in load.await_args_list] == [
+        *[{"speculative": True}] * 5,
+        {"speculative": False},
+    ]
+    mass.call_later.assert_not_called()
+
+
 async def test_a_preload_in_flow_mode_leaves_stepping_over_to_the_flow(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

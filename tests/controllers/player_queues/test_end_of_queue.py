@@ -16,8 +16,10 @@ from unittest.mock import AsyncMock, MagicMock, Mock
 import pytest
 from music_assistant_models.enums import MediaType, PlaybackState, QueueOption
 from music_assistant_models.errors import PlayerUnavailableError
+from music_assistant_models.media_items import AudioFormat
 from music_assistant_models.player_queue import PlayerQueue
 from music_assistant_models.queue_item import QueueItem
+from music_assistant_models.streamdetails import StreamDetails
 
 from music_assistant.constants import ATTR_PLAY_ACTION_IN_PROGRESS
 from music_assistant.controllers.player_queues import PlayerQueuesController
@@ -517,6 +519,28 @@ def test_an_item_that_ends_in_its_fade_counts_as_ended() -> None:
 
     assert queue.extra_attributes["playback_stalled_next_item_id"] == "next"
     assert "already mixed" in _stall_warning(tracker)
+
+
+@pytest.mark.parametrize(
+    ("end_position", "stream_duration"),
+    [(100.0, 180), (None, 100)],
+    ids=["a_clients_end_position", "the_duration_of_its_stream"],
+)
+def test_an_item_without_a_fade_ends_where_its_audio_does(
+    end_position: float | None, stream_duration: int
+) -> None:
+    """A client's end position comes before the stream's duration, and that before the listed one."""
+    attributes = {} if end_position is None else {"end_position": end_position}
+    tracker, queue, prev_state, new_state = _item_end(last_playing=98, **attributes)
+    ended = prev_state["current_item"]
+    assert ended is not None
+    ended.streamdetails = StreamDetails(
+        provider="test", item_id="ended", audio_format=AudioFormat(), duration=stream_duration
+    )
+
+    PlaybackTrackerMixin._handle_end_of_queue(tracker, queue, prev_state, new_state)
+
+    assert queue.extra_attributes["playback_stalled_item_id"] == "ended"
 
 
 @pytest.mark.parametrize(
