@@ -211,6 +211,43 @@ async def test_unavailable_items_are_left_out() -> None:
     assert [x.queue_item_id for x in window.items] == ["track1", "track2"]
 
 
+async def test_the_item_asked_about_is_listed_even_when_unavailable() -> None:
+    """Test the item the speaker is on stays in its window after it was marked unplayable."""
+    items = [_make_queue_item(f"track{i}") for i in range(5)]
+    items[2].available = False
+    player, _ = _make_player(items, current_index=2)
+
+    window = await player.build_cloud_queue_window("track2")
+
+    # without its centre the window would give the speaker nothing to follow track2 with
+    assert [x.queue_item_id for x in window.items] == ["track1", "track2", "track3", "track4"]
+
+
+async def test_an_unknown_item_is_answered_around_a_playing_item_that_is_unavailable() -> None:
+    """Test the playing item an answer falls back to is listed whatever its flag."""
+    items = [_make_queue_item(f"track{i}") for i in range(5)]
+    items[2].available = False
+    player, _ = _make_player(items, current_index=2)
+
+    window = await player.build_cloud_queue_window("gone")
+
+    assert [x.queue_item_id for x in window.items] == ["track1", "track2", "track3", "track4"]
+
+
+@pytest.mark.parametrize("item_id", [None, ""], ids=["omitted", "empty"])
+async def test_an_unavailable_head_is_left_out_of_a_window_without_an_item_id(
+    item_id: str | None,
+) -> None:
+    """Test a fresh load of the queue is not offered a first item that cannot be played."""
+    items = [_make_queue_item(f"track{i}") for i in range(5)]
+    items[0].available = False
+    player, _ = _make_player(items)
+
+    window = await player.build_cloud_queue_window(item_id)
+
+    assert [x.queue_item_id for x in window.items] == ["track1", "track2", "track3", "track4"]
+
+
 async def test_announcement_is_served_as_a_single_item_queue() -> None:
     """Test an announcement is the only item in the window while it plays."""
     player, _ = _make_player([_make_queue_item("track0")])

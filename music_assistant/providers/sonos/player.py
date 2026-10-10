@@ -710,7 +710,9 @@ class SonosPlayer(Player):
         offset = max(0, center_index - min(PREVIOUS_ITEMS, max_previous))
         for idx in range(offset, center_index + 1):
             queue_item = self.mass.player_queues.get_item(queue_id, idx)
-            if queue_item and queue_item.available:
+            # the centre of a window the speaker named an item for is listed whatever its
+            # flag: unavailable means it cannot be started, and the speaker is already on it
+            if queue_item and (queue_item.available or (item_id and idx == center_index)):
                 items.append(await self._player_media_for_speaker(queue_item))
 
         # get_next_item accounts for repeat mode, so this is the item that will really
