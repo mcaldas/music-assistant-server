@@ -129,6 +129,39 @@ class TempoPlan:
             savings += (seg_end - ts) * (1.0 - 1.0 / ratio)
         return savings
 
+    def ramp_points(self, rendered_end: float) -> list[tuple[float, float]]:
+        """
+        Where the stretch puts input time on the rendered stream, as (input, rendered) seconds.
+
+        The first point is where the stretch starts, the last one is at ``rendered_end``,
+        and the stream runs straight between two points. Empty when nothing is stretched
+        ahead of ``rendered_end``.
+
+        :param rendered_end: Rendered-stream position (seconds) of the last point.
+        """
+        if not self.steps or rendered_end <= 0.0:
+            return []
+        points = [(0.0, 0.0)]
+        # rubberband runs at the first step's ratio from t=0 (see savings_until)
+        segments = [(0.0, self.steps[0][1]), *self.steps]
+        for i, (ts, ratio) in enumerate(segments):
+            rendered = points[-1][1]
+            if i + 1 < len(segments):
+                end = segments[i + 1][0]
+                if end <= ts:
+                    continue
+                # a step within 2 ms of the end is the end: two points that close would
+                # read as one once rounded, and nothing can be interpolated between them
+                if rendered + (end - ts) / ratio < rendered_end - 0.002:
+                    points.append((end, rendered + (end - ts) / ratio))
+                    continue
+            points.append((ts + (rendered_end - rendered) * ratio, rendered_end))
+            break
+        # at normal speed a point adds nothing: the last such one is where the stretch starts
+        while len(points) > 1 and abs(points[1][0] - points[1][1]) < 1e-6:
+            del points[0]
+        return points if len(points) > 1 else []
+
 
 @dataclass(slots=True)
 class ShelfSchedule:
