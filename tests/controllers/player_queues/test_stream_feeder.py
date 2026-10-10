@@ -17,7 +17,10 @@ from music_assistant_models.queue_item import QueueItem
 
 from music_assistant.controllers.player_queues import PlayerQueuesController
 from music_assistant.controllers.player_queues.state import PlayerQueueData
-from music_assistant.controllers.player_queues.stream_feeder import PREPARE_AFTER_PART_DELAY
+from music_assistant.controllers.player_queues.stream_feeder import (
+    PRELOAD_RETRY_DELAY,
+    PREPARE_AFTER_PART_DELAY,
+)
 from music_assistant.controllers.streams.constants import STREAM_SLOT_WAIT_TIMEOUT
 from music_assistant.models.music_provider import MusicProvider, ProviderStreamLimitError
 
@@ -729,6 +732,115 @@ async def test_a_repeated_prepare_joins_a_preparation_that_skipped_ahead() -> No
     preparation.cancel()
     with pytest.raises(asyncio.CancelledError):
         await preparation
+
+
+def _controller_with_playing_item() -> tuple[PlayerQueuesController, SimpleNamespace, MagicMock]:
+    """Build a controller whose streamed item is the playing one, three minutes long."""
+    controller, next_item, mass = _controller_with_next_item()
+    _streamed_item(controller).duration = 180
+    queue = cast("Any", controller.get("queue-1"))
+    queue.flow_mode = False
+    queue.corrected_elapsed_time = 0
+    return controller, next_item, mass
+
+
+async def test_a_preload_whose_provider_did_not_answer_asks_again(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A next item whose provider could not be asked is looked up again and handed over."""
+    controller, next_item, mass = _controller_with_playing_item()
+    load = AsyncMock(side_effect=[AudioError("offline"), next_item])
+    controller.load_next_queue_item = load  # type: ignore[method-assign]
+    sleep = AsyncMock()
+    monkeypatch.setattr(asyncio, "sleep", sleep)
+
+    controller._preload_next_item("queue-1", "current")
+    await mass.create_task.call_args.args[0]
+
+    assert [awaited.kwargs for awaited in load.await_args_list] == [{"speculative": True}] * 2
+    sleep.assert_awaited_once_with(PRELOAD_RETRY_DELAY)
+    assert mass.call_later.call_args.args[2] is next_item
+
+
+@pytest.mark.parametrize(
+    ("duration", "last_attempt_at"),
+    [(180, 150), (165, 140)],
+    ids=["30_s_before_the_end", "not_sooner_than_the_first_wait"],
+)
+async def test_a_preload_takes_todays_way_when_the_playing_item_is_nearly_over(
+    monkeypatch: pytest.MonkeyPatch, duration: int, last_attempt_at: int
+) -> None:
+    """With too little of the playing item left to ask again, the load may step over."""
+    controller, next_item, mass = _controller_with_playing_item()
+    _streamed_item(controller).duration = duration
+    queue = cast("Any", controller.get("queue-1"))
+
+    async def _load(_queue_id: str, _item_id: str, speculative: bool = False) -> SimpleNamespace:
+        if speculative:
+            raise AudioError("offline")
+        return next_item
+
+    async def _play_on(seconds: float) -> None:
+        queue.corrected_elapsed_time += seconds
+
+    load = AsyncMock(side_effect=_load)
+    controller.load_next_queue_item = load  # type: ignore[method-assign]
+    monkeypatch.setattr(asyncio, "sleep", _play_on)
+
+    controller._preload_next_item("queue-1", "current")
+    await mass.create_task.call_args.args[0]
+
+    # asked at 0, 10, 30, 70 and 130 s, then once more for the item to be stepped over
+    assert [awaited.kwargs for awaited in load.await_args_list] == [
+        *[{"speculative": True}] * 5,
+        {"speculative": False},
+    ]
+    assert queue.corrected_elapsed_time == last_attempt_at
+    assert mass.call_later.call_args.args[2] is next_item
+
+
+async def test_a_preload_in_flow_mode_leaves_stepping_over_to_the_flow(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A flow steps over at its own boundary, so its preload only ever looks ahead."""
+    controller, next_item, mass = _controller_with_playing_item()
+    queue = cast("Any", controller.get("queue-1"))
+    queue.flow_mode = True
+    queue.corrected_elapsed_time = 170
+    load = AsyncMock(side_effect=AudioError("offline"))
+    controller.load_next_queue_item = load  # type: ignore[method-assign]
+
+    async def _flow_moves_on(_seconds: float) -> None:
+        if load.await_count == 3:
+            queue.current_item = next_item
+
+    monkeypatch.setattr(asyncio, "sleep", _flow_moves_on)
+
+    controller._preload_next_item("queue-1", "current")
+    await mass.create_task.call_args.args[0]
+
+    assert [awaited.kwargs for awaited in load.await_args_list] == [{"speculative": True}] * 3
+
+
+async def test_a_preload_stops_when_the_player_has_moved_on(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A preload whose item is no longer the playing one after its wait asks nothing more."""
+    controller, next_item, mass = _controller_with_playing_item()
+    queue = cast("Any", controller.get("queue-1"))
+    load = AsyncMock(side_effect=AudioError("offline"))
+    controller.load_next_queue_item = load  # type: ignore[method-assign]
+
+    async def _move_on(_seconds: float) -> None:
+        queue.current_item = next_item
+
+    monkeypatch.setattr(asyncio, "sleep", _move_on)
+
+    controller._preload_next_item("queue-1", "current")
+    await mass.create_task.call_args.args[0]
+
+    load.assert_awaited_once()
+    mass.call_later.assert_not_called()
 
 
 def _part(
