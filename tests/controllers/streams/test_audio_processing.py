@@ -1760,6 +1760,7 @@ async def test_flow_zero_audio_skip_restores_seek_position(
     build = AsyncMock(
         return_value=SimpleNamespace(
             timing_info=SimpleNamespace(
+                pre_crossfade_duration=0,
                 fadein_trimmed_duration=2,
                 crossfade_duration=8,
             )

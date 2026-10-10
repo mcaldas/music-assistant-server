@@ -4677,10 +4677,14 @@ class StreamsAudio:
         The ``transition_*`` extra attributes describe the planned transition: its mode,
         the smart fade's tier and strategy, where the mix starts and ends in outgoing-song
         seconds, the overlap, where the incoming item enters in its own song seconds and the
-        outgoing deck's final tempo ratio. A client's request for the boundary is used up
-        here, and ``transition_request`` says what came of it: applied, fallback (with
-        ``transition_request_reason``) or ignored. A later call replaces them; a new stream
-        of the item drops them.
+        outgoing deck's final tempo ratio. ``transition_mix_start_elapsed`` is the item's
+        elapsed time at which the mix starts: a tempo ramp ahead of the overlap makes the
+        stream reach the song's mix start earlier or later than the song's own clock, so a
+        client that times the incoming item needs this one.
+
+        A client's request for the boundary is used up here, and ``transition_request`` says
+        what came of it: applied, fallback (with ``transition_request_reason``) or ignored.
+        A later call replaces them; a new stream of the item drops them.
 
         :param queue_id: Queue the item is streamed from.
         :param outgoing: Queue item that is ending.
@@ -4736,6 +4740,11 @@ class StreamsAudio:
                 attrs["transition_mix_end"] = round(mix_end, 3)
                 attrs["transition_mix_start"] = round(
                     mix_end - timing.crossfade_duration * ratio, 3
+                )
+            if tail_start is not None:
+                # the tail is rendered from its start, and its overlap is what follows PRE
+                attrs["transition_mix_start_elapsed"] = round(
+                    tail_start + timing.pre_crossfade_duration, 3
                 )
         self.mass.player_queues.signal_update(queue_id)
 

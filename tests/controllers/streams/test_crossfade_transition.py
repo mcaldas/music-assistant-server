@@ -769,6 +769,12 @@ def test_report_transition_publishes_the_smart_plan(monkeypatch: pytest.MonkeyPa
         round(report["transition_mix_start"] / bar_seconds), abs=0.01
     )
     assert report["transition_tempo_ratio"] == pytest.approx(ratio, abs=1e-4)
+    # on the stream the mix starts where the ramp ahead of it has brought the song's mix start
+    ramp = plan.tempo_plan.savings_until(report["transition_mix_start"] - 195.0)
+    assert abs(ramp) > 0.01
+    assert report["transition_mix_start_elapsed"] == pytest.approx(
+        report["transition_mix_start"] - ramp, abs=5e-3
+    )
     mass.player_queues.signal_update.assert_called_once_with("queue-1")
 
 
@@ -796,6 +802,8 @@ def test_report_transition_places_a_standard_fade_at_the_held_tail(
     assert report["transition_mode"] == "standard_crossfade"
     assert report["transition_mix_end"] == pytest.approx(299.6)
     assert report["transition_mix_start"] == pytest.approx(299.6 - STANDARD_CROSSFADE_DURATION)
+    # nothing is stretched, so the stream reaches the mix when the song does
+    assert report["transition_mix_start_elapsed"] == report["transition_mix_start"]
     assert report["transition_tempo_ratio"] == 1.0
     assert not {"transition_tier", "transition_strategy"} & report.keys()
 
