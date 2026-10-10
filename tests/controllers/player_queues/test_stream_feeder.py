@@ -769,7 +769,7 @@ async def test_a_preload_whose_provider_did_not_answer_asks_again(
     [(180, 150), (165, 140)],
     ids=["30_s_before_the_end", "not_sooner_than_the_first_wait"],
 )
-async def test_a_preload_takes_todays_way_when_the_playing_item_is_nearly_over(
+async def test_a_preload_may_step_over_once_the_playing_item_is_nearly_over(
     monkeypatch: pytest.MonkeyPatch, duration: int, last_attempt_at: int
 ) -> None:
     """With too little of the playing item left to ask again, the load may step over."""
