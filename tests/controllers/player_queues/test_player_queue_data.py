@@ -14,6 +14,7 @@ from music_assistant_models.media_items import (
 from music_assistant_models.player_queue import PlayerQueue
 from music_assistant_models.queue_item import QueueItem
 
+from music_assistant.constants import ATTR_PLAY_ACTION_IN_PROGRESS
 from music_assistant.controllers.player_queues.constants import CACHE_FORMAT_VERSION
 from music_assistant.controllers.player_queues.state import PlayerQueueData
 
@@ -275,6 +276,22 @@ def test_from_cache_reads_legacy_flat_layout() -> None:
         item.uri for item in data.enqueued_media_items
     ]
     assert restored.userid == "user-1"
+
+
+def test_from_cache_drops_a_published_stall() -> None:
+    """A stall published before a restart says nothing about the queue that comes back."""
+    data = PlayerQueueData(queue=_queue())
+    data.queue.extra_attributes.update(
+        {
+            "playback_stalled_at": 100.0,
+            "playback_stalled_item_id": "i1",
+            "playback_stalled_next_item_id": "i2",
+        }
+    )
+
+    restored = PlayerQueueData.from_cache(data.to_cache(), [])
+
+    assert restored.queue.extra_attributes == {ATTR_PLAY_ACTION_IN_PROGRESS: False}
 
 
 def test_cache_significant_ignores_playback_progress() -> None:

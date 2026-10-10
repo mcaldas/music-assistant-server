@@ -27,6 +27,10 @@ if TYPE_CHECKING:
 
 _SortableT = TypeVar("_SortableT", bound=PlaylistPlayableItem)
 
+# Prefix of the queue extra attributes that say an item played to its end and the next one
+# in the queue never started, for API clients. Flat scalars; absent while there is none.
+PLAYBACK_STALLED_PREFIX = "playback_stalled_"
+
 
 class CompareState(TypedDict):
     """
@@ -281,3 +285,10 @@ def space_by_artist(artist_sets: list[set[str]], *, preceding: set[str] | None =
         if not changed:
             break
     return order
+
+
+def clear_playback_stall(queue: PlayerQueue) -> None:
+    """Withdraw the published stall; the queue's next signaled update publishes that."""
+    attributes = queue.extra_attributes
+    for key in [key for key in attributes if key.startswith(PLAYBACK_STALLED_PREFIX)]:
+        del attributes[key]

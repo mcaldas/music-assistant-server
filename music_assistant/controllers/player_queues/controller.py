@@ -75,6 +75,7 @@ from music_assistant.controllers.player_queues.constants import (
     SKIP_END_MARGIN,
 )
 from music_assistant.controllers.player_queues.helpers import (
+    clear_playback_stall,
     committed_index,
     get_current_playback_speed,
     handle_play_action,
@@ -2161,6 +2162,8 @@ class PlayerQueuesController(QueueLoaderMixin, PlaybackTrackerMixin, StreamFeede
         self.mass.cancel_task(f"prepare_next_audio_buffer_{queue_id}")
         self._set_transitioning(queue_id, False)
         queue_data = self._queue_data[queue_id]
+        # a queue that is told to stop is no longer waiting on its next item
+        clear_playback_stall(queue_data.queue)
         session_id = queue_data.session_id
         if (queue := self.get(queue_id)) and queue.active:
             if queue.state == PlaybackState.PLAYING:
