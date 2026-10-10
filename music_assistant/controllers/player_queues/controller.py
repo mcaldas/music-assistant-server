@@ -75,6 +75,7 @@ from music_assistant.controllers.player_queues.constants import (
     SKIP_END_MARGIN,
 )
 from music_assistant.controllers.player_queues.helpers import (
+    clear_playback_stall,
     committed_index,
     get_current_playback_speed,
     handle_play_action,
@@ -1238,6 +1239,8 @@ class PlayerQueuesController(QueueLoaderMixin, PlaybackTrackerMixin, StreamFeede
             queue.index_in_buffer = index
             # a new load owns nothing yet, so the old item must not vouch for its successor
             queue_data.last_served_item_id = None
+            # and whatever did not start before is answered by this start
+            clear_playback_stall(queue)
             queue_data.flow_mode_stream_log = []
             queue_data.flow_buffer_completed = None
             queue_data.flow_queue_exhausted = None
@@ -1623,11 +1626,21 @@ class PlayerQueuesController(QueueLoaderMixin, PlaybackTrackerMixin, StreamFeede
         self,
         queue_id: str,
         current_item_id: str,
+        speculative: bool = False,
     ) -> QueueItem:
         """
         Call when a player wants the next queue item to play.
 
-        Raises QueueEmpty if there are no more tracks left.
+        An item that cannot be loaded is marked unavailable and stepped over.
+
+        :param queue_id: The queue to load the next item of.
+        :param current_item_id: The item the next one follows.
+        :param speculative: Whether the caller only looks ahead and can ask again later. An
+            item whose provider could not be asked is then left as it is and the error is
+            raised, instead of the item being stepped over.
+        :raises QueueEmpty: If there are no more tracks left.
+        :raises AudioError: For a speculative call, if the provider of the next item could
+            not be asked.
         """
         queue = self.get(queue_id)
         if not queue:
@@ -1639,6 +1652,7 @@ class PlayerQueuesController(QueueLoaderMixin, PlaybackTrackerMixin, StreamFeede
             raise QueueEmpty("Invalid item id for queue given.")
         next_item: QueueItem | None = None
         idx = 0
+        written_off = False
         while True:
             next_index = self._get_next_index(queue_id, cur_index + idx)
             if next_index is None:
@@ -1664,10 +1678,20 @@ class PlayerQueuesController(QueueLoaderMixin, PlaybackTrackerMixin, StreamFeede
                 # transient source capacity, do not burn a playable item over it
                 raise
             except (MediaNotFoundError, AudioError) as err:
+                if speculative and isinstance(err, AudioError):
+                    # the provider could not be asked, which says nothing about the item:
+                    # a caller with time to ask again must not cost the queue a playable item
+                    if written_off:
+                        # the items this call marked unavailable still need their update. One
+                        # that already was is no news, and an update for it would only have
+                        # the queue look ahead again, into the same failure
+                        self.update_items(queue_id, self._queue_data[queue_id].items)
+                    raise
                 # No stream details found, skip this QueueItem
                 self.logger.warning(
                     "Skipping unplayable item %s (%s): %s", queue_item.name, queue_item.uri, err
                 )
+                written_off = written_off or queue_item.available
                 queue_item.available = False
                 idx += 1
         if idx != 0:
@@ -2030,7 +2054,7 @@ class PlayerQueuesController(QueueLoaderMixin, PlaybackTrackerMixin, StreamFeede
 
         Players that play upcoming tracks from a cached copy of the queue use this to
         verify a requested item is still the previous, current, buffered or expected
-        next track.
+        next track. An unavailable item passes only while it is the current one.
 
         :param queue_id: The queue to check against.
         :param queue_item_id: The queue item id the player asked for.
@@ -2040,6 +2064,11 @@ class PlayerQueuesController(QueueLoaderMixin, PlaybackTrackerMixin, StreamFeede
             return False
         item_index = self.index_by_id(queue_id, queue_item_id)
         if item_index is None:
+            return False
+        item = self._queue_data[queue_id].items[item_index]
+        if not item.available and item_index != queue.current_index:
+            # the queue stepped over this item, so its place beside the playhead says
+            # nothing; only a player that is already on it may load it again
             return False
         for center in (queue.current_index, queue.index_in_buffer):
             if center is None:
@@ -2156,6 +2185,8 @@ class PlayerQueuesController(QueueLoaderMixin, PlaybackTrackerMixin, StreamFeede
         self.mass.cancel_task(f"prepare_next_audio_buffer_{queue_id}")
         self._set_transitioning(queue_id, False)
         queue_data = self._queue_data[queue_id]
+        # a queue that is told to stop is no longer waiting on its next item
+        clear_playback_stall(queue_data.queue)
         session_id = queue_data.session_id
         if (queue := self.get(queue_id)) and queue.active:
             if queue.state == PlaybackState.PLAYING:
@@ -2230,6 +2261,8 @@ class PlayerQueuesController(QueueLoaderMixin, PlaybackTrackerMixin, StreamFeede
         # flag has to follow or clients keep showing a smart mix on a plain queue
         queue.smart_shuffle_active = self.is_smart_shuffle_active(queue)
         queue.ended = False
+        # a stall names two items that are leaving the queue
+        clear_playback_stall(queue)
         if queue.state != PlaybackState.IDLE and not skip_stop:
             self.mass.create_task(self.stop(queue_id))
         queue.current_index = None

@@ -17,6 +17,7 @@ from contextlib import suppress
 from typing import TYPE_CHECKING
 
 from music_assistant_models.enums import (
+    CrossfadeMode,
     EventType,
     MediaType,
     PlaybackState,
@@ -37,14 +38,17 @@ from music_assistant_models.media_items import (
 from music_assistant_models.playback_progress_report import MediaItemPlaybackProgressReport
 
 from music_assistant.constants import (
+    ATTR_PLAY_ACTION_IN_PROGRESS,
     PLAYBACK_REPORT_INTERVAL_SECONDS,
     VERBOSE_LOG_LEVEL,
 )
 from music_assistant.controllers.music.favorites import without_disliked_tracks
 from music_assistant.controllers.player_queues.base import _PlayerQueuesBase
 from music_assistant.controllers.player_queues.helpers import (
+    PLAYBACK_STALLED_PREFIX,
     CompareState,
     build_queue_item,
+    clear_playback_stall,
     find_dynamic_source,
     get_current_playback_speed,
 )
@@ -157,6 +161,9 @@ class PlaybackTrackerMixin(_PlayerQueuesBase):
             if queue.active
             else PlaybackState.IDLE
         )
+        if queue.state == PlaybackState.PLAYING:
+            # whatever kept the next item from starting is over
+            clear_playback_stall(queue)
         # update current item/index from player report
         if not self._update_current_index_from_player(queue, player):
             return
@@ -465,6 +472,7 @@ class PlaybackTrackerMixin(_PlayerQueuesBase):
             return
         # check if no more items in the queue (next_item should be None at end of queue)
         if queue.next_item is not None:
+            self._publish_playback_stall(queue, prev_state)
             return
         # check if we had a previous item playing
         if prev_state["current_item_id"] is None:
@@ -626,6 +634,65 @@ class PlaybackTrackerMixin(_PlayerQueuesBase):
             return
         self.logger.info("End of queue reached for %s, marking it as ended", queue.display_name)
         self.mark_ended(queue.queue_id)
+
+    def _publish_playback_stall(self, queue: PlayerQueue, prev_state: CompareState) -> None:
+        """
+        Publish that an item played to its end and the next one in the queue never started.
+
+        Nothing else lets an API client tell this from a pause, and nothing is started on
+        its behalf here. The ``playback_stalled_*`` extra attributes of the queue stay until
+        it plays again, is stopped or is cleared.
+
+        :param queue: The queue that went idle with a next item to play.
+        :param prev_state: The state the queue was in before it went idle.
+        """
+        queue_data = self._queue_data[queue.queue_id]
+        item, next_item = prev_state["current_item"], queue.next_item
+        if (
+            item is None
+            or next_item is None
+            # the player was taken by another source, so the queue was left, not stuck
+            or not queue.active
+            # a pause that ran out is somebody's pause, and a flow stream restarts by itself
+            or prev_state["state"] != PlaybackState.PLAYING
+            or queue.flow_mode
+            # a stop, a next or a play of our own (a stop that went through ended the session)
+            or queue_data.session_id is None
+            or queue.extra_attributes.get(ATTR_PLAY_ACTION_IN_PROGRESS)
+            # the player was last served something else than the item that ended: the next
+            # item, so it is changing tracks, or nothing yet since a play or next of our own
+            or queue_data.last_served_item_id != item.queue_item_id
+            # on repeat one the next item is the same one, served again or not
+            or queue_data.last_served_item_id == next_item.queue_item_id
+        ):
+            return
+        attributes = item.extra_attributes
+        # an item that is mixed into the next one is over where that mix ends
+        end = attributes.get("transition_mix_end")
+        if not isinstance(end, int | float):
+            details = item.streamdetails
+            end = get_end_position(item) or (details.duration if details else None) or item.duration
+        if not end or prev_state["last_playing_elapsed_time"] < int(end) - 5:
+            # it went idle part-way through the item: a pause or a stop on the device
+            return
+        # an item names its next one at every boundary that was locked, fade or no fade
+        mode = attributes.get("transition_mode")
+        fade_mixed = (
+            attributes.get("transition_next_item_id") == next_item.queue_item_id
+            and mode is not None
+            and mode != CrossfadeMode.DISABLED
+        )
+        self.logger.warning(
+            "%s went idle at the end of %s without starting %s, the next item in its queue (%s)",
+            queue.display_name,
+            item.name,
+            next_item.name,
+            "the fade into it was already mixed" if fade_mixed else "no fade into it was mixed",
+        )
+        queue.extra_attributes[f"{PLAYBACK_STALLED_PREFIX}at"] = time.time()
+        queue.extra_attributes[f"{PLAYBACK_STALLED_PREFIX}item_id"] = item.queue_item_id
+        queue.extra_attributes[f"{PLAYBACK_STALLED_PREFIX}next_item_id"] = next_item.queue_item_id
+        self.signal_update(queue.queue_id)
 
     def _handle_playback_progress_report(
         self, queue: PlayerQueue, prev_state: CompareState, new_state: CompareState

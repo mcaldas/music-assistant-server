@@ -302,9 +302,12 @@ class SonosCloudQueue:
             return
         report_id = item.get("reportId")
         if report_id:
-            if report_id in player.reported_playback_errors:
+            # the id stands for one playback, which can fail again in another way: only
+            # the same error under it is a resend
+            reported = f"{report_id} {error.get('type')} {error.get('status')}"
+            if reported in player.reported_playback_errors:
                 return
-            player.reported_playback_errors.append(report_id)
+            player.reported_playback_errors.append(reported)
         wire_id = item.get("id", "")
         title = (
             player.current_media.title

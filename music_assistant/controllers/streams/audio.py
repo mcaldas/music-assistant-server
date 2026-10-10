@@ -4353,8 +4353,11 @@ class StreamsAudio:
 
         :param candidates: Candidates in mapping and compatible-instance order.
         :param media_item: The media item the candidates belong to.
-        :return: The first resolved stream details, or None when every candidate failed.
-        :raises AudioError: The last (actionable) audio error when no candidate resolved.
+        :return: The first resolved stream details, or None when there was no candidate or
+            none of the candidates' providers has the item.
+        :raises AudioError: When no candidate resolved and at least one failed for another
+            reason than not having the item: the last such failure, wrapped with the original
+            as its cause if it was not an AudioError itself.
         """
         last_audio_error: AudioError | None = None
         for mapping, provider in candidates:
@@ -4376,8 +4379,16 @@ class StreamsAudio:
                     self.mass.create_task(
                         self.mass.music.mark_provider_mapping_unavailable(media_item, mapping)
                     )
-            except MusicAssistantError as err:
-                self.logger.warning("%s", err)
+            except Exception as err:
+                # a provider that could not be asked says nothing about whether it has the
+                # item, so the caller must not be told that nobody has it
+                if isinstance(err, MusicAssistantError):
+                    self.logger.warning("%s", err)
+                else:
+                    # not an error the provider chose to raise, keep the trace of where
+                    self.logger.warning("%s: %s", type(err).__name__, err, exc_info=err)
+                last_audio_error = AudioError(str(err) or type(err).__name__)
+                last_audio_error.__cause__ = err
         if last_audio_error is not None:
             raise last_audio_error
         return None

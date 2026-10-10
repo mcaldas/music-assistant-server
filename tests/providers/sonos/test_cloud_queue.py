@@ -211,6 +211,57 @@ async def test_unavailable_items_are_left_out() -> None:
     assert [x.queue_item_id for x in window.items] == ["track1", "track2"]
 
 
+async def test_the_item_asked_about_is_listed_even_when_unavailable() -> None:
+    """Test the item the speaker is on stays in its window after it was marked unplayable."""
+    items = [_make_queue_item(f"track{i}") for i in range(5)]
+    items[2].available = False
+    player, _ = _make_player(items, current_index=2)
+
+    window = await player.build_cloud_queue_window("track2")
+
+    # without its centre the window would give the speaker nothing to follow track2 with
+    assert [x.queue_item_id for x in window.items] == ["track1", "track2", "track3", "track4"]
+
+
+async def test_an_unknown_item_is_answered_around_a_playing_item_that_is_unavailable() -> None:
+    """Test the playing item an answer falls back to is listed whatever its flag."""
+    items = [_make_queue_item(f"track{i}") for i in range(5)]
+    items[2].available = False
+    player, _ = _make_player(items, current_index=2)
+
+    window = await player.build_cloud_queue_window("gone")
+
+    assert [x.queue_item_id for x in window.items] == ["track1", "track2", "track3", "track4"]
+
+
+async def test_an_unknown_item_is_not_answered_with_an_unavailable_item_nothing_plays() -> None:
+    """Test an answer built around the buffered item, for want of a playing one, checks its flag."""
+    items = [_make_queue_item(f"track{i}") for i in range(5)]
+    items[2].available = False
+    player, queues = _make_player(items)
+    # a start at track2 was asked for and nothing plays yet
+    queues.queue.current_index = None
+    queues.queue.index_in_buffer = 2
+
+    window = await player.build_cloud_queue_window("gone")
+
+    assert [x.queue_item_id for x in window.items] == ["track1", "track3", "track4"]
+
+
+@pytest.mark.parametrize("item_id", [None, ""], ids=["omitted", "empty"])
+async def test_an_unavailable_head_is_left_out_of_a_window_without_an_item_id(
+    item_id: str | None,
+) -> None:
+    """Test a fresh load of the queue is not offered a first item that cannot be played."""
+    items = [_make_queue_item(f"track{i}") for i in range(5)]
+    items[0].available = False
+    player, _ = _make_player(items)
+
+    window = await player.build_cloud_queue_window(item_id)
+
+    assert [x.queue_item_id for x in window.items] == ["track1", "track2", "track3", "track4"]
+
+
 async def test_announcement_is_served_as_a_single_item_queue() -> None:
     """Test an announcement is the only item in the window while it plays."""
     player, _ = _make_player([_make_queue_item("track0")])
@@ -919,6 +970,28 @@ async def test_a_later_failure_on_another_item_is_reported(
         await cloud_queue._handle_sonos_queue_time_played(player, request)
 
     assert caplog.text.count("ERROR_LSE") == 2
+
+
+async def test_another_failure_under_the_same_report_id_is_reported(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A report id stands for one playback, which can fail a second time in another way."""
+    player = _player_for_error_reports()
+    cloud_queue = _make_cloud_queue()
+    failed_again = {
+        **_error_report(),
+        "error": {"type": "playback", "status": "ERROR_PLAYBACK_FAILED"},
+    }
+    request = MagicMock()
+
+    with caplog.at_level(logging.WARNING, logger="test.sonos.cloud_queue"):
+        request.json = AsyncMock(return_value={"items": [_error_report()]})
+        await cloud_queue._handle_sonos_queue_time_played(player, request)
+        request.json = AsyncMock(return_value={"items": [failed_again]})
+        await cloud_queue._handle_sonos_queue_time_played(player, request)
+
+    assert caplog.text.count("could not play") == 2
+    assert "ERROR_PLAYBACK_FAILED" in caplog.text
 
 
 @pytest.mark.parametrize("status", [404, "404"], ids=["int", "str"])

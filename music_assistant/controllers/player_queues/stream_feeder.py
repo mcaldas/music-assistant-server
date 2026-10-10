@@ -43,6 +43,16 @@ if TYPE_CHECKING:
 # prepared behind a part is looked at again once the queue has been quiet for this long
 PREPARE_AFTER_PART_DELAY = 2.0
 
+# a next item whose provider did not answer is looked up again after this many seconds, and
+# each time after twice as many up to the maximum: a provider that refuses requests needs time
+PRELOAD_RETRY_DELAY = 10.0
+PRELOAD_RETRY_MAX_DELAY = 60.0
+# with this many seconds or less of the playing item left there is no time to ask again
+PRELOAD_LAST_ATTEMPT = 30.0
+# an item that is not playing never gets that near its end, so there the asking is given up
+# after this many failed attempts in a row
+PRELOAD_IDLE_ATTEMPTS = 5
+
 
 class StreamFeederMixin(_PlayerQueuesBase):
     """Feed the player's stream: enqueue the next item, preload/prepare its audio, clean up."""
@@ -86,7 +96,10 @@ class StreamFeederMixin(_PlayerQueuesBase):
             prepared_item: QueueItem | None = None
             try:
                 try:
-                    prepared_item = await self.load_next_queue_item(queue_id, queue_item_id)
+                    # only looking ahead: the fade into the next item asks again for real
+                    prepared_item = await self.load_next_queue_item(
+                        queue_id, queue_item_id, speculative=True
+                    )
                 except QueueEmpty:
                     return
                 # unplayable items are skipped, so the prepared item can be a later one
@@ -447,7 +460,12 @@ class StreamFeederMixin(_PlayerQueuesBase):
         Preload the streamdetails for the next item in the queue/buffer.
 
         This basically ensures the item is playable and fetches the stream details.
-        If an error occurs, the item will be skipped and the next item will be loaded.
+        An item no provider has is skipped and the item after it is loaded. An item whose
+        provider could not be asked is asked for again while the item before it plays, and
+        is only skipped once that item is nearly over.
+
+        :param queue_id: The queue to preload the next item of.
+        :param item_id_in_buffer: The item the player has started to fetch.
         """
         queue = self._queue_data[queue_id].queue
 
@@ -469,14 +487,66 @@ class StreamFeederMixin(_PlayerQueuesBase):
                     if current_item.queue_item_id == item_id_in_buffer:
                         break
                     await asyncio.sleep(1)
-                if next_item := await self.load_next_queue_item(queue_id, item_id_in_buffer):
-                    self.logger.debug(
-                        "Preloaded next item %s for queue %s",
-                        next_item.name,
-                        queue.display_name,
+                delay = PRELOAD_RETRY_DELAY
+                idle_attempts = 0
+                while True:
+                    # where in the playing item the time to ask again is up. A flow hands the
+                    # player nothing and steps over at its own boundary, so there it never is
+                    ask_until = (
+                        None
+                        if queue.flow_mode
+                        else (get_end_position(current_item) or current_item.duration or 0)
+                        - PRELOAD_LAST_ATTEMPT
                     )
-                    # enqueue the next item on the player
-                    self._enqueue_next_item(queue_id, next_item)
+                    speculative = ask_until is None or queue.corrected_elapsed_time < ask_until
+                    try:
+                        next_item = await self.load_next_queue_item(
+                            queue_id, item_id_in_buffer, speculative=speculative
+                        )
+                        break
+                    except AudioError as err:
+                        if not speculative:
+                            # a load that may step over raises this only for a provider at
+                            # its stream limit, which nothing here could wait out
+                            raise
+                        if delay == PRELOAD_RETRY_DELAY:
+                            # said once, however often it is asked again
+                            self.logger.warning(
+                                "Could not look up the item after %s on queue %s yet: %s; "
+                                "it stays in the queue and is asked again",
+                                current_item.name,
+                                queue.display_name,
+                                err,
+                            )
+                    idle_attempts = 0 if queue.state == PlaybackState.PLAYING else idle_attempts + 1
+                    if idle_attempts >= PRELOAD_IDLE_ATTEMPTS:
+                        # nothing hands the player this item now: leave a trace of why
+                        self.logger.debug(
+                            "No longer asking for the item after %s on queue %s: it is not playing",
+                            current_item.name,
+                            queue.display_name,
+                        )
+                        return
+                    wait = delay
+                    if ask_until is not None:
+                        # back in time for the last attempt, counted from where the item is
+                        # now, as a lookup can take long to fail. Never sooner than the first
+                        # wait: the seconds left do not run down while the item is paused
+                        time_left = ask_until - queue.corrected_elapsed_time
+                        wait = min(delay, max(time_left, PRELOAD_RETRY_DELAY))
+                    await asyncio.sleep(wait)
+                    delay = min(delay * 2, PRELOAD_RETRY_MAX_DELAY)
+                    # the item a player has moved on to gets a preload of its own
+                    current_item = queue.current_item
+                    if current_item is None or current_item.queue_item_id != item_id_in_buffer:
+                        return
+                self.logger.debug(
+                    "Preloaded next item %s for queue %s",
+                    next_item.name,
+                    queue.display_name,
+                )
+                # enqueue the next item on the player
+                self._enqueue_next_item(queue_id, next_item)
 
             except QueueEmpty:
                 return

@@ -2042,6 +2042,7 @@ def _native_stream_handler_context(
         queue_item_id="item-1",
         name="Track",
         duration=180,
+        available=True,
         streamdetails=streamdetails,
         media_item=None,
         media_type=MediaType.TRACK,

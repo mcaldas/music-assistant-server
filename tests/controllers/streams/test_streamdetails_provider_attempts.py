@@ -21,7 +21,7 @@ import pytest
 from music_assistant_models.auth import User, UserRole
 from music_assistant_models.config_entries import ProviderAccess
 from music_assistant_models.enums import ContentType, MediaType, ProviderSharing, StreamType
-from music_assistant_models.errors import MediaNotFoundError
+from music_assistant_models.errors import AudioError, InvalidDataError, MediaNotFoundError
 from music_assistant_models.media_items import AudioFormat, ProviderMapping, SoundEffect
 from music_assistant_models.queue_item import QueueItem
 from music_assistant_models.streamdetails import StreamDetails
@@ -139,6 +139,20 @@ async def test_a_failing_provider_is_asked_only_once() -> None:
         await audio.get_stream_details(queue_item=_queue_item(_mapping(INSTANCE)))
 
     assert calls == [ITEM_ID]
+
+
+async def test_an_unreachable_provider_does_not_read_as_media_not_found() -> None:
+    """A provider that could not be asked surfaces as an audio error, not as a missing item."""
+
+    async def _unreachable(item_id: str, _media_type: MediaType) -> StreamDetails:
+        raise InvalidDataError(f"Error while fetching playlist for {item_id}")
+
+    provider = MagicMock()
+    provider.get_stream_details = _unreachable
+    audio = _audio({INSTANCE: provider})
+
+    with pytest.raises(AudioError):
+        await audio.get_stream_details(queue_item=_queue_item(_mapping(INSTANCE)))
 
 
 async def test_the_widening_pass_still_reaches_a_provider_the_steering_held_back() -> None:
