@@ -653,6 +653,28 @@ async def test_a_start_of_our_own_that_has_not_come_up_yet_is_not_published() ->
     ctrl.logger.warning.assert_not_called()
 
 
+async def test_a_new_start_withdraws_the_published_stall() -> None:
+    """A client that answers a stall with a start must not read the same stall again."""
+    ctrl, queue = _controller()
+    ctrl._get_resume_position = AsyncMock(return_value=0)  # type: ignore[method-assign]
+    ctrl._load_item = AsyncMock()  # type: ignore[method-assign]
+    ctrl.player_media_from_queue_item = AsyncMock()  # type: ignore[method-assign]
+    player = ctrl.mass.players.get_player.return_value
+    player.player_id, player.extra_data, player.state.active_source = QUEUE_ID, {}, None
+    player.state.playback_state = PlaybackState.IDLE
+    queue.extra_attributes.update(
+        {
+            "playback_stalled_at": 100.0,
+            "playback_stalled_item_id": "first",
+            "playback_stalled_next_item_id": "last",
+        }
+    )
+
+    await PlayerQueuesController.play_index(ctrl, QUEUE_ID, 1)
+
+    assert not [key for key in queue.extra_attributes if key.startswith("playback_stalled")]
+
+
 @pytest.mark.parametrize("was", ["paused", "a_flow"])
 def test_a_paused_queue_or_a_flow_going_idle_is_not_published(was: str) -> None:
     """A pause that ran out is somebody's pause, and a flow stream restarts by itself."""
