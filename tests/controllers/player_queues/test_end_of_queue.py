@@ -582,6 +582,17 @@ def test_a_next_item_the_player_already_fetched_is_not_published() -> None:
     tracker.logger.warning.assert_not_called()
 
 
+def test_an_item_that_repeats_is_not_published() -> None:
+    """On repeat one the next item is the one that ended: fetched again or not looks the same."""
+    tracker, queue, prev_state, new_state = _item_end()
+    queue.next_item = prev_state["current_item"]
+
+    PlaybackTrackerMixin._handle_end_of_queue(tracker, queue, prev_state, new_state)
+
+    assert not queue.extra_attributes
+    tracker.logger.warning.assert_not_called()
+
+
 @pytest.mark.parametrize("ours", ["play_action_in_progress", "session_ended"])
 def test_a_stop_music_assistant_made_is_not_published(ours: str) -> None:
     """A stop, a next or a play of our own is no stall, however close to the item's end."""
