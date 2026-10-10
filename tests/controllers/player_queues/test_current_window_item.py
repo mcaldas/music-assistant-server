@@ -5,6 +5,7 @@ from __future__ import annotations
 from typing import Any, cast
 from unittest.mock import MagicMock, Mock
 
+import pytest
 from music_assistant_models.enums import MediaType, PlaybackState, RepeatMode
 from music_assistant_models.media_items import ItemMapping, ProviderMapping, Track
 from music_assistant_models.player_queue import PlayerQueue
@@ -236,9 +237,18 @@ def test_a_skipped_track_behind_the_fade_target_is_refused() -> None:
     assert ctrl.is_current_window_item("q1", _item_id_at(ctrl, 3))
 
 
-def test_an_unavailable_track_the_player_is_on_is_still_served() -> None:
+@pytest.mark.parametrize("index_in_buffer", [2, 3], ids=["not_ahead", "buffered_ahead"])
+def test_an_unavailable_track_the_player_is_on_is_still_served(index_in_buffer: int) -> None:
     """A track flagged while the player is on it may still be loaded again."""
-    ctrl = _controller(current_index=2, index_in_buffer=2)
+    ctrl = _controller(current_index=2, index_in_buffer=index_in_buffer)
     ctrl._queue_data["q1"].items[2].available = False
 
     assert ctrl.is_current_window_item("q1", _item_id_at(ctrl, 2))
+
+
+def test_an_unavailable_track_the_player_only_buffered_is_refused() -> None:
+    """A track flagged at its own start, before the player was on it, is not served again."""
+    ctrl = _controller(current_index=1, index_in_buffer=2)
+    ctrl._queue_data["q1"].items[2].available = False
+
+    assert not ctrl.is_current_window_item("q1", _item_id_at(ctrl, 2))
