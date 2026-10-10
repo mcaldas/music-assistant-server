@@ -1650,6 +1650,7 @@ class PlayerQueuesController(QueueLoaderMixin, PlaybackTrackerMixin, StreamFeede
             raise QueueEmpty("Invalid item id for queue given.")
         next_item: QueueItem | None = None
         idx = 0
+        written_off = False
         while True:
             next_index = self._get_next_index(queue_id, cur_index + idx)
             if next_index is None:
@@ -1678,14 +1679,17 @@ class PlayerQueuesController(QueueLoaderMixin, PlaybackTrackerMixin, StreamFeede
                 if speculative and isinstance(err, AudioError):
                     # the provider could not be asked, which says nothing about the item:
                     # a caller with time to ask again must not cost the queue a playable item
-                    if idx != 0:
-                        # the items skipped before this one still need their update
+                    if written_off:
+                        # the items this call marked unavailable still need their update. One
+                        # that already was is no news, and an update for it would only have
+                        # the queue look ahead again, into the same failure
                         self.update_items(queue_id, self._queue_data[queue_id].items)
                     raise
                 # No stream details found, skip this QueueItem
                 self.logger.warning(
                     "Skipping unplayable item %s (%s): %s", queue_item.name, queue_item.uri, err
                 )
+                written_off = written_off or queue_item.available
                 queue_item.available = False
                 idx += 1
         if idx != 0:

@@ -158,6 +158,17 @@ async def test_items_written_off_before_the_failure_are_still_announced() -> Non
     cast("MagicMock", controller.update_items).assert_called_once()
 
 
+async def test_stepping_over_an_item_written_off_earlier_announces_nothing() -> None:
+    """A look ahead that fails behind an item skipped before changed nothing to signal."""
+    controller, (_a, b, _c) = _controller_with_three_items({"c": AudioError("offline")})
+    b.available = False
+
+    with pytest.raises(AudioError):
+        await controller.load_next_queue_item(QUEUE_ID, "a", speculative=True)
+
+    cast("MagicMock", controller.update_items).assert_not_called()
+
+
 async def test_looking_ahead_still_skips_an_item_its_provider_does_not_have() -> None:
     """Looking ahead writes off an item no provider has, like any other caller."""
     controller, (_a, b, c) = _controller_with_three_items({"b": MediaNotFoundError("gone")})
