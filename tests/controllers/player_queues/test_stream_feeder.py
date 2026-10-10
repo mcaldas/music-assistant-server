@@ -797,6 +797,8 @@ async def test_a_preload_may_step_over_once_the_playing_item_is_nearly_over(
         *[{"speculative": True}] * 5,
         {"speculative": False},
     ]
+    # five failed lookups, said once
+    assert cast("MagicMock", controller.logger).warning.call_count == 1
     assert queue.corrected_elapsed_time == last_attempt_at
     assert mass.call_later.call_args.args[2] is next_item
 
