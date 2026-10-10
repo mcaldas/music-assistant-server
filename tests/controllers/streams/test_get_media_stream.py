@@ -618,6 +618,85 @@ async def test_get_media_stream_keeps_caller_extra_input_args_intact(
     assert streamdetails.extra_input_args == [*_PROVIDER_INPUT_ARGS]
 
 
+_DECRYPTION_KEY = "00" * 16
+
+
+def _encrypted_streamdetails() -> StreamDetails:
+    """Build StreamDetails for an encrypted track served over HTTP (a fragmented MP4)."""
+    return StreamDetails(
+        provider="test_provider",
+        item_id="track-1",
+        audio_format=AudioFormat(content_type=ContentType.MP4, codec_type=ContentType.AAC),
+        media_type=MediaType.TRACK,
+        stream_type=StreamType.ENCRYPTED_HTTP,
+        decryption_key=_DECRYPTION_KEY,
+        path="https://test.invalid/track-1.mp4",
+        duration=240,
+        can_seek=True,
+        allow_seek=True,
+    )
+
+
+@pytest.mark.asyncio
+async def test_an_encrypted_stream_read_from_its_start_is_opened_without_its_index(
+    patch_ffmpeg: type[_FakeFFMpeg],
+) -> None:
+    """
+    An encrypted track read from its start must be opened without building its index.
+
+    It is a fragmented MP4: for the index ffmpeg reads every fragment's header before the
+    first packet, each through a connection of its own, which keeps a track silent for
+    seconds at every cold start. The connection itself has to stay seekable, or a download
+    that breaks is restarted from its first byte.
+    """
+    streamdetails = _encrypted_streamdetails()
+    audio = _make_audio_controller()
+
+    await _drain(audio.get_media_stream(streamdetails, _make_pcm_format()))
+
+    assert patch_ffmpeg.last_instance is not None
+    assert patch_ffmpeg.last_instance.extra_input_args == [
+        "-decryption_key",
+        _DECRYPTION_KEY,
+        "-fflags",
+        "+ignidx",
+    ]
+    assert streamdetails.extra_input_args == []
+
+
+@pytest.mark.asyncio
+async def test_an_encrypted_stream_that_is_seeked_keeps_its_index(
+    patch_ffmpeg: type[_FakeFFMpeg],
+) -> None:
+    """A seek into an encrypted track needs the index: it is opened as before."""
+    audio = _make_audio_controller()
+
+    await _drain(
+        audio.get_media_stream(_encrypted_streamdetails(), _make_pcm_format(), seek_position=120)
+    )
+
+    assert patch_ffmpeg.last_instance is not None
+    assert patch_ffmpeg.last_instance.extra_input_args == [
+        "-decryption_key",
+        _DECRYPTION_KEY,
+        "-ss",
+        "120",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_a_plain_http_stream_is_opened_as_before(
+    patch_ffmpeg: type[_FakeFFMpeg],
+) -> None:
+    """Other HTTP sources are not known to be fragmented: nothing changes for them."""
+    audio = _make_audio_controller()
+
+    await _drain(audio.get_media_stream(_seekable_streamdetails(), _make_pcm_format()))
+
+    assert patch_ffmpeg.last_instance is not None
+    assert patch_ffmpeg.last_instance.extra_input_args == [*_PROVIDER_INPUT_ARGS]
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("stream_type", [StreamType.HTTP, StreamType.CUSTOM])
 @pytest.mark.usefixtures("patch_ffmpeg")
