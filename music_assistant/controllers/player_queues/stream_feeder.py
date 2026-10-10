@@ -486,16 +486,15 @@ class StreamFeederMixin(_PlayerQueuesBase):
                     await asyncio.sleep(1)
                 delay = PRELOAD_RETRY_DELAY
                 while True:
-                    # the seconds left to ask in. A flow hands the player nothing and steps
-                    # over at its own boundary, so its preload never runs out of them
-                    time_left = (
+                    # where in the playing item the time to ask again is up. A flow hands the
+                    # player nothing and steps over at its own boundary, so there it never is
+                    ask_until = (
                         None
                         if queue.flow_mode
                         else (get_end_position(current_item) or current_item.duration or 0)
-                        - queue.corrected_elapsed_time
                         - PRELOAD_LAST_ATTEMPT
                     )
-                    speculative = time_left is None or time_left > 0
+                    speculative = ask_until is None or queue.corrected_elapsed_time < ask_until
                     try:
                         next_item = await self.load_next_queue_item(
                             queue_id, item_id_in_buffer, speculative=speculative
@@ -516,9 +515,11 @@ class StreamFeederMixin(_PlayerQueuesBase):
                                 err,
                             )
                     wait = delay
-                    if time_left is not None:
-                        # back in time for the last attempt, but never sooner than the first
+                    if ask_until is not None:
+                        # back in time for the last attempt, counted from where the item is
+                        # now, as a lookup can take long to fail. Never sooner than the first
                         # wait: the seconds left do not run down while the item is paused
+                        time_left = ask_until - queue.corrected_elapsed_time
                         wait = min(delay, max(time_left, PRELOAD_RETRY_DELAY))
                     await asyncio.sleep(wait)
                     delay = min(delay * 2, PRELOAD_RETRY_MAX_DELAY)

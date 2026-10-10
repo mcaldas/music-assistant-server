@@ -799,6 +799,35 @@ async def test_a_preload_takes_todays_way_when_the_playing_item_is_nearly_over(
     assert mass.call_later.call_args.args[2] is next_item
 
 
+async def test_a_preload_counts_the_seconds_a_failed_lookup_took(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A lookup that was slow to fail leaves less of the playing item to wait in."""
+    controller, next_item, mass = _controller_with_playing_item()
+    queue = cast("Any", controller.get("queue-1"))
+
+    async def _load(_queue_id: str, _item_id: str, speculative: bool = False) -> SimpleNamespace:
+        if not speculative:
+            return next_item
+        if queue.corrected_elapsed_time == 130:
+            # this one hangs for half a minute before it fails
+            queue.corrected_elapsed_time += 30
+        raise AudioError("offline")
+
+    async def _play_on(seconds: float) -> None:
+        queue.corrected_elapsed_time += seconds
+
+    controller.load_next_queue_item = AsyncMock(side_effect=_load)  # type: ignore[method-assign]
+    monkeypatch.setattr(asyncio, "sleep", _play_on)
+
+    controller._preload_next_item("queue-1", "current")
+    await mass.create_task.call_args.args[0]
+
+    # the attempt that may step over still comes before the item ends at 180 s
+    assert queue.corrected_elapsed_time == 170
+    assert mass.call_later.call_args.args[2] is next_item
+
+
 async def test_a_preload_in_flow_mode_leaves_stepping_over_to_the_flow(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
