@@ -1711,6 +1711,7 @@ async def test_flow_zero_audio_skip_restores_seek_position(
         audio_format=pcm_format,
         buffer=SimpleNamespace(
             has_error=False,
+            cancelled=False,
             is_valid=lambda *_args: True,
             duration_available=16,
             eof=False,

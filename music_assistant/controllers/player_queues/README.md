@@ -195,12 +195,27 @@ else goes, including what sessions that ended earlier left behind: sessions rota
 so a claim that is no longer current marks audio nobody will come back for. A clear or a replace
 drops the items themselves, so all of their audio goes with them.
 
+An item that is taken off a queue any other way (a delete, a replace of the upcoming items, a
+dynamic rebuild) leaves its prepared audio with it, and a preparation still running for it is
+ended. The cleanups above walk the queue's items and never reach it again, so its source would keep
+its provider's stream slot until the buffer's inactivity timeout: for a track longer than its buffer
+that starves the item that follows on a provider that allows one stream. An item a reader has keeps
+its audio: one a stream has read from in this session, or one the player has a response open for.
+
 A paused queue keeps its session and its buffers until the pause watcher stops it after 30 seconds.
 When playback on another queue finds no free provider stream slot and one of those buffers holds
 one, the paused queue is stopped right away. It resumes later from where it was paused, with a new
 source stream. Preparing the next track ahead of time never stops a paused queue. A player that
 could not be told to stop still shows paused on a stream its queue has ended, so play starts the
 queue again there rather than unpausing the player.
+
+A player that asks for each item on its own can leave one while its source still fills: the source
+of a track longer than its buffer only goes on while the buffer is read, and keeps its provider's
+stream slot until it has delivered everything. When the item the player asks for next finds no free
+slot on a provider that allows one stream, the source of an item of the same queue that no open
+response reads and no fade is mixed into is aborted, and the asked item takes its slot instead of
+waiting behind it. Preparing the next track ahead of time never takes a slot this way, and neither
+another queue's sources nor a flow stream's are touched.
 
 Data flow: current index → next-item computation → stream-detail resolution → player enqueue-next.
 (Next-track audio-buffer warming is driven separately by the streams pipeline, relative to the

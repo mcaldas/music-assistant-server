@@ -70,6 +70,13 @@ async def _incoming(chunk_seconds: float = 0.1) -> AsyncGenerator[bytes]:
         yield data[start : start + step]
 
 
+async def _no_incoming() -> AsyncGenerator[bytes]:
+    """Yield nothing: a mix that was given none of the incoming track."""
+    no_audio: tuple[bytes, ...] = ()
+    for chunk in no_audio:
+        yield chunk
+
+
 async def _stalling_incoming(gate: asyncio.Event) -> AsyncGenerator[bytes]:
     """Yield part of the overlap, then park on ``gate`` so the mix stays mid-flight."""
     yield _tone(440.0, 0.5)
@@ -148,4 +155,26 @@ async def test_mix_output_matches_direct_apply(
     )
 
     assert via_mixer == via_apply
+    assert all(proc.returncode is not None for proc in tracked_processes)
+
+
+@pytest.mark.asyncio
+async def test_a_mix_without_incoming_audio_plays_the_outgoing_part_whole(
+    tracked_processes: list[process_module.AsyncProcess],
+) -> None:
+    """
+    A mix that gets none of the incoming track still plays all of the outgoing part.
+
+    A stream whose fade the queue let go mixes without the next item. The seconds of its
+    tail that were to overlap are part of the track all the same, and must not be dropped.
+    """
+    mixer = SmartFadesMixer(_StubStreams())  # type: ignore[arg-type]
+    fade, fade_out = _built_fade()
+
+    mixed = b"".join([chunk async for chunk in mixer.mix(fade, _no_incoming(), fade_out, PCM)])
+
+    assert len(mixed) == len(fade_out)
+    # the part before the overlap as it is
+    before_overlap = len(_tone(220.0, 2.0))
+    assert mixed[:before_overlap] == fade_out[:before_overlap]
     assert all(proc.returncode is not None for proc in tracked_processes)

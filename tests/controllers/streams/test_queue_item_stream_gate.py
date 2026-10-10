@@ -121,3 +121,29 @@ async def test_item_falling_out_of_the_window_during_setup_is_refused() -> None:
 
     assert "not up next" in str(exc.value.reason)
     assert ctrl.mass.player_queues.is_current_window_item.call_count == 2
+
+
+async def test_an_ended_response_offers_its_items_slot() -> None:
+    """A response that ended lets the queue hand on a source slot its item no longer needs."""
+    ctrl = _make_controller(strict_player=True, item_in_window=True)
+    open_at_the_offer: list[dict[str, list[object]]] = []
+    ctrl.mass.player_queues.release_abandoned_stream_slot.side_effect = lambda _queue_id: (
+        open_at_the_offer.append(dict(ctrl._open_item_streams))
+    )
+
+    with pytest.raises(web.HTTPNotFound):
+        await StreamsController.serve_queue_item_stream(ctrl, _make_request())
+
+    ctrl.mass.player_queues.release_abandoned_stream_slot.assert_called_once_with(QUEUE_ID)
+    # the ended response is no longer listed by then, or its item would still count as read
+    assert open_at_the_offer == [{}]
+
+
+async def test_a_refused_request_offers_nothing() -> None:
+    """A request refused before it was registered opened nothing to hand on."""
+    ctrl = _make_controller(strict_player=True, item_in_window=False)
+
+    with pytest.raises(web.HTTPNotFound):
+        await StreamsController.serve_queue_item_stream(ctrl, _make_request())
+
+    ctrl.mass.player_queues.release_abandoned_stream_slot.assert_not_called()

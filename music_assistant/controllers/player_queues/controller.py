@@ -1250,6 +1250,10 @@ class PlayerQueuesController(QueueLoaderMixin, PlaybackTrackerMixin, StreamFeede
             # the new session streams every item afresh: what older ones read holds no end back
             for item in queue_data.items:
                 self.mass.streams.audio.read_positions.pop(item.queue_item_id, None)
+            # nor does it take over a fade an older session mixed or is still mixing: that
+            # stream reaches no player any more, so the item started here plays from its own
+            # start instead of waiting for that mix or carrying on behind it
+            self.mass.streams.audio.clear_crossfade_handover(queue_id)
             self.mass.streams.audio_processing.start_session(
                 queue_id,
                 queue_data.session_id,
@@ -1846,9 +1850,13 @@ class PlayerQueuesController(QueueLoaderMixin, PlaybackTrackerMixin, StreamFeede
 
     def update_items(self, queue_id: str, queue_items: list[QueueItem]) -> None:
         """Update the existing queue items, mostly caused by reordering."""
+        kept = {item.queue_item_id for item in queue_items}
+        removed = [x for x in self._queue_data[queue_id].items if x.queue_item_id not in kept]
         self._queue_data[queue_id].items = queue_items
         queue = self._queue_data[queue_id].queue
         queue.items = len(self._queue_data[queue_id].items)
+        # an item that leaves the queue leaves its prepared audio, and its source's slot, too
+        self._release_removed_audio(queue_id, removed)
         self.signal_update(queue_id, True)
         self.update_next_item_on_player(queue_id)
 

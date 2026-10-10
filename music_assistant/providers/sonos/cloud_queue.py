@@ -229,11 +229,13 @@ class SonosCloudQueue:
         https://docs.sonos.com/reference/timeplayed
         """
         json_body = await request.json()
+        # the first position is the one that counts; a failure listed behind it still is one
+        position_read = False
         for item in json_body["items"]:
             if error := item.get("error"):
                 self._log_reported_playback_error(player, item, error)
                 continue
-            if item["type"] != "update":
+            if position_read or item["type"] != "update":
                 continue
             if "positionMillis" not in item:
                 continue
@@ -245,7 +247,7 @@ class SonosCloudQueue:
                 player.wire_item_id(player.current_media.queue_item_id),
             ):
                 player.update_elapsed_time(item["positionMillis"] / 1000)
-            break
+            position_read = True
         return web.Response(status=204)
 
     def _parse_sonos_queue_item(
@@ -282,7 +284,7 @@ class SonosCloudQueue:
         self, player: SonosPlayer, item: dict[str, Any], error: dict[str, Any]
     ) -> None:
         """
-        Log a playback failure the speaker reported for one of its queue items.
+        Log and publish a playback failure the speaker reported for one of its queue items.
 
         :param player: The speaker that sent the report.
         :param item: The reported queue item the failure belongs to.
@@ -322,4 +324,11 @@ class SonosCloudQueue:
             title,
             error.get("status", "an unknown error"),
             error.get("type", "unknown"),
+        )
+        status = error.get("status")
+        is_http = error.get("type") == "http"
+        player.publish_playback_error(
+            wire_id,
+            code=None if is_http or status is None else str(status),
+            http_status=int(str(status)) if is_http and str(status).isdigit() else None,
         )

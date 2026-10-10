@@ -1093,6 +1093,8 @@ class QueueLoaderMixin(_PlayerQueuesBase):
         # otherwise publish that half-built state, which is exactly the empty queue this avoids.
         self._set_transitioning(queue_id, True)
         try:
+            # the one removal that does not pass update_items, which lets this audio go
+            self._release_removed_audio(queue_id, queue_data.items[insert_at:])
             queue_data.items = queue_data.items[:insert_at]
             queue.items = len(queue_data.items)
             pool_tracks = await self._managed_pool.fill(queue_id, is_initial=False)

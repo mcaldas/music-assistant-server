@@ -1423,6 +1423,12 @@ class Player(ABC):
         # current media is updated (after applying group/sync membership logic).
         # for instance to update any display information on the physical player.
 
+    def on_stop_while_idle(self) -> None:  # noqa: B027
+        """Handle callback when a STOP or PAUSE command is not passed on to an idle player."""
+        # optional callback for players that keep track of what they were last told to
+        # play: stop() and pause() are only called on a player that does not report idle,
+        # so such a player would otherwise never learn that it was stopped.
+
     # DO NOT OVERWRITE BELOW !
     # These properties and methods are either managed by core logic or they
     # are used to perform a very specific function. Overwriting these may

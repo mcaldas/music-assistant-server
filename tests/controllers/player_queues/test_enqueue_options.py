@@ -9,6 +9,8 @@ side-effecting ``play_index`` and ``signal_update`` are stubbed out.
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+from typing import Any, cast
 from unittest.mock import AsyncMock, MagicMock, Mock
 
 import pytest
@@ -43,6 +45,13 @@ def _items(queue_id: str, names: list[str]) -> list[QueueItem]:
     return [
         QueueItem(queue_id=queue_id, queue_item_id=name, name=name, duration=60) for name in names
     ]
+
+
+def _prepare(item: QueueItem) -> MagicMock:
+    """Attach prepared audio to the item and return its buffer."""
+    buffer = MagicMock()
+    item.streamdetails = cast("Any", SimpleNamespace(buffer=buffer))
+    return buffer
 
 
 def _track(item_id: str) -> Track:
@@ -235,6 +244,61 @@ async def test_replace_next_on_empty_queue_sets_current_index_without_playing() 
     ctrl.play_index.assert_not_awaited()
 
 
+def _playing_queue(ctrl: PlayerQueuesController, index_in_buffer: int) -> list[QueueItem]:
+    """
+    Give the controller a queue that plays the first of three items.
+
+    :param ctrl: The controller to give the queue to.
+    :param index_in_buffer: The highest index the player was handed.
+    """
+    ctrl.logger = MagicMock()
+    ctrl.play_index = AsyncMock()  # type: ignore[method-assign]
+    ctrl.get_next_item = Mock(return_value=None)  # type: ignore[method-assign]
+    existing = _items("q1", ["a", "b", "c"])
+    queue = PlayerQueue(
+        queue_id="q1",
+        active=True,
+        display_name="Q1",
+        available=True,
+        items=len(existing),
+        state=PlaybackState.PLAYING,
+        current_index=0,
+        index_in_buffer=index_in_buffer,
+    )
+    ctrl._queue_data = {"q1": PlayerQueueData(queue=queue, items=list(existing))}
+    return existing
+
+
+async def test_replace_next_releases_the_audio_of_the_tail_it_swaps_out() -> None:
+    """REPLACE_NEXT lets go of the audio that was prepared for an item it drops."""
+    ctrl = _controller()
+    playing, dropped, _last = _playing_queue(ctrl, index_in_buffer=0)
+    kept_buffer, dropped_buffer = _prepare(playing), _prepare(dropped)
+
+    await ctrl._enqueue_with_option("q1", _items("q1", ["new"]), QueueOption.REPLACE_NEXT)
+
+    assert [item.queue_item_id for item in ctrl._queue_data["q1"].items] == ["a", "new"]
+    assert cast("Any", dropped.streamdetails).buffer is None
+    dropped_buffer.clear.assert_called_once_with()
+    assert cast("Any", playing.streamdetails).buffer is kept_buffer
+    kept_buffer.clear.assert_not_called()
+
+
+async def test_replace_next_keeps_the_audio_of_the_item_being_faded_into() -> None:
+    """An item whose audio a fade already reads keeps it when the swap takes it off the queue."""
+    ctrl = _controller()
+    # the fade into it is read before the player's buffered index reaches it
+    _playing, fading_in, _last = _playing_queue(ctrl, index_in_buffer=0)
+    ctrl.mass.streams.audio.read_positions = {"a": 0.0, "b": 0.0}
+    buffer = _prepare(fading_in)
+
+    await ctrl._enqueue_with_option("q1", _items("q1", ["new"]), QueueOption.REPLACE_NEXT)
+
+    assert [item.queue_item_id for item in ctrl._queue_data["q1"].items] == ["a", "new"]
+    assert cast("Any", fading_in.streamdetails).buffer is buffer
+    buffer.clear.assert_not_called()
+
+
 async def test_next_on_idle_queue_with_content_keeps_current_index() -> None:
     """NEXT on an idle queue that has content leaves the current index and inserts after it."""
     ctrl = _controller()
@@ -387,6 +451,33 @@ async def test_enter_dynamic_mode_add_on_active_keeps_current_and_rebuilds_tail(
     }
     assert queue.current_index == 1
     play_index.assert_not_awaited()
+
+
+async def test_enter_dynamic_mode_releases_the_audio_of_the_tail_it_drops() -> None:
+    """The tail a rebuild drops lets go of the audio that was prepared for it."""
+    ctrl = _dynamic_controller()
+    ctrl.logger = MagicMock()
+    ctrl.play_index = AsyncMock()  # type: ignore[method-assign]
+    existing = _items("q1", ["e0", "e1", "e2"])
+    queue = PlayerQueue(
+        queue_id="q1",
+        active=True,
+        display_name="Q1",
+        available=True,
+        items=len(existing),
+        state=PlaybackState.PLAYING,
+        current_index=1,
+        index_in_buffer=1,
+    )
+    ctrl._queue_data = {"q1": PlayerQueueData(queue=queue, items=list(existing))}
+    kept_buffer, dropped_buffer = _prepare(existing[1]), _prepare(existing[2])
+
+    await ctrl._enter_dynamic_mode("q1", QueueOption.ADD)
+
+    assert cast("Any", existing[2].streamdetails).buffer is None
+    dropped_buffer.clear.assert_called_once_with()
+    assert cast("Any", existing[1].streamdetails).buffer is kept_buffer
+    kept_buffer.clear.assert_not_called()
 
 
 async def test_enter_dynamic_mode_replaces_old_pool_tail_stays_bounded() -> None:

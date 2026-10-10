@@ -51,3 +51,23 @@ def test_an_already_gone_transport_is_left_alone() -> None:
 def test_a_queue_without_open_responses_is_a_noop() -> None:
     """Rotating a session on an idle queue must not error."""
     _make_controller().close_superseded_item_streams("queue-x", "s")
+
+
+def test_open_item_stream_ids_lists_get_responses_of_the_current_session() -> None:
+    """Only an open GET of the session that owns playback is the player asking for an item."""
+    controller = _make_controller()
+
+    def _request(method: str, queue_item_id: str) -> MagicMock:
+        request = MagicMock()
+        request.method = method
+        request.match_info = {"queue_item_id": queue_item_id}
+        return request
+
+    controller._open_item_streams["queue-1"] = [
+        ("new", _request("GET", "asked")),
+        ("new", _request("HEAD", "probed")),
+        ("old", _request("GET", "superseded")),
+    ]
+
+    assert controller.open_item_stream_ids("queue-1", "new") == {"asked"}
+    assert controller.open_item_stream_ids("queue-x", "new") == set()

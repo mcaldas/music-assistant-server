@@ -6,7 +6,7 @@ import asyncio
 import logging
 import time
 from collections.abc import AsyncGenerator
-from contextlib import suppress
+from contextlib import aclosing, suppress
 from types import SimpleNamespace
 from typing import Any, cast
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -1147,6 +1147,76 @@ async def test_seekable_no_eviction_after_eof() -> None:
     assert chunk == _make_chunk(0)
     assert buf._discarded_chunks == 0
     assert buf.size_seconds == max_size
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("converted", [False, True], ids=["raw", "converted"])
+async def test_a_reader_with_a_resume_point_leaves_it_in_a_full_buffer(
+    monkeypatch: pytest.MonkeyPatch, converted: bool
+) -> None:
+    """A reader ahead of the item's own frees a full buffer only up to where that one resumes."""
+    buf = AudioBuffer(TEST_PCM_FORMAT, buffer_size=BufferSize.MINIMAL)
+    max_size = buf.max_size_seconds
+    buf.fill(_make_source(max_size + 30), source_name="test")
+
+    async def _refilled() -> None:
+        async with asyncio.timeout(5), buf._data_available:
+            await buf._data_available.wait_for(lambda: buf.size_seconds == max_size)
+
+    async def _unconverted(
+        audio_input: AsyncGenerator[bytes], **_kwargs: Any
+    ) -> AsyncGenerator[bytes]:
+        async for chunk in audio_input:
+            yield chunk
+
+    monkeypatch.setattr(
+        "music_assistant.controllers.streams.audio_buffer.get_ffmpeg_stream", _unconverted
+    )
+    output_format = (
+        AudioFormat(content_type=ContentType.PCM_F32LE, sample_rate=44100, bit_depth=32, channels=2)
+        if converted
+        else TEST_PCM_FORMAT
+    )
+
+    # the fade into an item reads its head, here 10 s of it and a little ahead
+    await _refilled()
+    chunks: list[bytes] = []
+    async with aclosing(buf.get_stream(output_format=output_format, keep_from_ms=10_000)) as stream:
+        async for chunk in stream:
+            chunks.append(chunk)
+            if len(chunks) == 13:
+                break
+            # the parked source fills the space a read made before the next one
+            await _refilled()
+
+    assert chunks == [_make_chunk(i) for i in range(13)]
+    # everything before the resume point made room for the source, nothing from it on
+    assert buf._discarded_chunks == 10
+    assert buf.size_seconds == max_size
+    assert buf.is_valid(10_000)
+
+    # the item's own reader frees space as before
+    assert await buf._get(chunk_number=10) == _make_chunk(10)
+    assert buf._discarded_chunks == 11
+    await buf.clear()
+
+
+@pytest.mark.asyncio
+async def test_a_resume_point_does_not_block_a_reader_past_a_small_buffer() -> None:
+    """A reader waiting for audio a full buffer has no room for still makes that room."""
+    buf = AudioBuffer(TEST_PCM_FORMAT, buffer_size=BufferSize.MINIMAL)
+    max_size = buf.max_size_seconds
+    buf.fill(_make_source(max_size + 30), source_name="test")
+
+    read = 0
+    async with asyncio.timeout(5), aclosing(buf.get_raw_stream(keep_from_ms=0)) as stream:
+        async for _chunk in stream:
+            read += 1
+            if read == max_size + 10:
+                break
+
+    assert buf.first_buffered_chunk > 0
+    await buf.clear()
 
 
 # -- get_stream passthrough --

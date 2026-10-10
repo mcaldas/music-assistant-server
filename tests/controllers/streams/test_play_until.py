@@ -6,6 +6,7 @@ import asyncio
 import struct
 from array import array
 from collections.abc import AsyncGenerator, Awaitable, Callable
+from itertools import pairwise
 from types import SimpleNamespace
 from typing import Any, cast
 from unittest.mock import AsyncMock, MagicMock
@@ -481,6 +482,98 @@ async def test_single_minimal_buffer_releases_the_source(monkeypatch: pytest.Mon
     assert len(tail) >= (STANDARD_CROSSFADE_DURATION - 1) * SECOND
     assert not a_buffer.is_buffering
     assert first.streamdetails.buffer is None
+
+
+@pytest.mark.parametrize("playing", ["s1", "s2"], ids=["its session", "an ended session"])
+async def test_single_an_end_inside_the_window_being_collected_is_refused(
+    monkeypatch: pytest.MonkeyPatch, playing: str
+) -> None:
+    """
+    The whole fade window counts as read from the moment the tail is collected.
+
+    Only a share of it is read while it builds up, so by what was read alone a client could
+    move the end into the window and get a fade over the little that is in hand.
+
+    :param playing: The queue's session; the stream is of "s1".
+    """
+    first = _item("a", 1, 300, BufferSize.BALANCED)
+    first.streamdetails.queue_id = "queue-1"
+    second = _item("b", 2, 60, BufferSize.BALANCED)
+    await _filled(first, second)
+    audio, mass = _single_audio(monkeypatch, second)
+    mass.player_queues.queue_data_or_none.return_value = SimpleNamespace(session_id=playing)
+    queues = MagicMock()
+    queues.get_item.return_value = first
+    queues.mass.streams.audio = audio
+    stream = audio.get_queue_item_stream_with_smartfade(
+        cast("Any", SimpleNamespace(player_id="p1", name="P")),
+        cast("Any", first),
+        TEST_PCM_FORMAT,
+        crossfade_mode=CrossfadeMode.SMART_CROSSFADE,
+        session_id="s1",
+    )
+    # 20 s are read by then and 10 s went out: 10.5 s of the 45 s window are built up
+    for _ in range(10):
+        await anext(stream)
+
+    if playing == "s1":
+        with pytest.raises(ActionUnavailable):
+            await PlayerQueuesController.set_end_position(queues, "queue-1", "a", 50.0)
+        # what is read, and the 34.5 s of the window that are still to come
+        assert audio.read_positions["a"] == pytest.approx(54.5)
+        # an end behind the window can still be set
+        await PlayerQueuesController.set_end_position(queues, "queue-1", "a", 60.0)
+        assert first.extra_attributes["end_position"] == 60.0
+    else:
+        # a stream of a session that ended holds no end back
+        assert "a" not in audio.read_positions
+    await stream.aclose()
+
+
+async def test_single_a_track_longer_than_its_buffer_keeps_flowing_once_its_source_is_done(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    The source of a track longer than its buffer completes on a buffer without its head.
+
+    What is left of the track counts from where the buffer starts, so the window is built
+    up while audio leaves, as for a track that fits its buffer.
+    """
+    first = _item("a", 1, 700, BufferSize.BALANCED)
+    second = _item("b", 2, 60, BufferSize.BALANCED)
+    a_buffer = first.streamdetails.buffer
+    await _filled(first, second)
+    audio, _mass = _single_audio(monkeypatch, second)
+    get_stream = a_buffer.get_stream
+    seconds_read = 0
+    # how far the track's buffer had moved on when its source was done
+    head_at_eof: list[int] = []
+
+    async def _counted(**kwargs: Any) -> AsyncGenerator[bytes]:
+        nonlocal seconds_read
+        async for chunk in get_stream(**kwargs):
+            seconds_read += len(chunk) // SECOND
+            if a_buffer.eof and not head_at_eof:
+                head_at_eof.append(a_buffer.first_buffered_chunk)
+            yield chunk
+
+    monkeypatch.setattr(a_buffer, "get_stream", _counted)
+    read_at = [0]
+
+    async def _while_playing(_audio: StreamsAudio, _emitted: int) -> None:
+        read_at.append(seconds_read)
+
+    out = await _run_single(audio, first, CrossfadeMode.SMART_CROSSFADE, _while_playing)
+
+    # past the buffer's own length, where a count from the buffer's start would end the track
+    assert head_at_eof[0] > 300
+    # never more than two seconds read for one that was handed on
+    assert max(later - earlier for earlier, later in pairwise(read_at)) <= 2
+    tail = cast("AsyncMock", audio.smart_fades_mixer.build).call_args.kwargs["fade_out_data"]
+    assert len(tail) == 45 * SECOND
+    # the stand-in fade's share is the tail: all of the track, each frame once
+    assert len(out) == 700 * SECOND
+    assert _at(out, len(out) // FRAME - 1) == pytest.approx(700 - 1 / SR)
 
 
 async def test_single_boundary_holds_the_incoming_head(monkeypatch: pytest.MonkeyPatch) -> None:

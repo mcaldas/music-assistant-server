@@ -218,6 +218,11 @@ CROSSFADE_HANDOFF_WAIT = 30.0
 # lead for the fade, and a source that never shows up loses only the fade.
 FADE_SOURCE_WAIT = 5.0
 
+# Share of the audio a single-item stream reads that it keeps back while the tail it
+# holds for its fade builds up; the rest is handed on. A tuning value: the higher, the
+# sooner the window is full and the slower audio leaves while it builds.
+TAIL_HOLD_BUILD_SHARE = 0.5
+
 # Chunk size for the realtime AudioSource path; small enough to keep ffmpeg→consumer
 # latency below ~50 ms while still amortising per-chunk overhead.
 AUDIO_SOURCE_CHUNK_SECONDS = 0.02
@@ -780,6 +785,18 @@ class StreamsAudio:
         # resolve the exact owning instance (even when flagged unavailable) so the
         # slot is charged to the account that issued the streamdetails
         provider = self.mass.get_provider(streamdetails.provider, return_unavailable=True)
+        if (
+            isinstance(provider, MusicProvider)
+            and provider.max_concurrent_streams == 1
+            and not provider.has_available_stream_slot
+            and streamdetails.queue_id
+        ):
+            # the slot may be held by a source of this queue that nothing reads; a release
+            # that fails leaves this start waiting for the slot as before
+            with suppress(Exception):
+                await asyncio.shield(
+                    self.mass.player_queues.release_abandoned_stream_slot(streamdetails.queue_id)
+                )
         stream_slot = (
             provider.acquire_stream_slot(source_wait_timeout)
             if isinstance(provider, MusicProvider)
@@ -1595,6 +1612,7 @@ class StreamsAudio:
         session_id: str | None = None,
         prepared_buffer: AudioBuffer | None = None,
         exact_seek: bool = False,
+        keep_from: float | None = None,
     ) -> AsyncGenerator[bytes]:
         """
         Get the (PCM) audio stream for a single queue item.
@@ -1612,6 +1630,9 @@ class StreamsAudio:
         :param session_id: Queue session that owns processing-detail updates.
         :param prepared_buffer: Existing buffer that must be used without opening a new source.
         :param exact_seek: Preserve millisecond precision instead of user-seek quantization.
+        :param keep_from: Media second the item's own request resumes at after this read (the
+            fade into an item reads ahead of it): this read leaves the buffer's audio from
+            there on in place.
         """
         streamdetails = queue_item.streamdetails
         assert streamdetails
@@ -1796,6 +1817,7 @@ class StreamsAudio:
             seek_position_ms=seek_position_ms,
             filter_params=filter_params or None,
             exact_seek=exact_seek,
+            keep_from_ms=None if keep_from is None else int(keep_from * 1000),
         )
 
         first_chunk_received = False
@@ -2021,7 +2043,8 @@ class StreamsAudio:
 
         # Passes chunks straight through until the source has delivered the whole
         # item (the hold target is zero until buffer EOF); from that moment it
-        # collects the item's last window once, as the boundary's fade material.
+        # collects the item's last window once, as the boundary's fade material,
+        # from a share of what it reads while the rest keeps leaving.
         tail_window = bytearray()
         bytes_written = 0
         # calculate crossfade buffer size (the ceiling; a slow source's boundary
@@ -2086,10 +2109,25 @@ class StreamsAudio:
         else:
             discard_position = float(streamdetails.seek_position)
 
+        # timed for two debug lines: when the fade into the item ended, written at the next
+        # slice of its own audio handed on, and when its audio last left since a tail is
+        # held back (the start of the hold until some did), written once the tail is read
+        fade_ended_at = asyncio.get_event_loop().time() if exact_buffer_seek else None
+        quiet_since: float | None = None
         total_chunks_received = 0
         # the source's bytes, which place the held tail in song seconds
         received_bytes = 0
+        # how much of the tail's window is built up
+        hold_built = 0
         playback_speed = cast("float", queue_item.extra_attributes.get("playback_speed", 1.0))
+
+        def superseded() -> bool:
+            """Return whether the queue has moved on from the session this stream is of."""
+            queue_data = (
+                self.mass.player_queues.queue_data_or_none(queue.queue_id) if session_id else None
+            )
+            return queue_data is not None and queue_data.session_id != session_id
+
         async for chunk in self.get_queue_item_stream(
             queue_item,
             pcm_format,
@@ -2102,11 +2140,62 @@ class StreamsAudio:
             total_chunks_received += 1
             received_bytes += len(chunk)
             tail_window.extend(chunk)
+            chunk_size = len(chunk)
             del chunk
             hold_target = tail_hold_target(queue_item, crossfade_buffer_size, pcm_format)
+            if hold_built < hold_target:
+                # Reading the whole window before any more audio leaves stops the stream
+                # for as long as that takes: seconds through a slow filter (loudnorm), and
+                # a player gives up on a response that stays silent that long. So the
+                # window is built up from a share of what arrives while the rest goes on,
+                # and from all of it once no more than the window is left of the item: at
+                # its end the tail is the one it would be with the whole window held at
+                # once. What is left counts in whole seconds, rounded down (holding a
+                # little early costs nothing), and at least a second is held, so that only
+                # whole slices leave below, as they do with a full window.
+                details = queue_item.streamdetails
+                assert details is not None  # for type checking: a hold needs a buffer
+                audio_buffer = cast("AudioBuffer", details.buffer)
+                stop = audio_buffer.first_buffered_chunk + audio_buffer.duration_available
+                if (end := get_end_position(queue_item)) is not None:
+                    stop = min(stop, end)
+                position = (
+                    discard_position + received_bytes / pcm_format.pcm_sample_size * playback_speed
+                )
+                left = int(max(0.0, stop - position) / playback_speed)
+                hold_built = min(
+                    hold_target,
+                    max(
+                        hold_built + int(chunk_size * TAIL_HOLD_BUILD_SHARE),
+                        hold_target - left * pcm_format.pcm_sample_size,
+                        pcm_format.pcm_sample_size,
+                    ),
+                )
+                # The rest of the window is the fade's as well, though it is not read yet:
+                # an end a client moves into it (set_end_position) is refused as one that
+                # was read past, which it was when the whole window was read at once.
+                if not superseded():
+                    self._mark_read(
+                        queue_item.queue_item_id,
+                        position
+                        + (hold_target - hold_built) / pcm_format.pcm_sample_size * playback_speed,
+                    )
+            else:
+                # the window is full, or its target came down (a moved end, an error)
+                hold_built = hold_target
+            hold_target = hold_built // frame_size * frame_size
+            if hold_target and quiet_since is None:
+                quiet_since = asyncio.get_event_loop().time()
             if len(tail_window) <= hold_target:
                 await asyncio.sleep(0)
                 continue
+            if fade_ended_at is not None:
+                self.logger.debug(
+                    "First audio of %s after its fade came %.2fs after the fade ended",
+                    queue_item.name,
+                    asyncio.get_event_loop().time() - fade_ended_at,
+                )
+                fade_ended_at = None
             # yield everything above the window; the slice can run short of a
             # whole second when the window is small, so credit what is actually
             # yielded - a nominal full-second credit inflates the play log and
@@ -2117,6 +2206,18 @@ class StreamsAudio:
                 bytes_written += len(pcm_slice)
                 del tail_window[: len(pcm_slice)]
                 await asyncio.sleep(0)
+            if quiet_since is not None:
+                quiet_since = asyncio.get_event_loop().time()
+
+        if tail_window and quiet_since is not None:
+            # once no more than the window is left of the item all of it is held, so nothing
+            # leaves while the last of the tail is read: the stretch a player can give up in
+            self.logger.debug(
+                "Held back %.1fs of %s for its fade: %.2fs without output",
+                len(tail_window) / pcm_format.pcm_sample_size,
+                queue_item.name,
+                asyncio.get_event_loop().time() - quiet_since,
+            )
 
         #### HANDLE END OF TRACK
 
@@ -2124,6 +2225,13 @@ class StreamsAudio:
         crossfade_start_time = asyncio.get_event_loop().time()
         next_queue_item: QueueItem | None
         try:
+            if superseded():
+                # The queue has moved on to another session, which this stream's audio does
+                # not reach. The next item is that session's: loaded here it could get other
+                # stream details under its reader, and the queue's buffered index, the item's
+                # read mark, its prepared audio and a transition a client asked for would be
+                # left as a fade nobody heard had them. The stream only plays out its tail.
+                raise QueueEmpty("The queue has moved on to another session")
             self.logger.debug(
                 "Preloading NEXT track for crossfade for queue %s", queue.display_name
             )
@@ -2141,7 +2249,7 @@ class StreamsAudio:
             # clients learn at once that the next item is locked and can no longer change
             self.mass.player_queues.signal_update(queue.queue_id)
         except QueueEmpty:
-            # end of queue reached, no next item
+            # end of queue reached (or a stream the queue has left behind), no next item
             next_queue_item = None
 
         crossfade_allowed = False
@@ -2156,8 +2264,11 @@ class StreamsAudio:
         # Claim the handoff the moment the next item is known, before the awaits that
         # size the fade: the speaker can ask for that item's url during them, and a
         # marker registered afterwards would arrive too late to be waited for.
+        # A stream of a session the queue has moved past claims nothing: its audio reaches no
+        # player, and the item the new session starts would wait for a fade nobody hears.
+        # (Checked again here for a session that changed while the next item was loaded.)
         handoff: asyncio.Event | None = None
-        if next_queue_item is not None:
+        if next_queue_item is not None and not superseded():
             handoff = asyncio.Event()
             self._crossfade_pending[queue.queue_id] = (
                 next_queue_item.queue_item_id,
@@ -2292,6 +2403,12 @@ class StreamsAudio:
                     # the resident fade-in size and records on the handover how much of
                     # the next item the mix consumed (final once the mix is exhausted)
                     async def _limited_fade_in() -> AsyncGenerator[bytes]:
+                        claim = self._crossfade_pending.get(queue.queue_id)
+                        if claim is None or claim[1] is not handoff:
+                            # the boundary was cleared before its mix read the next item (the
+                            # queue moved on): that item may be starting on its own, and a
+                            # second reader drops a still-filling buffer's audio under the first
+                            return
                         fade_in_bytes_consumed = 0
                         fade_in_stream = self.get_queue_item_stream(
                             _next_item,
@@ -2301,6 +2418,12 @@ class StreamsAudio:
                             session_id=session_id,
                             prepared_buffer=fade_in_audio_buffer,
                             exact_seek=True,
+                            # where the item's own request goes on once the mix is played
+                            # out: a full buffer keeps that audio through these reads
+                            keep_from=fade_in_start
+                            + fade_in_buffer_size
+                            / pcm_format.pcm_sample_size
+                            * fade_in_playback_speed,
                         )
                         async with aclosing(fade_in_stream):
                             async for chunk in fade_in_stream:
@@ -3365,7 +3488,21 @@ class StreamsAudio:
                 self.mass.create_task(stale.close())
         # and release anything waiting on a fade this queue will never finish mixing
         if pending := self._crossfade_pending.pop(queue_id, None):
+            self.logger.debug("Releasing the fade being mixed for queue %s", queue_id)
             pending[1].set()
+
+    def crossfade_targets(self, queue_id: str) -> set[str]:
+        """
+        Return the items a fade of this queue reads before their own stream has started.
+
+        :param queue_id: The queue whose fades to look at.
+        """
+        targets: set[str] = set()
+        if pending := self._crossfade_pending.get(queue_id):
+            targets.add(pending[0])
+        if handover := self._crossfade_handover.get(queue_id):
+            targets.add(handover.queue_item_id)
+        return targets
 
     async def get_shoutcast_stream(
         self, url: str, streamdetails: StreamDetails
@@ -3841,6 +3978,11 @@ class StreamsAudio:
                         raise
                     if final_pass:
                         # capacity was the root cause, surface the typed (actionable) error
+                        if reason == "streaming":
+                            # as where the last wait for a slot ends, further down
+                            self.logger.warning(
+                                "%s could not start: %s", queue_item.name, last_capacity_error
+                            )
                         raise last_capacity_error from err
                     # no usable alternative mapping: restore the capacity-blocked details
                     # and spend the remaining budget blocking on that provider's slot
@@ -3915,6 +4057,10 @@ class StreamsAudio:
                     continue
                 busy_instances.add(err.provider_instance)
                 if final_pass or loop.time() >= deadline:
+                    if reason == "streaming":
+                        # the response this was for can be gone by now, and then nothing
+                        # else says why the item never started
+                        self.logger.warning("%s could not start: %s", queue_item.name, err)
                     raise
                 if all_candidate_instances.issubset(busy_instances):
                     discovered: set[str] = set()
@@ -4683,7 +4829,9 @@ class StreamsAudio:
             audio_buffer = cast(
                 "AudioBuffer | None", streamdetails.buffer if streamdetails else None
             )
-            if audio_buffer is not None:
+            # an aborted buffer that was left attached is as good as none: nothing fills it
+            # any more, and a preparation attaches the one to wait for
+            if audio_buffer is not None and not audio_buffer.cancelled:
                 if audio_buffer.has_error:
                     return
                 with suppress(TimeoutError):
