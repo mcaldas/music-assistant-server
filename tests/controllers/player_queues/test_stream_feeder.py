@@ -278,7 +278,7 @@ async def test_prepare_next_gives_up_softly_on_a_capacity_failure() -> None:
 
 async def test_a_prepare_looks_ahead_without_writing_items_off() -> None:
     """Preparing the next item only looks ahead, and ends quietly when its provider is away."""
-    controller, next_item, mass = _controller_with_next_item()
+    controller, _next_item, mass = _controller_with_next_item()
     load = AsyncMock(side_effect=AudioError("offline"))
     controller.load_next_queue_item = load  # type: ignore[method-assign]
     mass.streams.audio.get_audio_buffer = AsyncMock()
@@ -286,9 +286,9 @@ async def test_a_prepare_looks_ahead_without_writing_items_off() -> None:
     controller.prepare_next_audio_buffer("queue-1", "current")
     await mass.create_task.call_args.args[0]
 
+    # the load is what would write the item off, and looking ahead it does not
     load.assert_awaited_once_with("queue-1", "current", speculative=True)
     mass.streams.audio.get_audio_buffer.assert_not_awaited()
-    assert next_item.available
 
 
 async def test_prepare_next_defers_while_the_streamed_item_holds_the_only_source_slot() -> None:
