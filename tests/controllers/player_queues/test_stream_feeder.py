@@ -18,6 +18,7 @@ from music_assistant_models.queue_item import QueueItem
 from music_assistant.controllers.player_queues import PlayerQueuesController
 from music_assistant.controllers.player_queues.state import PlayerQueueData
 from music_assistant.controllers.player_queues.stream_feeder import (
+    PRELOAD_IDLE_ATTEMPTS,
     PRELOAD_RETRY_DELAY,
     PREPARE_AFTER_PART_DELAY,
 )
@@ -740,6 +741,7 @@ def _controller_with_playing_item() -> tuple[PlayerQueuesController, SimpleNames
     _streamed_item(controller).duration = 180
     queue = cast("Any", controller.get("queue-1"))
     queue.flow_mode = False
+    queue.state = PlaybackState.PLAYING
     queue.corrected_elapsed_time = 0
     return controller, next_item, mass
 
@@ -869,6 +871,31 @@ async def test_a_preload_stops_when_the_player_has_moved_on(
     await mass.create_task.call_args.args[0]
 
     load.assert_awaited_once()
+    mass.call_later.assert_not_called()
+
+
+async def test_a_preload_gives_up_on_a_queue_that_is_not_playing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A paused item never nears its end, so the asking about its next item ends by count."""
+    controller, next_item, mass = _controller_with_playing_item()
+    # a pause on the device can read as idle, with the session and the item still there
+    cast("Any", controller.get("queue-1")).state = PlaybackState.IDLE
+    load = AsyncMock(side_effect=AudioError("offline"))
+    controller.load_next_queue_item = load  # type: ignore[method-assign]
+
+    async def _stay_paused(_seconds: float) -> None:
+        assert load.await_count < 20, "the preload asks for as long as the queue is paused"
+
+    monkeypatch.setattr(asyncio, "sleep", _stay_paused)
+
+    controller._preload_next_item("queue-1", "current")
+    await mass.create_task.call_args.args[0]
+
+    assert [awaited.kwargs for awaited in load.await_args_list] == [
+        {"speculative": True}
+    ] * PRELOAD_IDLE_ATTEMPTS
+    assert next_item.available
     mass.call_later.assert_not_called()
 
 

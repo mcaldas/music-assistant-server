@@ -49,6 +49,9 @@ PRELOAD_RETRY_DELAY = 10.0
 PRELOAD_RETRY_MAX_DELAY = 60.0
 # with this many seconds or less of the playing item left there is no time to ask again
 PRELOAD_LAST_ATTEMPT = 30.0
+# an item that is not playing never gets that near its end, so there the asking is given up
+# after this many failed attempts in a row
+PRELOAD_IDLE_ATTEMPTS = 5
 
 
 class StreamFeederMixin(_PlayerQueuesBase):
@@ -458,8 +461,8 @@ class StreamFeederMixin(_PlayerQueuesBase):
 
         This basically ensures the item is playable and fetches the stream details.
         An item no provider has is skipped and the item after it is loaded. An item whose
-        provider could not be asked is asked for again while the playing item lasts, and is
-        only skipped once that item is nearly over.
+        provider could not be asked is asked for again while the item before it plays, and
+        is only skipped once that item is nearly over.
 
         :param queue_id: The queue to preload the next item of.
         :param item_id_in_buffer: The item the player has started to fetch.
@@ -485,6 +488,7 @@ class StreamFeederMixin(_PlayerQueuesBase):
                         break
                     await asyncio.sleep(1)
                 delay = PRELOAD_RETRY_DELAY
+                idle_attempts = 0
                 while True:
                     # where in the playing item the time to ask again is up. A flow hands the
                     # player nothing and steps over at its own boundary, so there it never is
@@ -514,6 +518,15 @@ class StreamFeederMixin(_PlayerQueuesBase):
                                 queue.display_name,
                                 err,
                             )
+                    idle_attempts = 0 if queue.state == PlaybackState.PLAYING else idle_attempts + 1
+                    if idle_attempts >= PRELOAD_IDLE_ATTEMPTS:
+                        # nothing hands the player this item now: leave a trace of why
+                        self.logger.debug(
+                            "No longer asking for the item after %s on queue %s: it is not playing",
+                            current_item.name,
+                            queue.display_name,
+                        )
+                        return
                     wait = delay
                     if ask_until is not None:
                         # back in time for the last attempt, counted from where the item is
