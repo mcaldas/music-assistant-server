@@ -1624,11 +1624,21 @@ class PlayerQueuesController(QueueLoaderMixin, PlaybackTrackerMixin, StreamFeede
         self,
         queue_id: str,
         current_item_id: str,
+        speculative: bool = False,
     ) -> QueueItem:
         """
         Call when a player wants the next queue item to play.
 
-        Raises QueueEmpty if there are no more tracks left.
+        An item that cannot be loaded is marked unavailable and stepped over.
+
+        :param queue_id: The queue to load the next item of.
+        :param current_item_id: The item the next one follows.
+        :param speculative: Whether the caller only looks ahead and can ask again later. An
+            item whose provider could not be asked is then left as it is and the error is
+            raised, instead of the item being stepped over.
+        :raises QueueEmpty: If there are no more tracks left.
+        :raises AudioError: For a speculative call, if the provider of the next item could
+            not be asked.
         """
         queue = self.get(queue_id)
         if not queue:
@@ -1665,6 +1675,13 @@ class PlayerQueuesController(QueueLoaderMixin, PlaybackTrackerMixin, StreamFeede
                 # transient source capacity, do not burn a playable item over it
                 raise
             except (MediaNotFoundError, AudioError) as err:
+                if speculative and isinstance(err, AudioError):
+                    # the provider could not be asked, which says nothing about the item:
+                    # a caller with time to ask again must not cost the queue a playable item
+                    if idx != 0:
+                        # the items skipped before this one still need their update
+                        self.update_items(queue_id, self._queue_data[queue_id].items)
+                    raise
                 # No stream details found, skip this QueueItem
                 self.logger.warning(
                     "Skipping unplayable item %s (%s): %s", queue_item.name, queue_item.uri, err

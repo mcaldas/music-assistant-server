@@ -11,7 +11,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from music_assistant_models.enums import MediaType, PlaybackState, RepeatMode
-from music_assistant_models.errors import QueueEmpty
+from music_assistant_models.errors import AudioError, QueueEmpty
 from music_assistant_models.player_queue import PlayerQueue
 from music_assistant_models.queue_item import QueueItem
 
@@ -160,7 +160,7 @@ def _controller_with_next_item() -> tuple[PlayerQueuesController, SimpleNamespac
         )
     }
 
-    async def _load_next(queue_id: str, item_id: str) -> Any:
+    async def _load_next(queue_id: str, item_id: str, **_kwargs: object) -> Any:
         if (item := controller.get_next_item(queue_id, item_id)) is None:
             raise QueueEmpty
         return item
@@ -272,6 +272,21 @@ async def test_prepare_next_gives_up_softly_on_a_capacity_failure() -> None:
     assert next_item.available
 
 
+async def test_a_prepare_looks_ahead_without_writing_items_off() -> None:
+    """Preparing the next item only looks ahead, and ends quietly when its provider is away."""
+    controller, next_item, mass = _controller_with_next_item()
+    load = AsyncMock(side_effect=AudioError("offline"))
+    controller.load_next_queue_item = load  # type: ignore[method-assign]
+    mass.streams.audio.get_audio_buffer = AsyncMock()
+
+    controller.prepare_next_audio_buffer("queue-1", "current")
+    await mass.create_task.call_args.args[0]
+
+    load.assert_awaited_once_with("queue-1", "current", speculative=True)
+    mass.streams.audio.get_audio_buffer.assert_not_awaited()
+    assert next_item.available
+
+
 async def test_prepare_next_defers_while_the_streamed_item_holds_the_only_source_slot() -> None:
     """A preload for the same single-slot source waits for the boundary, not for a timeout."""
     controller, next_item, mass = _controller_with_next_item()
@@ -347,7 +362,7 @@ async def test_prepare_next_skips_an_item_that_left_the_queue_while_it_was_fetch
     controller, next_item, mass = _controller_with_next_item()
     next_item.streamdetails = None
 
-    async def _replace_queue_meanwhile(*_args: object) -> SimpleNamespace:
+    async def _replace_queue_meanwhile(*_args: object, **_kwargs: object) -> SimpleNamespace:
         controller._queue_data["queue-1"].items.clear()
         next_item.streamdetails = SimpleNamespace(buffer=None)
         return next_item
@@ -415,7 +430,7 @@ async def test_prepare_next_creates_no_buffer_once_the_session_ended() -> None:
     """
     controller, next_item, mass = _controller_with_next_item()
 
-    async def _stop_meanwhile(*_args: object) -> SimpleNamespace:
+    async def _stop_meanwhile(*_args: object, **_kwargs: object) -> SimpleNamespace:
         controller._queue_data["queue-1"].session_id = None
         return next_item
 
@@ -504,7 +519,7 @@ async def test_prepare_next_follows_the_streamed_item_not_the_audible_one() -> N
     await mass.create_task.call_args.args[0]
 
     cast("AsyncMock", controller.load_next_queue_item).assert_awaited_once_with(
-        "queue-1", "current"
+        "queue-1", "current", speculative=True
     )
     mass.streams.audio.get_audio_buffer.assert_awaited_once()
     assert mass.streams.audio.get_audio_buffer.await_args.args[0] is next_item
@@ -515,7 +530,7 @@ async def test_a_prepare_aborted_while_resolving_the_item_just_stops() -> None:
     controller, _next_item, mass = _controller_with_next_item()
     started = asyncio.Event()
 
-    async def _hang(*_args: object) -> None:
+    async def _hang(*_args: object, **_kwargs: object) -> None:
         started.set()
         await asyncio.Event().wait()
 
@@ -656,7 +671,7 @@ async def test_a_repeated_prepare_hands_back_the_preparation_already_running(
     controller.mass = mass_minimal
     resolving = asyncio.Event()
 
-    async def _hang(*_args: object) -> None:
+    async def _hang(*_args: object, **_kwargs: object) -> None:
         resolving.set()
         await asyncio.Event().wait()
 
@@ -689,7 +704,7 @@ async def test_a_repeated_prepare_joins_a_preparation_that_skipped_ahead() -> No
     controller._queue_data["queue-1"].items.append(cast("Any", later_item))
     filling = asyncio.Event()
 
-    async def _skip_unplayable(*_args: object) -> SimpleNamespace:
+    async def _skip_unplayable(*_args: object, **_kwargs: object) -> SimpleNamespace:
         next_item.available = False
         return later_item
 

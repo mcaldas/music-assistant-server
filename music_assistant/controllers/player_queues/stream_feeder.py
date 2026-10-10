@@ -86,7 +86,10 @@ class StreamFeederMixin(_PlayerQueuesBase):
             prepared_item: QueueItem | None = None
             try:
                 try:
-                    prepared_item = await self.load_next_queue_item(queue_id, queue_item_id)
+                    # only looking ahead: the fade into the next item asks again for real
+                    prepared_item = await self.load_next_queue_item(
+                        queue_id, queue_item_id, speculative=True
+                    )
                 except QueueEmpty:
                     return
                 # unplayable items are skipped, so the prepared item can be a later one
