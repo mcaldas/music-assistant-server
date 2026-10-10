@@ -640,7 +640,7 @@ class PlaybackTrackerMixin(_PlayerQueuesBase):
 
         Nothing else lets an API client tell this from a pause, and nothing is started on
         its behalf here. The ``playback_stalled_*`` extra attributes of the queue stay until
-        it plays again or is stopped.
+        it plays again, is stopped or is cleared.
 
         :param queue: The queue that went idle with a next item to play.
         :param prev_state: The state the queue was in before it went idle.

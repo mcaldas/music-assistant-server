@@ -2259,6 +2259,8 @@ class PlayerQueuesController(QueueLoaderMixin, PlaybackTrackerMixin, StreamFeede
         # flag has to follow or clients keep showing a smart mix on a plain queue
         queue.smart_shuffle_active = self.is_smart_shuffle_active(queue)
         queue.ended = False
+        # a stall names two items that are leaving the queue
+        clear_playback_stall(queue)
         if queue.state != PlaybackState.IDLE and not skip_stop:
             self.mass.create_task(self.stop(queue_id))
         queue.current_index = None

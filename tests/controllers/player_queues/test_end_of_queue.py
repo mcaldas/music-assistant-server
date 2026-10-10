@@ -640,3 +640,17 @@ async def test_the_published_stall_is_withdrawn_when_the_queue_plays_or_is_stopp
     queue.extra_attributes.update(stall)
     await PlayerQueuesController._handle_stop(ctrl, QUEUE_ID)
     assert queue.extra_attributes == {ATTR_PLAY_ACTION_IN_PROGRESS: False}
+
+
+def test_clearing_an_idle_queue_withdraws_a_published_stall() -> None:
+    """The marker names two items of the queue, so it goes with them."""
+    ctrl, queue = _controller()
+    queue.extra_attributes.update(
+        playback_stalled_at=100.0,
+        playback_stalled_item_id="first",
+        playback_stalled_next_item_id="last",
+    )
+
+    ctrl.clear(QUEUE_ID)
+
+    assert not queue.extra_attributes
