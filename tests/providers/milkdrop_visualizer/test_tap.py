@@ -6,6 +6,7 @@ import struct
 from unittest.mock import AsyncMock, Mock
 
 import numpy as np
+import pytest
 from music_assistant_models.media_items import AudioFormat, MediaItemPalette
 
 from music_assistant.controllers.streams.audio_buffer import AudioBufferDiscarded, AudioBufferEOF
@@ -245,6 +246,65 @@ def test_align_scales_the_resync_threshold_by_speed() -> None:
     assert manager._align(tap, cursor, item, 15.0, buffer, 2.0) is cursor
     # beyond the scaled threshold it is a seek and re-anchors
     assert manager._align(tap, cursor, item, 17.0, buffer, 2.0) is not cursor
+
+
+def test_align_follows_one_small_correction_after_a_start_from_idle() -> None:
+    """A player that started from idle is corrected once it says where it really is."""
+    manager = _manager()
+    tap = Tap("player-1")
+    tap.was_idle = True
+    item = Mock(queue_item_id="item-1")
+    buffer = Mock(first_buffered_chunk=0)
+    first = manager._align(tap, None, item, 0.0, buffer)
+    # the player turns out to be 0.31 s behind where it was first reported
+    corrected = manager._align(tap, first, item, first.playhead() - 0.31, buffer)
+    assert corrected is not first
+    assert corrected.anchor_us - first.anchor_us == pytest.approx(310_000, abs=20_000)
+    # the corrected anchor stands: the next word of that size is report jitter again
+    assert manager._align(tap, corrected, item, corrected.playhead() - 0.31, buffer) is corrected
+
+
+def test_align_ignores_a_small_correction_when_the_player_was_not_idle() -> None:
+    """A tap that joins a playing track anchors on a position that already stands."""
+    manager = _manager()
+    tap = Tap("player-1")
+    item = Mock(queue_item_id="item-1")
+    buffer = Mock(first_buffered_chunk=0)
+    cursor = manager._align(tap, None, item, 60.0, buffer)
+    assert manager._align(tap, cursor, item, cursor.playhead() - 0.31, buffer) is cursor
+
+
+def test_align_stops_following_small_corrections_once_the_start_has_settled() -> None:
+    """Past the settle time a small gap is report jitter, as on any other track."""
+    manager = _manager()
+    tap = Tap("player-1")
+    tap.was_idle = True
+    item = Mock(queue_item_id="item-1")
+    buffer = Mock(first_buffered_chunk=0)
+    cursor = manager._align(tap, None, item, 0.0, buffer)
+    cursor.settle_until_us = server_now_us() - 1
+    assert manager._align(tap, cursor, item, cursor.playhead() - 0.31, buffer) is cursor
+
+
+def test_align_does_not_settle_a_track_that_follows_another() -> None:
+    """Only the first anchor after idle is a guess; a track change inherits a standing timeline."""
+    manager = _manager()
+    tap = Tap("player-1")
+    tap.was_idle = True
+    buffer = Mock(first_buffered_chunk=0)
+    first = manager._align(tap, None, Mock(queue_item_id="item-1"), 0.0, buffer)
+    second_item = Mock(queue_item_id="item-2")
+    second = manager._align(tap, first, second_item, 0.0, buffer)
+    assert manager._align(tap, second, second_item, second.playhead() - 0.31, buffer) is second
+
+
+async def test_read_once_notes_that_the_player_was_idle() -> None:
+    """A pass with nothing playing marks the next anchor as the one after idle."""
+    manager = _manager()
+    tap = Tap("player-1")
+    manager._playing_source = Mock(return_value=None)  # type: ignore[method-assign]
+    assert await manager._read_once(tap, None) is None
+    assert tap.was_idle
 
 
 def test_align_re_anchors_on_a_speed_change() -> None:
