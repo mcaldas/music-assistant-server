@@ -48,7 +48,7 @@ from music_assistant.controllers.player_queues.helpers import (
     PLAYBACK_STALLED_PREFIX,
     CompareState,
     build_queue_item,
-    clear_playback_stall,
+    clear_playback_reports,
     find_dynamic_source,
     get_current_playback_speed,
 )
@@ -163,7 +163,7 @@ class PlaybackTrackerMixin(_PlayerQueuesBase):
         )
         if queue.state == PlaybackState.PLAYING:
             # whatever kept the next item from starting is over
-            clear_playback_stall(queue)
+            clear_playback_reports(queue)
         # update current item/index from player report
         if not self._update_current_index_from_player(queue, player):
             return
