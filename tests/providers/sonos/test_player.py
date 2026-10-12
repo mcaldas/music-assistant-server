@@ -149,6 +149,32 @@ async def test_connect_websocket_handshake_failure_reschedules_reconnect() -> No
 
 
 @pytest.mark.asyncio
+async def test_setup_gives_up_on_a_speaker_that_never_reports_its_state(
+    timer_mass: MusicAssistant,
+) -> None:
+    """Test a speaker that connects but never answers does not hold its setup forever."""
+    player, client = _bind_player(timer_mass)
+    timer_mass._http_session_no_ssl = MagicMock()
+
+    async def _start_listening(_init_ready: asyncio.Event) -> None:
+        await asyncio.sleep(3600)
+
+    client.connect = AsyncMock()
+    client.start_listening = _start_listening
+    with (
+        patch.object(SonosPlayer, "device_info", MagicMock(ip_address="192.168.1.10")),
+        patch("music_assistant.providers.sonos.player.SonosLocalApiClient", return_value=client),
+        patch("music_assistant.providers.sonos.player.SETUP_TIMEOUT", 0.05),
+    ):
+        async with asyncio.timeout(2) as bound:
+            with pytest.raises(TimeoutError):
+                await player.setup()
+    assert not bound.expired()
+    assert player._listen_task is not None
+    await player.on_unload()
+
+
+@pytest.mark.asyncio
 async def test_on_unload_disconnects_without_reconnecting(timer_mass: MusicAssistant) -> None:
     """Test an unloaded player disconnects and its aborted listener does not reconnect."""
     player, client = _bind_player(timer_mass)

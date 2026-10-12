@@ -100,6 +100,8 @@ PLAYBACK_ERROR_MERGE_WINDOW = 5
 # seconds for a woken speaker's radio to come up, and for a queue load to start it playing
 WAKE_TIMEOUT = 15
 WAKE_PLAY_KICK_TIMEOUT = 2
+# seconds a newly discovered speaker gets to connect and report its initial state
+SETUP_TIMEOUT = 30
 
 
 class SonosPlayer(Player):
@@ -191,7 +193,8 @@ class SonosPlayer(Player):
         self.client = SonosLocalApiClient(
             self.device_info.ip_address, self.mass.http_session_no_ssl
         )
-        await self._connect(False)
+        async with asyncio.timeout(SETUP_TIMEOUT):
+            await self._connect(False)
 
         # collect supported features
         _supported_features = SUPPORTED_FEATURES.copy()
