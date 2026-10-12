@@ -55,6 +55,13 @@ LEAD_SECONDS = 5.0
 # Scaled by playback speed where compared: report jitter lives in wall-clock
 # time and inflates by the speed factor on its way into media time.
 RESYNC_THRESHOLD_SECONDS = 3.0
+# A player that starts from idle is first reported where it was told to start, and
+# says where it really is some seconds later: often a few tenths of a second on,
+# the time it took to produce sound. For this long after such a start one correction
+# as small as the threshold below moves the anchor, so the timeline does not run
+# ahead of the room for the whole first track.
+SETTLE_SECONDS = 20.0
+SETTLE_THRESHOLD_SECONDS = 0.15
 # Poll interval while there is nothing to read: idle player, or the tap having
 # read as far ahead as it may.
 IDLE_POLL_SECONDS = 0.5
@@ -204,6 +211,9 @@ class TrackCursor:
     carry_media: float
     # Media seconds per wall-clock second (atempo, audiobooks/podcasts).
     speed: float = 1.0
+    # Clock time until which a small correction of the reported position still moves
+    # the anchor; 0 once the anchor stands.
+    settle_until_us: int = 0
 
     def playhead(self) -> float:
         """Return where the anchor says the audible playhead is now, in media seconds."""
@@ -239,6 +249,9 @@ class Tap:
         # (a seek) rebuilds the schedule without querying again. Positive only:
         # a cached miss would suppress analysis that lands late in the track.
         self.beats_analysis: tuple[str, AudioAnalysisData] | None = None
+        # Whether the player was seen idle since the tap last anchored: the anchor
+        # after that is the one a player corrects once its sound is really out.
+        self.was_idle = False
         self.task: asyncio.Task[None] | None = None
         self.beats_task: asyncio.Task[None] | None = None
 
@@ -368,6 +381,7 @@ class TapManager:
         """
         source = self._playing_source(tap.player_id)
         if source is None:
+            tap.was_idle = True
             if cursor is not None:
                 tap.reset('{"type": "stream/end"}')
             await asyncio.sleep(IDLE_POLL_SECONDS)
@@ -442,23 +456,31 @@ class TapManager:
         :param speed: Playback speed the queue plays the item at.
         """
         oldest = buffer.first_buffered_chunk
+        now_us = server_now_us()
+        settling = cursor is not None and now_us < cursor.settle_until_us
+        threshold = SETTLE_THRESHOLD_SECONDS if settling else RESYNC_THRESHOLD_SECONDS
         if (
             cursor is not None
             and cursor.item_id == item.queue_item_id
             and cursor.speed == speed
-            and abs(cursor.playhead() - playhead) <= RESYNC_THRESHOLD_SECONDS * speed
+            and abs(cursor.playhead() - playhead) <= threshold * speed
         ):
             # eviction may have overtaken us; same timeline, so just catch up
             cursor.next_chunk = max(cursor.next_chunk, oldest)
             return cursor
         start_chunk = max(int(max(0.0, playhead)), oldest)
+        # only the first anchor after idle is a guess: a correction that moved it is the
+        # player's own word, and a track change inherits a timeline that already stands
+        settle = cursor is None and tap.was_idle
+        tap.was_idle = False
         cursor = TrackCursor(
             item_id=item.queue_item_id,
-            anchor_us=server_now_us() - int(playhead / speed * 1_000_000),
+            anchor_us=now_us - int(playhead / speed * 1_000_000),
             next_chunk=start_chunk,
             carry=np.zeros(0, dtype=np.float32),
             carry_media=float(start_chunk),
             speed=speed,
+            settle_until_us=now_us + int(SETTLE_SECONDS * 1_000_000) if settle else 0,
         )
         tap.reset('{"type": "stream/clear"}')
         self._schedule_beats(tap, item, cursor.anchor_us, speed)
