@@ -100,6 +100,8 @@ PLAYBACK_ERROR_MERGE_WINDOW = 5
 # seconds for a woken speaker's radio to come up, and for a queue load to start it playing
 WAKE_TIMEOUT = 15
 WAKE_PLAY_KICK_TIMEOUT = 2
+# seconds a newly discovered speaker gets to connect and report its initial state
+SETUP_TIMEOUT = 30
 
 
 class SonosPlayer(Player):
@@ -191,7 +193,8 @@ class SonosPlayer(Player):
         self.client = SonosLocalApiClient(
             self.device_info.ip_address, self.mass.http_session_no_ssl
         )
-        await self._connect(False)
+        async with asyncio.timeout(SETUP_TIMEOUT):
+            await self._connect(False)
 
         # collect supported features
         _supported_features = SUPPORTED_FEATURES.copy()
@@ -1110,9 +1113,10 @@ class SonosPlayer(Player):
             try:
                 await self.client.connect()
             except (ConnectionFailed, CannotConnect, ClientError) as err:
-                self.logger.warning("Failed to connect to Sonos player: %s", err)
                 if not retry_on_fail or not self.mass.players.get_player(self.player_id):
+                    # left to the caller to report
                     raise
+                self.logger.warning("Failed to connect to Sonos player: %s", err)
                 if self._sleeps_as_power_off:
                     # a portable that stopped answering has gone to sleep; power() wakes it
                     self._mark_asleep()

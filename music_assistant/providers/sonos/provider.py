@@ -7,10 +7,10 @@ https://github.com/music-assistant/aiosonos
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from typing import TYPE_CHECKING, cast
 
-from aiohttp.client_exceptions import ClientError
 from aiosonos.api.models import SonosCapability
 from aiosonos.utils import get_discovery_info
 from music_assistant_models.enums import EventType, IdentifierType
@@ -41,12 +41,20 @@ def _refresh_task_id(player_id: str) -> str:
     return f"sonos_refresh_cloud_queue_{player_id}"
 
 
+# Seconds before each retry of a player setup that failed. After the last one the
+# speaker is left alone until it is discovered again.
+SETUP_RETRY_DELAYS = (10, 30, 60, 120)
+# seconds a speaker gets to answer the request for its discovery info
+DISCOVERY_INFO_TIMEOUT = 10
+
+
 class SonosPlayerProvider(PlayerProvider):
     """Sonos Player provider."""
 
     _ignored_disabled_players: set[str]
     _pending_setup_tasks: set[str]
     _pending_refresh_tasks: set[str]
+    _setups_in_progress: set[str]
     _unloaded: bool
     _cloud_queue: SonosCloudQueue
     _unsub_queue_items_updated: Callable[[], None] | None = None
@@ -60,6 +68,7 @@ class SonosPlayerProvider(PlayerProvider):
         self._ignored_disabled_players = set()
         self._pending_setup_tasks = set()
         self._pending_refresh_tasks = set()
+        self._setups_in_progress = set()
         self._unloaded = False
         self._set_aiosonos_log_level()
         self._cloud_queue = SonosCloudQueue(self)
@@ -76,18 +85,8 @@ class SonosPlayerProvider(PlayerProvider):
             "list[str]", self.config.get_value(CONF_ENTRY_MANUAL_DISCOVERY_IPS.key)
         )
         for ip_address in manual_ip_config:
-            try:
-                # get discovery info from SONOS speaker so we can provide an ID & other info
-                discovery_info = await get_discovery_info(self.mass.http_session_no_ssl, ip_address)
-            except ClientError as err:
-                self.logger.debug(
-                    "Ignoring %s (manual IP) as it is not reachable: %s", ip_address, str(err)
-                )
-                continue
-            player_id = discovery_info["device"]["id"]
-            sonos_player = SonosPlayer(self, player_id, discovery_info=discovery_info)
-            sonos_player.device_info.add_identifier(IdentifierType.IP_ADDRESS, ip_address)
-            await sonos_player.setup()
+            # the speaker's ID and name are only known once it answers
+            await self._setup_player(None, ip_address, ip_address)
 
     async def unload(self, is_removed: bool = False) -> None:
         """Handle close/cleanup of the provider."""
@@ -176,6 +175,9 @@ class SonosPlayerProvider(PlayerProvider):
             return
         if self._ignore_disabled_discovery(player_id, name):
             return
+        if player_id in self._setups_in_progress:
+            # the timer below aborts a setup it finds running when it fires
+            return
         # handle new player setup in a delayed task because mdns announcements
         # can arrive in (duplicated) bursts
         task_id = f"setup_sonos_{player_id}"
@@ -205,20 +207,72 @@ class SonosPlayerProvider(PlayerProvider):
         else:
             logging.getLogger("aiosonos").setLevel(self.logger.level + 10)
 
-    async def _setup_player(self, player_id: str, name: str, info: AsyncServiceInfo) -> None:
-        """Handle setup of a new player that is discovered using mdns."""
-        if self.mass.players.get_player(player_id):
-            msg = f"Player {player_id} already exists"
-            raise ValueError(msg)
-        if self._ignore_disabled_discovery(player_id, name):
-            return
-        address = get_primary_ip_address(info)
-        if address is None:
-            return
+    async def _setup_player(
+        self, player_id: str | None, name: str, info: AsyncServiceInfo | str, attempt: int = 0
+    ) -> None:
+        """
+        Set up a new player, found using mdns or at a manual IP address.
+
+        A setup that fails is retried a few times.
+
+        :param player_id: The discovered Sonos player ID, None for a manual IP address.
+        :param name: The discovered Sonos service name, or the manual IP address.
+        :param info: The mdns discovery info, or the manual IP address.
+        :param attempt: The number of setups of this discovery that failed before this one.
+        """
         try:
+            await self._add_player(player_id, name, info)
+        except Exception as err:
+            retry = attempt < len(SETUP_RETRY_DELAYS)
+            # warn at the first failure only, the retries would only repeat it
+            self.logger.log(
+                logging.WARNING if attempt == 0 else logging.DEBUG,
+                "Failed to set up Sonos player %s: %s%s",
+                name,
+                str(err) or type(err).__name__,
+                " (will be retried)" if retry else "",
+                exc_info=err if self.logger.isEnabledFor(logging.DEBUG) else None,
+            )
+            if retry:
+                # a manual IP address has no player ID until the speaker answers
+                task_id = f"setup_sonos_{player_id or name}"
+                self._pending_setup_tasks.add(task_id)
+                self.mass.call_later(
+                    SETUP_RETRY_DELAYS[attempt],
+                    self._setup_player,
+                    player_id,
+                    name,
+                    info,
+                    attempt + 1,
+                    task_id=task_id,
+                )
+
+    async def _add_player(
+        self, player_id: str | None, name: str, info: AsyncServiceInfo | str
+    ) -> None:
+        """
+        Create and set up the player, unless it is known or must be ignored.
+
+        Raises when the speaker could not be reached or set up.
+        """
+        address = info if isinstance(info, str) else get_primary_ip_address(info)
+        if address is None and not isinstance(info, str):
+            # an announcement is passed on even if its address records did not arrive
+            # in time, so look again
+            await info.async_request(self.mass.discovery.aiozc.zeroconf, 3000)
+            address = get_primary_ip_address(info)
+        if address is None:
+            msg = "no usable IP address in its announcement"
+            raise ConnectionError(msg)
+        # the http session itself would wait minutes for a speaker that does not answer
+        async with asyncio.timeout(DISCOVERY_INFO_TIMEOUT):
             discovery_info = await get_discovery_info(self.mass.http_session_no_ssl, address)
-        except ClientError as err:
-            self.logger.debug("Ignoring %s in discovery as it is not reachable: %s", name, str(err))
+        player_id = player_id or discovery_info["device"]["id"]
+        # nothing is awaited between this check and the mark below, so only one of
+        # two discoveries of the same speaker gets past it
+        if player_id in self._setups_in_progress or self.mass.players.get_player(player_id):
+            return
+        if self._ignore_disabled_discovery(player_id, name):
             return
         display_name = discovery_info["device"].get("name") or name
         if SonosCapability.PLAYBACK not in discovery_info["device"]["capabilities"]:
@@ -230,7 +284,23 @@ class SonosPlayerProvider(PlayerProvider):
         self.logger.debug("Discovered Sonos device %s on %s", name, address)
         sonos_player = SonosPlayer(self, player_id, discovery_info=discovery_info)
         sonos_player.device_info.add_identifier(IdentifierType.IP_ADDRESS, address)
-        await sonos_player.setup()
+        self._setups_in_progress.add(player_id)
+        # an announcement that came in during the lookup above has armed a timer
+        # that would abort this setup when it fires
+        self.mass.cancel_timer(f"setup_sonos_{player_id}")
+        try:
+            try:
+                await sonos_player.setup()
+            finally:
+                if (
+                    sonos_player._listen_task is not None
+                    and self.mass.players.get_player(player_id) is not sonos_player
+                ):
+                    # connected, but not the registered player: release the connection,
+                    # or its listener keeps reconnecting next to a later setup's
+                    await sonos_player.on_unload()
+        finally:
+            self._setups_in_progress.discard(player_id)
 
     def _ignore_disabled_discovery(self, player_id: str, name: str) -> bool:
         """
