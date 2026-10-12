@@ -1113,9 +1113,10 @@ class SonosPlayer(Player):
             try:
                 await self.client.connect()
             except (ConnectionFailed, CannotConnect, ClientError) as err:
-                self.logger.warning("Failed to connect to Sonos player: %s", err)
                 if not retry_on_fail or not self.mass.players.get_player(self.player_id):
+                    # left to the caller to report
                     raise
+                self.logger.warning("Failed to connect to Sonos player: %s", err)
                 if self._sleeps_as_power_off:
                     # a portable that stopped answering has gone to sleep; power() wakes it
                     self._mark_asleep()

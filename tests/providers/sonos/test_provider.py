@@ -3,24 +3,27 @@
 import asyncio
 import ipaddress
 import logging
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Coroutine, Iterator
 from contextlib import contextmanager
 from typing import Any, ClassVar, cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from aiohttp import ClientConnectionError
+from aiosonos.exceptions import CannotConnect
 from zeroconf import ServiceStateChange
 
 from music_assistant.mass import MusicAssistant
 from music_assistant.providers.sonos.player import SonosPlayer
 from music_assistant.providers.sonos.provider import SonosPlayerProvider
+from tests.providers.sonos.test_player import _bind_player
 
 PLAYER_ID = "sonos_player"
 SERVICE_NAME = "Toilet._sonos._tcp.local."
 ADDRESS = "192.168.1.10"
 DISCOVERY_INFO = {"device": {"id": PLAYER_ID, "name": "Toilet", "capabilities": ["PLAYBACK"]}}
 PROVIDER = "music_assistant.providers.sonos.provider"
+PLAYER = "music_assistant.providers.sonos.player"
 
 
 def _bind_provider(mass: MusicAssistant | MagicMock) -> SonosPlayerProvider:
@@ -127,6 +130,22 @@ async def _wait_until(condition: Callable[[], object]) -> None:
 def _unreachable() -> ClientConnectionError:
     """Create the error of a speaker that does not answer."""
     return ClientConnectionError("no route to host")
+
+
+def _warnings(caplog: pytest.LogCaptureFixture) -> list[logging.LogRecord]:
+    """Return what the log holds at warning level and above, from any logger."""
+    return [record for record in caplog.records if record.levelno >= logging.WARNING]
+
+
+def _both_ways(
+    provider: SonosPlayerProvider, listed_first: bool
+) -> list[Callable[[], Coroutine[Any, Any, None]]]:
+    """Return the setup from the manual addresses and the one from an announcement, in order."""
+    ways = [
+        provider.loaded_in_mass,
+        lambda: provider._setup_player(PLAYER_ID, SERVICE_NAME, _make_discovery_info()),
+    ]
+    return ways if listed_first else ways[::-1]
 
 
 @pytest.mark.asyncio
@@ -266,40 +285,43 @@ async def test_a_withdrawn_announcement_is_handed_to_the_player() -> None:
     mass.create_task.assert_called_once_with(goodbye)
 
 
+@pytest.mark.parametrize("listed_first", [False, True], ids=["announced_first", "listed_first"])
 @pytest.mark.asyncio
-async def test_a_manual_address_does_not_set_up_a_registered_player_again(
-    timer_mass: MusicAssistant,
+async def test_a_registered_player_is_not_set_up_again(
+    timer_mass: MusicAssistant, listed_first: bool
 ) -> None:
-    """Test a speaker that mdns already set up is left alone when its address is listed too."""
+    """Test a speaker that one way of discovery has set up is left alone by the other."""
     provider, registered = _bind_setup_provider(timer_mass)
     cast("MagicMock", provider.config).get_value.return_value = [ADDRESS, ADDRESS]
     fake = _fake_player_class(registered)
 
     with _discovering(fake):
-        await provider._setup_player(PLAYER_ID, SERVICE_NAME, _make_discovery_info())
-        await provider.loaded_in_mass()
+        for way in _both_ways(provider, listed_first):
+            await way()
 
     assert len(fake.created) == 1
     assert registered[PLAYER_ID] is fake.created[0]
 
 
+@pytest.mark.parametrize("listed_first", [True, False], ids=["listed_first", "announced_first"])
 @pytest.mark.asyncio
 async def test_a_speaker_found_both_ways_at_once_is_set_up_once(
-    timer_mass: MusicAssistant,
+    timer_mass: MusicAssistant, listed_first: bool
 ) -> None:
     """Test a manual address and an announcement racing for one speaker set it up once."""
     provider, registered = _bind_setup_provider(timer_mass)
     gate = asyncio.Event()
     fake = _fake_player_class(registered, gate=gate)
+    first, second = _both_ways(provider, listed_first)
 
     with _discovering(fake):
-        listed = asyncio.create_task(provider.loaded_in_mass())
-        announced = asyncio.create_task(
-            provider._setup_player(PLAYER_ID, SERVICE_NAME, _make_discovery_info())
-        )
+        ahead = asyncio.create_task(first())
+        # the first way is connecting when the other one finds the speaker
+        await _wait_until(lambda: fake.created)
+        behind = asyncio.create_task(second())
         await asyncio.sleep(0.01)
         gate.set()
-        await asyncio.gather(listed, announced)
+        await asyncio.gather(ahead, behind)
 
     assert len(fake.created) == 1
     assert registered[PLAYER_ID] is fake.created[0]
@@ -391,28 +413,75 @@ async def test_a_streak_of_failures_is_logged_once_and_ends(
     fake = _fake_player_class(registered)
     lookup = AsyncMock(side_effect=_unreachable())
 
-    def _warnings() -> list[logging.LogRecord]:
-        return [
-            record
-            for record in caplog.records
-            if record.name == provider.logger.name and record.levelno >= logging.WARNING
-        ]
-
     with (
         caplog.at_level(logging.DEBUG, logger=provider.logger.name),
         _discovering(fake, lookup),
         patch(f"{PROVIDER}.SETUP_RETRY_DELAYS", (0.01, 0.01)),
     ):
         await provider._setup_player(PLAYER_ID, SERVICE_NAME, _make_discovery_info())
-        assert len(_warnings()) == 1
-        assert SERVICE_NAME in _warnings()[0].message
-        assert "no route to host" in _warnings()[0].message
+        assert len(_warnings(caplog)) == 1
+        assert SERVICE_NAME in _warnings(caplog)[0].message
+        assert "no route to host" in _warnings(caplog)[0].message
         await _wait_until(lambda: lookup.await_count == 3)
         await asyncio.sleep(0.05)
 
     assert lookup.await_count == 3
-    assert len(_warnings()) == 1
+    assert len(_warnings(caplog)) == 1
     assert timer_mass._tracked_timers == {}
+
+
+@pytest.mark.asyncio
+async def test_an_announcement_after_a_streak_has_ended_starts_a_new_one(
+    timer_mass: MusicAssistant, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Test a speaker that was given up on is warned about and retried when it comes again."""
+    provider, registered = _bind_setup_provider(timer_mass)
+    fake = _fake_player_class(registered)
+    lookup = AsyncMock(side_effect=_unreachable())
+    info = _make_discovery_info()
+
+    with (
+        caplog.at_level(logging.DEBUG, logger=provider.logger.name),
+        _discovering(fake, lookup),
+        patch(f"{PROVIDER}.SETUP_RETRY_DELAYS", (0.01,)),
+    ):
+        await provider._setup_player(PLAYER_ID, SERVICE_NAME, info)
+        await _wait_until(lambda: lookup.await_count == 2)
+        assert timer_mass._tracked_timers == {}
+        caplog.clear()
+        with patch(f"{PROVIDER}.SETUP_RETRY_DELAYS", (60,)):
+            # what the timer of a later announcement runs
+            await provider._setup_player(PLAYER_ID, SERVICE_NAME, info)
+
+        assert len(_warnings(caplog)) == 1
+        assert f"setup_sonos_{PLAYER_ID}" in timer_mass._tracked_timers
+
+
+@pytest.mark.asyncio
+async def test_a_refused_connection_is_logged_once_per_streak(
+    timer_mass: MusicAssistant, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Test the player's own connect adds no warning to the one of the setup that failed."""
+    provider, _ = _bind_setup_provider(timer_mass)
+    client = MagicMock()
+    client.connect = AsyncMock(side_effect=CannotConnect(OSError("connection refused")))
+
+    with (
+        caplog.at_level(logging.DEBUG),
+        patch(f"{PROVIDER}.get_discovery_info", AsyncMock(return_value=DISCOVERY_INFO)),
+        # the real player, on its real setup and connect
+        patch(f"{PROVIDER}.SonosPlayer", lambda *_args, **_kwargs: _bind_player(timer_mass)[0]),
+        patch.object(SonosPlayer, "device_info", MagicMock(ip_address=ADDRESS)),
+        patch(f"{PLAYER}.SonosLocalApiClient", return_value=client),
+        patch(f"{PROVIDER}.SETUP_RETRY_DELAYS", (0.01, 0.01)),
+    ):
+        await provider._setup_player(PLAYER_ID, SERVICE_NAME, _make_discovery_info())
+        await _wait_until(lambda: client.connect.await_count == 3)
+        await asyncio.sleep(0.05)
+
+    assert client.connect.await_count == 3
+    assert [record.name for record in _warnings(caplog)] == [provider.logger.name]
+    assert "connection refused" in _warnings(caplog)[0].message
 
 
 @pytest.mark.asyncio
@@ -427,6 +496,37 @@ async def test_an_unreachable_manual_address_is_retried(timer_mass: MusicAssista
         await _wait_until(lambda: PLAYER_ID in registered)
 
     assert len(fake.created) == 1
+
+
+@pytest.mark.asyncio
+async def test_a_manual_address_that_stays_silent_does_not_hold_up_the_next(
+    timer_mass: MusicAssistant, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Test a speaker that takes the request and never answers it is a failed setup like any."""
+    provider, registered = _bind_setup_provider(timer_mass)
+    silent = "192.168.1.11"
+    cast("MagicMock", provider.config).get_value.return_value = [silent, ADDRESS]
+    fake = _fake_player_class(registered)
+
+    async def _lookup(_session: object, address: str) -> dict[str, Any]:
+        if address == silent:
+            await asyncio.sleep(3600)
+        return DISCOVERY_INFO
+
+    with (
+        caplog.at_level(logging.DEBUG, logger=provider.logger.name),
+        _discovering(fake, _lookup),
+        patch(f"{PROVIDER}.DISCOVERY_INFO_TIMEOUT", 0.05),
+        patch(f"{PROVIDER}.SETUP_RETRY_DELAYS", (60,)),
+    ):
+        async with asyncio.timeout(2):
+            await provider.loaded_in_mass()
+
+        assert PLAYER_ID in registered
+        assert [record.message for record in _warnings(caplog)] == [
+            f"Failed to set up Sonos player {silent}: TimeoutError (will be retried)"
+        ]
+        assert f"setup_sonos_{silent}" in timer_mass._tracked_timers
 
 
 @pytest.mark.asyncio
@@ -535,3 +635,31 @@ async def test_an_announcement_without_an_address_is_asked_again(
         await provider._setup_player(PLAYER_ID, SERVICE_NAME, info)
 
     assert registered[PLAYER_ID] is fake.created[0]
+
+
+@pytest.mark.asyncio
+async def test_an_announcement_that_stays_without_an_address_is_a_failed_setup(
+    timer_mass: MusicAssistant, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Test a speaker whose address is not known yet is warned about and tried again."""
+    provider, registered = _bind_setup_provider(timer_mass)
+    timer_mass.discovery = MagicMock()
+    fake = _fake_player_class(registered)
+    info = _make_discovery_info()
+    info.ip_addresses_by_version.return_value = []
+    info.async_request = AsyncMock(return_value=False)
+
+    with (
+        caplog.at_level(logging.DEBUG, logger=provider.logger.name),
+        _discovering(fake),
+        patch(f"{PROVIDER}.SETUP_RETRY_DELAYS", (0.01,)),
+    ):
+        await provider._setup_player(PLAYER_ID, SERVICE_NAME, info)
+
+        assert len(_warnings(caplog)) == 1
+        assert "no usable IP address" in _warnings(caplog)[0].message
+        assert f"setup_sonos_{PLAYER_ID}" in timer_mass._tracked_timers
+        info.ip_addresses_by_version.return_value = [ipaddress.ip_address(ADDRESS)]
+        await _wait_until(lambda: PLAYER_ID in registered)
+
+    assert len(fake.created) == 1

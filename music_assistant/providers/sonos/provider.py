@@ -7,6 +7,7 @@ https://github.com/music-assistant/aiosonos
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from typing import TYPE_CHECKING, cast
 
@@ -43,6 +44,8 @@ def _refresh_task_id(player_id: str) -> str:
 # Seconds before each retry of a player setup that failed. After the last one the
 # speaker is left alone until it announces itself again.
 SETUP_RETRY_DELAYS = (10, 30, 60, 120)
+# seconds a speaker gets to answer the request for its discovery info
+DISCOVERY_INFO_TIMEOUT = 10
 
 
 class SonosPlayerProvider(PlayerProvider):
@@ -249,6 +252,9 @@ class SonosPlayerProvider(PlayerProvider):
                     info,
                     task_id=task_id,
                 )
+            else:
+                # the streak ends here, the next announcement starts a new one
+                del self._setup_failures[key]
         else:
             self._setup_failures.pop(key, None)
 
@@ -269,7 +275,9 @@ class SonosPlayerProvider(PlayerProvider):
         if address is None:
             msg = "no usable IP address in its announcement"
             raise ConnectionError(msg)
-        discovery_info = await get_discovery_info(self.mass.http_session_no_ssl, address)
+        # the http session itself would wait minutes for a speaker that does not answer
+        async with asyncio.timeout(DISCOVERY_INFO_TIMEOUT):
+            discovery_info = await get_discovery_info(self.mass.http_session_no_ssl, address)
         player_id = player_id or discovery_info["device"]["id"]
         # nothing is awaited between this check and the mark below, so only one of
         # two discoveries of the same speaker gets past it
