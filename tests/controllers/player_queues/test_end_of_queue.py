@@ -650,7 +650,9 @@ async def test_a_start_of_our_own_that_has_not_come_up_yet_is_not_published() ->
 
     assert queue.current_item is last
     assert "playback_stalled_at" not in queue.extra_attributes
-    ctrl.logger.warning.assert_not_called()
+    # the one warning is about the start itself, which nothing has confirmed yet
+    assert ctrl.logger.warning.call_count == 1
+    assert "did not confirm the start" in ctrl.logger.warning.call_args.args[0]
 
 
 async def test_a_new_start_withdraws_the_published_stall() -> None:
@@ -673,6 +675,53 @@ async def test_a_new_start_withdraws_the_published_stall() -> None:
     await PlayerQueuesController.play_index(ctrl, QUEUE_ID, 1)
 
     assert not [key for key in queue.extra_attributes if key.startswith("playback_stalled")]
+
+
+@pytest.mark.parametrize("confirmed", [False, True])
+async def test_a_start_the_player_does_not_confirm_is_published(confirmed: bool) -> None:
+    """A start whose wait ran out says so on the queue; one the player confirmed says nothing."""
+    ctrl, queue = _controller()
+    ctrl._get_resume_position = AsyncMock(return_value=0)  # type: ignore[method-assign]
+    ctrl._load_item = AsyncMock()  # type: ignore[method-assign]
+    ctrl.player_media_from_queue_item = AsyncMock()  # type: ignore[method-assign]
+    player = ctrl.mass.players.get_player.return_value
+    player.player_id, player.extra_data, player.state.active_source = QUEUE_ID, {}, None
+    player.state.playback_state = PlaybackState.PLAYING if confirmed else PlaybackState.IDLE
+    before = time.time()
+
+    await PlayerQueuesController.play_index(ctrl, QUEUE_ID, 1)
+
+    published = {
+        key: value
+        for key, value in queue.extra_attributes.items()
+        if key.startswith("playback_unconfirmed_")
+    }
+    if confirmed:
+        assert published == {}
+        ctrl.logger.warning.assert_not_called()
+        return
+    assert published.keys() == {"playback_unconfirmed_at", "playback_unconfirmed_item_id"}
+    assert published["playback_unconfirmed_item_id"] == "last"
+    assert before <= published["playback_unconfirmed_at"] <= time.time()
+    ctrl.signal_update.assert_called_with(QUEUE_ID)
+
+
+async def test_a_new_start_withdraws_an_earlier_unconfirmed_one() -> None:
+    """Each start answers for itself: what the last one left is not carried over."""
+    ctrl, queue = _controller()
+    ctrl._get_resume_position = AsyncMock(return_value=0)  # type: ignore[method-assign]
+    ctrl._load_item = AsyncMock()  # type: ignore[method-assign]
+    ctrl.player_media_from_queue_item = AsyncMock()  # type: ignore[method-assign]
+    player = ctrl.mass.players.get_player.return_value
+    player.player_id, player.extra_data, player.state.active_source = QUEUE_ID, {}, None
+    player.state.playback_state = PlaybackState.PLAYING
+    queue.extra_attributes.update(
+        {"playback_unconfirmed_at": 100.0, "playback_unconfirmed_item_id": "first"}
+    )
+
+    await PlayerQueuesController.play_index(ctrl, QUEUE_ID, 1)
+
+    assert not [key for key in queue.extra_attributes if key.startswith("playback_unconfirmed_")]
 
 
 @pytest.mark.parametrize("was", ["paused", "a_flow"])

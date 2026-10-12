@@ -75,7 +75,8 @@ from music_assistant.controllers.player_queues.constants import (
     SKIP_END_MARGIN,
 )
 from music_assistant.controllers.player_queues.helpers import (
-    clear_playback_stall,
+    PLAYBACK_UNCONFIRMED_PREFIX,
+    clear_playback_reports,
     committed_index,
     get_current_playback_speed,
     handle_play_action,
@@ -1240,7 +1241,7 @@ class PlayerQueuesController(QueueLoaderMixin, PlaybackTrackerMixin, StreamFeede
             # a new load owns nothing yet, so the old item must not vouch for its successor
             queue_data.last_served_item_id = None
             # and whatever did not start before is answered by this start
-            clear_playback_stall(queue)
+            clear_playback_reports(queue)
             queue_data.flow_mode_stream_log = []
             queue_data.flow_buffer_completed = None
             queue_data.flow_queue_exhausted = None
@@ -1372,6 +1373,20 @@ class PlayerQueuesController(QueueLoaderMixin, PlaybackTrackerMixin, StreamFeede
                 await self.mass.players.play_media(queue_id, player_media)
                 queue.current_index = index
                 queue.current_item = queue_item
+                self.signal_update(queue_id)
+            if target_player.state.playback_state != PlaybackState.PLAYING:
+                # the wait ran out. Nothing says the player took the item, and an idle
+                # queue on a new item reads like somebody's pause: say that it was a start
+                self.logger.warning(
+                    "%s did not confirm the start of %s within %s seconds",
+                    queue.display_name,
+                    queue_item.name,
+                    PLAYBACK_START_TIMEOUT,
+                )
+                queue.extra_attributes[f"{PLAYBACK_UNCONFIRMED_PREFIX}at"] = time.time()
+                queue.extra_attributes[f"{PLAYBACK_UNCONFIRMED_PREFIX}item_id"] = (
+                    queue_item.queue_item_id
+                )
                 self.signal_update(queue_id)
         finally:
             self._set_transitioning(queue_id, False)
@@ -2186,7 +2201,7 @@ class PlayerQueuesController(QueueLoaderMixin, PlaybackTrackerMixin, StreamFeede
         self._set_transitioning(queue_id, False)
         queue_data = self._queue_data[queue_id]
         # a queue that is told to stop is no longer waiting on its next item
-        clear_playback_stall(queue_data.queue)
+        clear_playback_reports(queue_data.queue)
         session_id = queue_data.session_id
         if (queue := self.get(queue_id)) and queue.active:
             if queue.state == PlaybackState.PLAYING:
@@ -2262,7 +2277,7 @@ class PlayerQueuesController(QueueLoaderMixin, PlaybackTrackerMixin, StreamFeede
         queue.smart_shuffle_active = self.is_smart_shuffle_active(queue)
         queue.ended = False
         # a stall names two items that are leaving the queue
-        clear_playback_stall(queue)
+        clear_playback_reports(queue)
         if queue.state != PlaybackState.IDLE and not skip_stop:
             self.mass.create_task(self.stop(queue_id))
         queue.current_index = None
