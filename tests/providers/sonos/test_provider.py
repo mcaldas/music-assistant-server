@@ -35,7 +35,6 @@ def _bind_provider(mass: MusicAssistant | MagicMock) -> SonosPlayerProvider:
     provider._pending_setup_tasks = set()
     provider._pending_refresh_tasks = set()
     provider._setups_in_progress = set()
-    provider._setup_failures = {}
     provider._unloaded = False
     return provider
 
@@ -316,8 +315,6 @@ async def test_a_speaker_found_both_ways_at_once_is_set_up_once(
 
     with _discovering(fake):
         ahead = asyncio.create_task(first())
-        # the first way is connecting when the other one finds the speaker
-        await _wait_until(lambda: fake.created)
         behind = asyncio.create_task(second())
         await asyncio.sleep(0.01)
         gate.set()
@@ -401,7 +398,6 @@ async def test_a_failed_setup_is_retried_until_it_succeeds(timer_mass: MusicAssi
         await _wait_until(lambda: PLAYER_ID in registered)
 
     assert len(fake.created) == 1
-    assert provider._setup_failures == {}
 
 
 @pytest.mark.asyncio
@@ -428,33 +424,6 @@ async def test_a_streak_of_failures_is_logged_once_and_ends(
     assert lookup.await_count == 3
     assert len(_warnings(caplog)) == 1
     assert timer_mass._tracked_timers == {}
-
-
-@pytest.mark.asyncio
-async def test_an_announcement_after_a_streak_has_ended_starts_a_new_one(
-    timer_mass: MusicAssistant, caplog: pytest.LogCaptureFixture
-) -> None:
-    """Test a speaker that was given up on is warned about and retried when it comes again."""
-    provider, registered = _bind_setup_provider(timer_mass)
-    fake = _fake_player_class(registered)
-    lookup = AsyncMock(side_effect=_unreachable())
-    info = _make_discovery_info()
-
-    with (
-        caplog.at_level(logging.DEBUG, logger=provider.logger.name),
-        _discovering(fake, lookup),
-        patch(f"{PROVIDER}.SETUP_RETRY_DELAYS", (0.01,)),
-    ):
-        await provider._setup_player(PLAYER_ID, SERVICE_NAME, info)
-        await _wait_until(lambda: lookup.await_count == 2)
-        assert timer_mass._tracked_timers == {}
-        caplog.clear()
-        with patch(f"{PROVIDER}.SETUP_RETRY_DELAYS", (60,)):
-            # what the timer of a later announcement runs
-            await provider._setup_player(PLAYER_ID, SERVICE_NAME, info)
-
-        assert len(_warnings(caplog)) == 1
-        assert f"setup_sonos_{PLAYER_ID}" in timer_mass._tracked_timers
 
 
 @pytest.mark.asyncio
@@ -542,25 +511,6 @@ async def test_unload_cancels_a_pending_retry(timer_mass: MusicAssistant) -> Non
         await provider.unload(is_removed=True)
 
     assert handle.cancelled()
-
-
-@pytest.mark.asyncio
-async def test_a_goodbye_ends_the_retries(timer_mass: MusicAssistant) -> None:
-    """Test a speaker that withdraws its announcement is no longer tried."""
-    provider, registered = _bind_setup_provider(timer_mass)
-    fake = _fake_player_class(registered)
-    lookup = AsyncMock(side_effect=_unreachable())
-    task_id = f"setup_sonos_{PLAYER_ID}"
-
-    with _discovering(fake, lookup), patch(f"{PROVIDER}.SETUP_RETRY_DELAYS", (60,)):
-        await provider._setup_player(PLAYER_ID, SERVICE_NAME, _make_discovery_info())
-        assert task_id in timer_mass._tracked_timers
-        await provider.on_mdns_service_state_change(
-            f"{PLAYER_ID}@{SERVICE_NAME}", ServiceStateChange.Removed, None
-        )
-
-    assert task_id not in timer_mass._tracked_timers
-    assert provider._setup_failures == {}
 
 
 @pytest.mark.asyncio

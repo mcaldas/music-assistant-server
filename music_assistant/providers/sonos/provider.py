@@ -42,7 +42,7 @@ def _refresh_task_id(player_id: str) -> str:
 
 
 # Seconds before each retry of a player setup that failed. After the last one the
-# speaker is left alone until it announces itself again.
+# speaker is left alone until it is discovered again.
 SETUP_RETRY_DELAYS = (10, 30, 60, 120)
 # seconds a speaker gets to answer the request for its discovery info
 DISCOVERY_INFO_TIMEOUT = 10
@@ -55,7 +55,6 @@ class SonosPlayerProvider(PlayerProvider):
     _pending_setup_tasks: set[str]
     _pending_refresh_tasks: set[str]
     _setups_in_progress: set[str]
-    _setup_failures: dict[str, int]
     _unloaded: bool
     _cloud_queue: SonosCloudQueue
     _unsub_queue_items_updated: Callable[[], None] | None = None
@@ -70,7 +69,6 @@ class SonosPlayerProvider(PlayerProvider):
         self._pending_setup_tasks = set()
         self._pending_refresh_tasks = set()
         self._setups_in_progress = set()
-        self._setup_failures = {}
         self._unloaded = False
         self._set_aiosonos_log_level()
         self._cloud_queue = SonosCloudQueue(self)
@@ -141,13 +139,9 @@ class SonosPlayerProvider(PlayerProvider):
             # picked up before the unload can still arrive after it
             return
         if state_change == ServiceStateChange.Removed:
-            removed_id = name.split("@", 1)[0]
-            # the speaker left the network: stop trying to set it up
-            self.mass.cancel_timer(f"setup_sonos_{removed_id}")
-            self._setup_failures.pop(removed_id, None)
             # a portable withdraws its announcement as it goes to sleep, long before the
             # websocket heartbeat notices
-            sonos_player = self.mass.players.get_player(removed_id)
+            sonos_player = self.mass.players.get_player(name.split("@", 1)[0])
             if isinstance(sonos_player, SonosPlayer):
                 self.mass.create_task(sonos_player.on_mdns_goodbye())
             return
@@ -214,7 +208,7 @@ class SonosPlayerProvider(PlayerProvider):
             logging.getLogger("aiosonos").setLevel(self.logger.level + 10)
 
     async def _setup_player(
-        self, player_id: str | None, name: str, info: AsyncServiceInfo | str
+        self, player_id: str | None, name: str, info: AsyncServiceInfo | str, attempt: int = 0
     ) -> None:
         """
         Set up a new player, found using mdns or at a manual IP address.
@@ -224,17 +218,15 @@ class SonosPlayerProvider(PlayerProvider):
         :param player_id: The discovered Sonos player ID, None for a manual IP address.
         :param name: The discovered Sonos service name, or the manual IP address.
         :param info: The mdns discovery info, or the manual IP address.
+        :param attempt: The number of setups of this discovery that failed before this one.
         """
-        # a manual IP address has no player ID until the speaker answers
-        key = player_id or name
         try:
             await self._add_player(player_id, name, info)
         except Exception as err:
-            failures = self._setup_failures[key] = self._setup_failures.get(key, 0) + 1
-            retry = failures <= len(SETUP_RETRY_DELAYS)
-            # warn once per streak of failures, the retries would only repeat it
+            retry = attempt < len(SETUP_RETRY_DELAYS)
+            # warn at the first failure only, the retries would only repeat it
             self.logger.log(
-                logging.WARNING if failures == 1 else logging.DEBUG,
+                logging.WARNING if attempt == 0 else logging.DEBUG,
                 "Failed to set up Sonos player %s: %s%s",
                 name,
                 str(err) or type(err).__name__,
@@ -242,21 +234,18 @@ class SonosPlayerProvider(PlayerProvider):
                 exc_info=err if self.logger.isEnabledFor(logging.DEBUG) else None,
             )
             if retry:
-                task_id = f"setup_sonos_{key}"
+                # a manual IP address has no player ID until the speaker answers
+                task_id = f"setup_sonos_{player_id or name}"
                 self._pending_setup_tasks.add(task_id)
                 self.mass.call_later(
-                    SETUP_RETRY_DELAYS[failures - 1],
+                    SETUP_RETRY_DELAYS[attempt],
                     self._setup_player,
                     player_id,
                     name,
                     info,
+                    attempt + 1,
                     task_id=task_id,
                 )
-            else:
-                # the streak ends here, the next announcement starts a new one
-                del self._setup_failures[key]
-        else:
-            self._setup_failures.pop(key, None)
 
     async def _add_player(
         self, player_id: str | None, name: str, info: AsyncServiceInfo | str
