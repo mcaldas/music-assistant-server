@@ -9,6 +9,27 @@ import numpy as np
 if TYPE_CHECKING:
     from numpy.typing import NDArray
 
+# One decode may follow a track on more than one metrical level: the beat model predicts in
+# windows that do not see each other, and the tracker's tempo range holds a tempo together
+# with its double. A track whose grid sits an octave off its own tempo, for a stretch or as
+# a whole, is decoded a second time, on a range around that tempo only.
+#
+# Lowest tempo of the octave a track's tempo is folded into for the second decode: with 66
+# the range is 66 to 132 BPM, which keeps dance music at 117 to 131 where it is counted.
+# The tempo judged is that of one beat interval in whole frames, the one with the largest
+# share of the track's time (often under half): at 50 frames a second 23 to 45 frames stay,
+# which for a steady track is about 66 to 133.4 BPM.
+BEAT_LEVEL_BAND_LOW_BPM = 66.0
+# The second decode's range is the folded tempo divided and multiplied by this. Narrower than
+# an octave by far, so no two levels fit in it. The tracker can still sit at the edge of this
+# range for a few bars.
+BEAT_LEVEL_RANGE_FACTOR = 1.2
+# A stretch is an octave off when this many beat intervals in a row are each within the
+# deviation of half or of double the track's main interval. Fewer is a fill, and a stretch
+# at any other ratio may be the music's own tempo: neither asks for a second decode.
+OCTAVE_RUN_MIN_BEATS = 8
+OCTAVE_RUN_DEVIATION = 0.15
+
 
 class DBNDownBeatTracker:
     """
@@ -40,7 +61,9 @@ class DBNDownBeatTracker:
         """Initialize the DBN tracker with the given parameters."""
         if beats_per_bar is None:
             beats_per_bar = [3, 4]
+        self.beats_per_bar = beats_per_bar
         self.fps = fps
+        self.transition_lambda = transition_lambda
         self.threshold = threshold
         self.correct = correct
         self.observation_lambda = observation_lambda
@@ -67,6 +90,24 @@ class DBNDownBeatTracker:
                     "tm_log_probs": tm_log_probs,
                 }
             )
+
+    def narrowed(self, min_bpm: float, max_bpm: float) -> DBNDownBeatTracker:
+        """
+        Return a tracker like this one for another tempo range.
+
+        :param min_bpm: Minimum tempo in BPM.
+        :param max_bpm: Maximum tempo in BPM.
+        """
+        return DBNDownBeatTracker(
+            beats_per_bar=self.beats_per_bar,
+            min_bpm=min_bpm,
+            max_bpm=max_bpm,
+            fps=self.fps,
+            transition_lambda=self.transition_lambda,
+            observation_lambda=self.observation_lambda,
+            threshold=self.threshold,
+            correct=self.correct,
+        )
 
     def __call__(self, activations: NDArray[np.float64]) -> tuple[NDArray[np.float64], int]:
         """
@@ -440,3 +481,76 @@ class DBNDownBeatTracker:
             beats.append(peak)
 
         return np.array(beats, dtype=np.int64)
+
+
+def one_level_tempo_range(beat_times: NDArray[np.float64], fps: int) -> tuple[float, float] | None:
+    """
+    Return the tempo range to decode a track on again, or None when its grid can stay.
+
+    A grid stays when the tempo of its main beat interval lies in the band and no run of
+    beats sits an octave off that interval.
+
+    :param beat_times: Beat times in seconds, as the first decode found them.
+    :param fps: Frames per second of the activations the beats were decoded from.
+    """
+    intervals = np.rint(np.diff(beat_times) * fps).astype(int)
+    if len(intervals) == 0 or intervals.min() < 1:
+        # no interval, or beats that are not in order: no tempo to judge
+        return None
+    # the main interval is the one frame count with the largest share of the track's time
+    # (often under half), not the one with most beats: a stretch at double the tempo has
+    # twice the beats
+    values, counts = np.unique(intervals, return_counts=True)
+    main = int(values[np.argmax(values * counts)])
+    tempo = 60.0 * fps / main
+    in_band = BEAT_LEVEL_BAND_LOW_BPM <= tempo < 2 * BEAT_LEVEL_BAND_LOW_BPM
+    if in_band and not _has_octave_run(intervals, main):
+        return None
+    while tempo < BEAT_LEVEL_BAND_LOW_BPM:
+        tempo *= 2
+    while tempo >= 2 * BEAT_LEVEL_BAND_LOW_BPM:
+        tempo /= 2
+    return tempo / BEAT_LEVEL_RANGE_FACTOR, tempo * BEAT_LEVEL_RANGE_FACTOR
+
+
+def decode_one_level(
+    tracker: DBNDownBeatTracker, activations: NDArray[np.float64]
+) -> tuple[NDArray[np.float64], int]:
+    """
+    Decode beat/downbeat activations into a grid that holds one metrical level.
+
+    Decodes as the tracker does, and a second time on a range around the track's own tempo
+    when the first grid sits an octave off that tempo for a run of beats, or lies outside
+    the band as a whole.
+
+    The second decode holds one tempo, within the range factor: in a track that is decoded
+    again, a part that plays at another tempo loses its beats.
+
+    :param tracker: The tracker for the first decode; its settings carry over to the second.
+    :param activations: Shape (T, 2), columns [beat_act, downbeat_act].
+    :return: Tuple of (beats, num_beats), as the tracker returns them.
+    """
+    beats, num_beats = tracker(activations)
+    tempo_range = one_level_tempo_range(beats[:, 0], tracker.fps)
+    if tempo_range is None:
+        return beats, num_beats
+    again, again_num_beats = tracker.narrowed(*tempo_range)(activations)
+    if len(again) < 2:
+        # a second decode that finds no grid (the provider refuses fewer than two beats)
+        # must not cost the track the one it has
+        return beats, num_beats
+    return again, again_num_beats
+
+
+def _has_octave_run(intervals: NDArray[np.int_], main: int) -> bool:
+    """Return whether enough beat intervals in a row sit at half or double the main one."""
+    half, double = main / 2, main * 2
+    off = (np.abs(intervals - half) <= OCTAVE_RUN_DEVIATION * half) | (
+        np.abs(intervals - double) <= OCTAVE_RUN_DEVIATION * double
+    )
+    run = 0
+    for is_off in off:
+        run = run + 1 if is_off else 0
+        if run >= OCTAVE_RUN_MIN_BEATS:
+            return True
+    return False

@@ -9,7 +9,6 @@ from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
-from typing import cast
 from unittest.mock import AsyncMock, Mock, patch
 
 import numpy as np
@@ -22,7 +21,6 @@ from music_assistant_models.media_items import AudioFormat
 from torchaudio.transforms import SpectralCentroid
 
 from music_assistant.models.audio_analysis import AudioAnalysisData, AudioAnalysisError
-from music_assistant.providers.smart_fades.dbn_postprocessor import DBNDownBeatTracker
 from music_assistant.providers.smart_fades.provider import (
     ANALYSIS_SAMPLE_RATE,
     BEAT_WINDOW_PACE_RATIO,
@@ -294,7 +292,7 @@ async def test_extended_analysis_fields(
 
     set_aa_mock = mass_mock.streams.audio_analysis.set_audio_analysis
     analysis = set_aa_mock.call_args.kwargs["analysis"]
-    assert set_aa_mock.call_args.kwargs["analysis_version"] == 3
+    assert set_aa_mock.call_args.kwargs["analysis_version"] == 4
 
     # Energy curve should be 1800 bins, normalized to [0, 1]
     assert analysis.rms_energy is not None
@@ -524,9 +522,9 @@ def test_free_models_releases_the_whole_set(provider: SmartFadesProvider) -> Non
     assert provider._models is None
 
 
-async def test_analysis_version_is_3(provider: SmartFadesProvider) -> None:
-    """v3 adds FireRed AED vocal activity."""
-    assert provider.analysis_version == 3
+async def test_analysis_version_is_4(provider: SmartFadesProvider) -> None:
+    """v4 decodes a track's beats on one metrical level."""
+    assert provider.analysis_version == 4
 
 
 async def test_cancel_clears_all_session_state(provider: SmartFadesProvider) -> None:
@@ -912,12 +910,13 @@ async def test_windowed_inference_matches_whole_track_prediction(
 
     def post_processor(activations: np.ndarray) -> tuple[np.ndarray, int]:
         captured.append(activations)
-        return np.array([[0.0, 1.0], [0.5, 2.0]]), 4
+        # one beat has no interval, so the one-level decode judges nothing of this grid
+        return np.array([[0.0, 1.0]]), 4
 
     provider._models = replace(
         _stub_models(),
         beat_this=Mock(model=stub),
-        beat_this_post_processor=cast("DBNDownBeatTracker", post_processor),
+        beat_this_post_processor=Mock(side_effect=post_processor, fps=50),
     )
 
     async def run_offloaded_timed(func: Callable[..., object], *args: object) -> object:
@@ -933,6 +932,34 @@ async def test_windowed_inference_matches_whole_track_prediction(
 
     assert len(captured) == 1
     assert np.array_equal(captured[0], expected)
+
+
+def test_beats_are_decoded_on_one_level(provider: SmartFadesProvider) -> None:
+    """The stitched activations go through the one-level decode, whose grid and meter are kept."""
+    post_processor = Mock()
+    logits = torch.zeros(4)
+    grid = np.array([[1.0, 1.0], [1.5, 2.0], [2.0, 3.0], [2.5, 1.0]])
+
+    with (
+        patch(
+            "music_assistant.providers.smart_fades.provider.aggregate_prediction",
+            return_value=(logits, logits),
+        ),
+        patch(
+            "music_assistant.providers.smart_fades.provider.decode_one_level",
+            return_value=(grid, 3),
+        ) as decode,
+    ):
+        beats, downbeats, beats_per_bar = provider._decode_beat_timings(
+            post_processor, [], np.array([0]), 4
+        )
+
+    assert decode.call_args.args[0] is post_processor
+    assert decode.call_args.args[1].shape == (4, 2)
+    post_processor.assert_not_called()
+    assert beats.tolist() == [1.0, 1.5, 2.0, 2.5]
+    assert downbeats.tolist() == [1.0, 2.5]
+    assert beats_per_bar == 3
 
 
 @pytest.mark.parametrize(

@@ -26,7 +26,7 @@ from music_assistant.models.audio_analysis_provider import (
 )
 
 from . import RECOMMENDED_CPU_CORES, RECOMMENDED_RAM_GB
-from .dbn_postprocessor import DBNDownBeatTracker
+from .dbn_postprocessor import DBNDownBeatTracker, decode_one_level
 from .feature_extractor import AdvancedBeatFeatureExtractor
 from .helpers import (
     aggregate_series_to_bins,
@@ -114,7 +114,8 @@ class SmartFadesProvider(AudioAnalysisProvider):
 
     max_analysis_duration = ACCUMULATING_ANALYSIS_MAX_DURATION_SECONDS
     # v3: FireRed AED vocal activity
-    analysis_version = 3
+    # v4: one metrical level per track (a second beat decode around the track's own tempo)
+    analysis_version = 4
     has_unloadable_models = True
 
     def __init__(
@@ -735,8 +736,8 @@ class SmartFadesProvider(AudioAnalysisProvider):
                 BEAT_WINDOW_OVERLAP_MODE,
                 self._device,
             )
-        dbn_out, beats_per_bar = post_processor(
-            self._beat_activations(beat_logits.float(), downbeat_logits.float())
+        dbn_out, beats_per_bar = decode_one_level(
+            post_processor, self._beat_activations(beat_logits.float(), downbeat_logits.float())
         )
         beats = dbn_out[:, 0]
         downbeats = dbn_out[dbn_out[:, 1] == 1, 0]
